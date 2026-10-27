@@ -1,0 +1,12 @@
+[package]
+name = "rustspice-backend-metal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Apple Silicon Metal UMA Zero-Copy + df64 Double-Float Compute Backend with Mixed-Precision CPU Refinement"
+
+[dependencies]
+rayon.workspace = true
+rustspice-backend-cpu.workspace = true
+rustspice-core.workspace = true
+rustspice-ir.workspace = true

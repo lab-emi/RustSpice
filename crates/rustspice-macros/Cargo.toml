@@ -1,0 +1,15 @@
+[package]
+name = "rustspice-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Procedural macro DSL (#[spice_device]) for compile-time symbolic auto-diff, CSE, and multi-backend GPU kernel generation"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+rustspice-ir.workspace = true
+syn.workspace = true

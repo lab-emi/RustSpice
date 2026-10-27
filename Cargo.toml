@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustspice-core",
+    "crates/rustspice-ir",
+    "crates/rustspice-macros",
+    "crates/rustspice-solver",
+    "crates/rustspice-backend-cpu",
+    "crates/rustspice-backend-metal",
+    "crates/rustspice-backend-cuda-tile",
+    "crates/rustspice-backend-cuda-simt",
+    "crates/rustspice-backend-wasm",
+    "crates/rustspice-py",
+    "crates/rustspice-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["RustEDA Contributors"]
+repository = "https://github.com/lab-emi/RustSpice"
+
+[workspace.dependencies]
+rustspice-core = { path = "crates/rustspice-core" }
+rustspice-ir = { path = "crates/rustspice-ir" }
+rustspice-macros = { path = "crates/rustspice-macros" }
+rustspice-solver = { path = "crates/rustspice-solver" }
+rustspice-backend-cpu = { path = "crates/rustspice-backend-cpu" }
+rustspice-backend-metal = { path = "crates/rustspice-backend-metal" }
+rustspice-backend-cuda-tile = { path = "crates/rustspice-backend-cuda-tile" }
+rustspice-backend-cuda-simt = { path = "crates/rustspice-backend-cuda-simt" }
+rustspice-backend-wasm = { path = "crates/rustspice-backend-wasm" }
+
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rustc-hash = "2.1"
+pulp = "0.21"
+rayon = "1.10"
+faer = "0.20"
+cranelift-codegen = "0.115"
+cranelift-frontend = "0.115"
+cranelift-jit = "0.115"
+cranelift-module = "0.115"
+cranelift-native = "0.115"
+syn = { version = "2.0", features = ["full", "visit", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+libloading = "0.8"
+pyo3 = { version = "0.24", features = ["abi3-py39"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

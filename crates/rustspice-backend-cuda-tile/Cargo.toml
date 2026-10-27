@@ -1,0 +1,14 @@
+[package]
+name = "rustspice-backend-cuda-tile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NVIDIA CUDA Rust Tile Track (cutile-rs architecture) Backend for SoA Device Evaluation and Multi-Circuit Batch Simulation"
+
+[dependencies]
+libloading.workspace = true
+pulp.workspace = true
+rayon.workspace = true
+rustspice-backend-cpu.workspace = true
+rustspice-core.workspace = true
+rustspice-ir.workspace = true

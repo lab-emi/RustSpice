@@ -1,0 +1,11 @@
+[package]
+name = "rustspice-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Symbolic SSA Equation IR, Forward/Reverse Auto-Diff, CSE/DCE Optimizer, and Multi-Backend Codegen for RustSpice"
+
+[dependencies]
+rustc-hash.workspace = true
+serde.workspace = true
+thiserror.workspace = true

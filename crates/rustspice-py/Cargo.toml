@@ -1,0 +1,20 @@
+[package]
+name = "rustspice-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PyO3 and Zero-Copy DLPack Bridge for PyTorch and Apple MLX Differentiable Circuit Simulation"
+
+[lib]
+name = "rustspice_py"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3.workspace = true
+rustspice-backend-cpu.workspace = true
+rustspice-core.workspace = true
+rustspice-solver.workspace = true

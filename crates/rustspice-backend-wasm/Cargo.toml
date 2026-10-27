@@ -1,0 +1,13 @@
+[package]
+name = "rustspice-backend-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cloud-Native WebAssembly SIMD128 and WebGPU (WGSL df64) Compute Backend for RustSpice"
+
+[dependencies]
+pulp.workspace = true
+rustspice-backend-cpu.workspace = true
+rustspice-backend-metal.workspace = true
+rustspice-core.workspace = true
+rustspice-ir.workspace = true

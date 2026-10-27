@@ -1,0 +1,23 @@
+[package]
+name = "rustspice-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line interface and automated ngspice head-to-head benchmark suite for RustSpice"
+
+[[bin]]
+name = "rustspice"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+rustspice-backend-cpu.workspace = true
+rustspice-backend-cuda-simt.workspace = true
+rustspice-backend-cuda-tile.workspace = true
+rustspice-backend-metal.workspace = true
+rustspice-backend-wasm.workspace = true
+rustspice-core.workspace = true
+rustspice-ir.workspace = true
+rustspice-solver.workspace = true
+serde.workspace = true
+serde_json.workspace = true

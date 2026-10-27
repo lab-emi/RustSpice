@@ -1,0 +1,13 @@
+[package]
+name = "rustspice-backend-cuda-simt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NVIDIA CUDA SIMT Track (cuda-oxide / PTX & PCG/cuDSS) Backend for Conflict-Free Sparse Matrix Stamping and Large-Scale RC Grid Solving"
+
+[dependencies]
+libloading.workspace = true
+rayon.workspace = true
+rustspice-backend-cpu.workspace = true
+rustspice-core.workspace = true
+rustspice-ir.workspace = true
