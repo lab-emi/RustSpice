@@ -17,6 +17,7 @@ use rustspice_backend_cuda_simt::batch::CudaBatchSolver;
 use rustspice_solver::{BatchDcEngine, Simulator};
 
 use super::legacy::{cmos_chain_deck, cpu_model, diode_cascade_deck_with, git_label, git_state};
+use super::rustsim::loadavg;
 
 #[derive(Args, Debug, Clone)]
 pub struct BatchArgs {
@@ -368,6 +369,7 @@ pub fn run(args: BatchArgs) -> i32 {
 }
 
 fn run_inner(args: &BatchArgs) -> Result<String, String> {
+    let load_start = loadavg();
     let deck = diode_cascade_deck_with(args.diodes, 5.0, ".op");
     let sim = Simulator::from_spice(&deck).map_err(|e| e.to_string())?;
     let t0 = Instant::now();
@@ -429,6 +431,7 @@ fn run_inner(args: &BatchArgs) -> Result<String, String> {
         &|n| chain_monte_carlo_inputs(n, args.stages),
     )?;
 
+    let load_end = loadavg();
     let (head, dirty) = git_state(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
     let threads = std::env::var("RAYON_NUM_THREADS")
         .ok()
@@ -448,7 +451,14 @@ fn run_inner(args: &BatchArgs) -> Result<String, String> {
         chain_plan.dim(),
         chain_plan.workspace_slots()
     );
-    let _ = writeln!(s, "- CPU: {} ({threads} rayon threads)", cpu_model());
+    let load = |l: Option<f64>| l.map_or("n/a".to_string(), |x| format!("{x:.1}"));
+    let _ = writeln!(
+        s,
+        "- CPU: {} ({threads} rayon threads); 1-minute load average {} at start, {} at end (the end value includes this benchmark's own threads)",
+        cpu_model(),
+        load(load_start),
+        load(load_end)
+    );
     let _ = writeln!(s, "- GPU: {gpu_line}");
     let _ = writeln!(
         s,
