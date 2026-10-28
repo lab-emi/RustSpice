@@ -4685,7 +4685,7 @@ pub fn render_markdown(r: &Report) -> String {
     );
     let _ = writeln!(
         s,
-        "- **Temperature**: {} C (300.15 K) in both tools (RustSpice has a fixed 300.15 K).",
+        "- **Temperature**: {} C (300.15 K) in both tools (default nominal temperature; `.temp` / `.options temp/tnom` are also supported).",
         r.scope.temperature_c
     );
     let _ = writeln!(

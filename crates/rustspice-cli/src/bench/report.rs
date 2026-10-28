@@ -1541,7 +1541,7 @@ fn section_methodology(s: &mut String, r: &SuiteReport) {
     );
     let _ = writeln!(
         s,
-        "- Scope: temperature 27 C (RustSpice is fixed at 300.15 K), `.options` are not honoured by RustSpice, RustSpice transients are fixed-step, one analysis per deck unless stated. A missing ngspice yields `unverified`, never a pass."
+        "- Scope: nominal temperature 27 C (300.15 K; `.temp`, `.options temp/tnom` and instance `temp/dtemp` are honoured by both tools), `.options gmin` is honoured and solver-tolerance `.options` emit warnings in RustSpice, RustSpice transients use adaptive LTE step control and write nominal `k * tstep` rows (or internal steps with `--internal-points`), one analysis per deck unless stated. A missing ngspice yields `unverified`, never a pass."
     );
     s.push('\n');
 }

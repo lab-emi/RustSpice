@@ -1957,9 +1957,12 @@ mod tests {
             } else {
                 vec![0.0]
             };
+            let budget = oracle::OracleBudget::new(std::time::Duration::from_secs(
+                if cfg!(debug_assertions) { 30 } else { 10 },
+            ));
             for p in probes.split(',') {
                 let t0 = std::time::Instant::now();
-                let r = oracle::evaluate(&d.deck, &spec, p.trim(), &axis);
+                let r = oracle::evaluate_with_budget(&d.deck, &spec, p.trim(), &axis, &budget);
                 eprintln!("{} {p}: {:.2}s", d.id, t0.elapsed().as_secs_f64());
                 let r = r.unwrap_or_else(|e| panic!("{} {p}: {e}", d.id));
                 assert!(r.iter().all(|v| v.is_finite()));

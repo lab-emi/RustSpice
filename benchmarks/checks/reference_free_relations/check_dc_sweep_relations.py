@@ -115,7 +115,7 @@ if __name__ == "__main__":
 
     closed = 0
     # (n, padding copies, name, gate, expected-gap slug or None)
-    for n, pads, name, gap in ((14, 0, "mesh14", None), (22, 0, "mesh22", "linear-static-pivot-accuracy"), (22, 3, "mesh22_pad3", None)):
+    for n, pads, name, gap in ((14, 0, "mesh14", None), (22, 0, "mesh22", None), (22, 3, "mesh22_pad3", None)):
         deck = f"{name}\n" + swept_mesh(n, pads) + "\n.dc vsw -1 1 0.1\n.end\n"
         fdeck = os.path.join(W, name + ".sp")
         open(fdeck, "w").write(deck)
