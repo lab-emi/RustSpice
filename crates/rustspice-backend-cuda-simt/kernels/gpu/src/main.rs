@@ -5,6 +5,8 @@
 use cuda_device::{kernel, thread};
 use cuda_host::cuda_module;
 
+// the shared source also holds host-only items (plan layout constants, workspace sizing)
+#[allow(dead_code)]
 #[path = "../../batch_newton.rs"]
 mod batch_newton;
 

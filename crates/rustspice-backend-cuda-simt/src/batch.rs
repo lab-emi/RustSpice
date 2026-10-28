@@ -1,8 +1,9 @@
 //! Batched DC operating points: one circuit topology solved at many parameter corners (Monte Carlo, PVT, supply
 //! corners).
 //!
-//! [`BatchPlan`] flattens what the CPU solver uses for one DC Newton solve: the Jacobian / RHS gather tables, the
-//! fill-reducing order and static-pivot elimination stream of its unrolled LU, the base values of every linear
+//! [`BatchPlan`] flattens what the CPU solver uses for one DC Newton solve: the Jacobian / RHS gather tables, a
+//! static-pivot elimination stream from its unrolled-LU compiler (on an order chosen to stay stable without
+//! re-pivoting), the device models (plain diodes, level-1 MOSFETs, bulk junctions), the base values of every linear
 //! device and the Newton tolerances. [`solve_cpu_ref`] runs the plan with rayon, one corner per task (the `cpu_ref`
 //! implementation); [`CudaBatchSolver`] runs the same source compiled to PTX by cuda-oxide, one corner per CUDA
 //! thread. Corners whose status is not [`status::CONVERGED`] are the caller's to re-solve on the CPU, whose solver
@@ -12,7 +13,7 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 use rustspice_backend_cpu::{SymbolicLuOp, UnrolledSymbolicLu};
-use rustspice_core::CompiledTopology;
+use rustspice_core::{CompiledTopology, DeviceSoaBuffer};
 
 use crate::driver::{CudaDriver, CudaError, CudaModule, DeviceBuffer, KernelArg};
 
@@ -51,6 +52,30 @@ pub enum ParamSlot {
     DiodeIs(u32),
     /// Emission coefficient of plain diode `index`.
     DiodeN(u32),
+    /// Width (`mos_w`, multiplier included) of MOSFET `index`.
+    MosW(u32),
+    /// Effective channel length (`mos_l`) of MOSFET `index`.
+    MosL(u32),
+    /// `VTO` of MOSFET `index`.
+    MosVto(u32),
+    /// `KP` of MOSFET `index`.
+    MosKp(u32),
+    /// `LAMBDA` of MOSFET `index`.
+    MosLambda(u32),
+}
+
+impl ParamSlot {
+    /// The MOSFET and the index of its value in `hdr::MOS_PARAM` (`W`, `L`, `VTO`, `KP`, `LAMBDA`).
+    fn mos_value(self) -> Option<(u32, usize)> {
+        match self {
+            ParamSlot::MosW(m) => Some((m, 0)),
+            ParamSlot::MosL(m) => Some((m, 1)),
+            ParamSlot::MosVto(m) => Some((m, 2)),
+            ParamSlot::MosKp(m) => Some((m, 3)),
+            ParamSlot::MosLambda(m) => Some((m, 4)),
+            _ => None,
+        }
+    }
 }
 
 /// Flattened solve plan: a `u32` part (header, then index arrays) and an `f64` part (scalars, then value arrays).
@@ -63,13 +88,70 @@ pub struct BatchPlan {
     slots: usize,
 }
 
+/// Conductance slots that a device writes at every evaluation or that a parameter sets per corner.
+fn dynamic_conductances(soa: &DeviceSoaBuffer, params: &[ParamSlot]) -> Vec<bool> {
+    let mut dynamic = vec![false; soa.cond_buf.len()];
+    let slots = soa
+        .diode_cond_buf_idx
+        .iter()
+        .chain(&soa.mos_gm_buf_idx)
+        .chain(&soa.mos_gds_buf_idx)
+        .chain(&soa.mos_gmbs_buf_idx)
+        .chain(&soa.mos_rev_gm_buf_idx)
+        .chain(&soa.mos_rev_gmbs_buf_idx)
+        .chain(soa.ext.junctions.iter().map(|j| &j.cond_buf_idx))
+        .chain(&soa.ext.bulk.cond_buf_idx)
+        .chain(params.iter().filter_map(|p| match p {
+            ParamSlot::Conductance(i) => Some(i),
+            _ => None,
+        }));
+    for &i in slots {
+        if let Some(d) = dynamic.get_mut(i as usize) {
+            *d = true;
+        }
+    }
+    dynamic
+}
+
 impl BatchPlan {
+    /// Jacobian entries of `topo` (in the DC state that [`Self::build`] expects) that are zero in every corner and
+    /// every Newton iteration: no device writes them, no parameter sets them, and their static value is 0 (the
+    /// structural diagonal of a voltage source branch, a capacitor at DC). Leaving them out of the LU avoids the fill
+    /// that their structure alone would cause.
+    pub fn constant_zero_entries(topo: &CompiledTopology, params: &[ParamSlot]) -> Vec<bool> {
+        let soa = &topo.soa;
+        let gt = &soa.gather_table;
+        let nnz = topo.jacobian.values.len();
+        if gt.nnz_ptr.len() != nnz + 1 {
+            return vec![false; nnz];
+        }
+        let dynamic = dynamic_conductances(soa, params);
+        let mut zero: Vec<bool> = (0..nnz)
+            .map(|k| {
+                let terms = &gt.nnz_terms[gt.nnz_ptr[k]..gt.nnz_ptr[k + 1]];
+                terms.iter().all(|t| !dynamic[t.buffer_idx as usize])
+                    && terms.iter().fold(0.0f64, |acc, t| {
+                        acc + t.sign * soa.cond_buf[t.buffer_idx as usize]
+                    }) == 0.0
+            })
+            .collect();
+        for &k in &soa.dc_floating_diag_idx {
+            if k < nnz {
+                zero[k] = false;
+            }
+        }
+        zero
+    }
+
     /// Builds the plan of `topo`, which must hold the DC state at `x = 0` with the sources at their DC values
     /// (`evaluate_devices` after `update_sources_at_time(None)`): its `cond_buf` / `rhs_buf` are the base values.
-    /// `perm`, `csc_value_map` and `lu` are the CPU solver's ordering and unrolled LU of `topo.jacobian`.
+    /// `perm`, `csc_value_map` and `lu` are an ordering and static-pivot LU of `topo.jacobian` (the solver's
+    /// `AdaptiveSparseSolver::static_pivot_plan`), whose reordered entry `k_new` is `csc_value_map[k_new]` of the
+    /// Jacobian; an entry it leaves out must be among [`Self::constant_zero_entries`].
     ///
     /// Supported: resistors, capacitors (open), inductors (short), independent sources, linear controlled
-    /// sources and plain diodes, with at least one diode. Anything else is an `Err` naming the reason.
+    /// sources, plain diodes and level-1 MOSFETs with their bulk junctions and Meyer capacitances (open at DC),
+    /// with at least one nonlinear device. Anything else is an `Err` naming the reason.
     pub fn build(
         topo: &CompiledTopology,
         perm: &[usize],
@@ -82,16 +164,30 @@ impl BatchPlan {
         let jac = &topo.jacobian;
         let n = soa.mna_dim;
         let nnz = jac.values.len();
-        if !soa.mos_names.is_empty() {
-            return Err("MOSFETs are not supported by the batched kernel".into());
+        let ext = &soa.ext;
+        if let Some(i) = soa.mos_level.iter().position(|&l| l != 1) {
+            return Err(format!(
+                "MOSFET `{}` is level {} (the kernel has level 1)",
+                soa.mos_names[i], soa.mos_level[i]
+            ));
         }
-        if soa.ext.is_nonlinear() {
-            return Err(
-                "full junctions, polynomial sources and Meyer capacitances are not supported"
-                    .into(),
-            );
+        if !ext.poly.is_empty() {
+            return Err("polynomial controlled sources are not supported".into());
         }
-        if soa.diode_names.is_empty() {
+        // a full junction is evaluated as a plain one when it differs from it only by its charge (none at DC)
+        if let Some(j) = ext
+            .junctions
+            .iter()
+            .find(|j| j.cubic_reverse || j.xbv.is_finite() || j.ikf.is_finite() || j.isr != 0.0)
+        {
+            return Err(format!(
+                "junction `{}` has a reverse law, breakdown, knee or recombination current",
+                j.name
+            ));
+        }
+        let nmos = soa.mos_names.len();
+        let njunc = ext.junctions.len() + ext.bulk.len();
+        if soa.diode_names.is_empty() && nmos == 0 && njunc == 0 {
             return Err("linear circuit (one direct solve per corner on the CPU)".into());
         }
         if !soa.nodeset_nodes.is_empty() {
@@ -100,7 +196,7 @@ impl BatchPlan {
         if soa.is_transient || soa.gmin != soa.gmin_nominal {
             return Err("the topology is not in its DC state".into());
         }
-        if lu.dim != n || perm.len() != n || csc_value_map.len() != nnz || jac.ncols != n {
+        if lu.dim != n || perm.len() != n || csc_value_map.len() > nnz || jac.ncols != n {
             return Err("the LU plan does not belong to this Jacobian".into());
         }
         let gt = &soa.gather_table;
@@ -113,14 +209,19 @@ impl BatchPlan {
                 ParamSlot::Conductance(i) => (i as usize) < soa.cond_buf.len(),
                 ParamSlot::SourceValue(i) => (i as usize) < soa.rhs_buf.len(),
                 ParamSlot::DiodeIs(d) | ParamSlot::DiodeN(d) => (d as usize) < ndiode,
+                ParamSlot::MosW(m)
+                | ParamSlot::MosL(m)
+                | ParamSlot::MosVto(m)
+                | ParamSlot::MosKp(m)
+                | ParamSlot::MosLambda(m) => (m as usize) < nmos,
             };
             if !ok {
                 return Err(format!("parameter slot {p:?} is out of range"));
             }
         }
 
-        // dynamic values: written by a diode or set by a parameter; every other device value is the same in all
-        // corners and is summed into the plan
+        // dynamic values: written by a diode, a MOSFET or a junction, or set by a parameter; every other device
+        // value is the same in all corners and is summed into the plan
         const STATIC: u32 = u32::MAX;
         let mut dcond = vec![STATIC; soa.cond_buf.len()];
         let mut drhs = vec![STATIC; soa.rhs_buf.len()];
@@ -150,6 +251,82 @@ impl BatchPlan {
                 )
             })
             .collect();
+        let mos_slots: Vec<[u32; 6]> = (0..nmos)
+            .map(|m| {
+                let mut c = |i: u32| mark(&mut dcond, &mut dcond0, &soa.cond_buf, i as usize);
+                [
+                    c(soa.mos_gm_buf_idx[m]),
+                    c(soa.mos_gds_buf_idx[m]),
+                    c(soa.mos_gmbs_buf_idx[m]),
+                    c(soa.mos_rev_gm_buf_idx[m]),
+                    c(soa.mos_rev_gmbs_buf_idx[m]),
+                    mark(
+                        &mut drhs,
+                        &mut drhs0,
+                        &soa.rhs_buf,
+                        soa.mos_rhs_buf_idx[m] as usize,
+                    ),
+                ]
+            })
+            .collect();
+        // plain junctions in the CPU's order (full ones, then the bulk table): anode, cathode, conductance slot,
+        // RHS slot, folded; is, n Vt, fold sign
+        let mut junc_u: Vec<u32> = Vec::with_capacity(5 * njunc);
+        let mut junc_f: Vec<f64> = Vec::with_capacity(6 * njunc);
+        let mut push_junction = |anode: usize,
+                                 cathode: usize,
+                                 cond: u32,
+                                 rhs: u32,
+                                 is: f64,
+                                 nvt: f64,
+                                 vcrit: f64,
+                                 fold_sign: f64| {
+            junc_u.extend([
+                anode as u32,
+                cathode as u32,
+                mark(&mut dcond, &mut dcond0, &soa.cond_buf, cond as usize),
+                mark(&mut drhs, &mut drhs0, &soa.rhs_buf, rhs as usize),
+                u32::from(fold_sign != 0.0),
+            ]);
+            junc_f.extend([is, nvt, 1.0 / nvt, is / nvt, vcrit, fold_sign]);
+        };
+        for j in &ext.junctions {
+            let sign = if j.fold_mos.is_some() {
+                j.fold_sign
+            } else {
+                0.0
+            };
+            push_junction(
+                j.anode,
+                j.cathode,
+                j.cond_buf_idx,
+                j.rhs_buf_idx,
+                j.is,
+                j.nvt,
+                j.vcrit,
+                sign,
+            );
+        }
+        let b = &ext.bulk;
+        for k in 0..b.len() {
+            push_junction(
+                b.anode[k],
+                b.cathode[k],
+                b.cond_buf_idx[k],
+                b.rhs_buf_idx[k],
+                b.is[k],
+                b.nvt[k],
+                b.vcrit[k],
+                b.fold_sign[k],
+            );
+        }
+        // the corner's value of a MOSFET parameter is read where the MOSFET is evaluated: 1 + its slot
+        let mut mos_param = vec![0u32; 5 * nmos];
+        for (j, p) in params.iter().enumerate() {
+            if let Some((m, k)) = p.mos_value() {
+                mos_param[5 * m as usize + k] = j as u32 + 1;
+            }
+        }
         let param_words: Vec<[u32; 2]> = params
             .iter()
             .map(|p| match *p {
@@ -163,14 +340,26 @@ impl BatchPlan {
                 ],
                 ParamSlot::DiodeIs(d) => [kernel::param::DIODE_IS, d],
                 ParamSlot::DiodeN(d) => [kernel::param::DIODE_N, d],
+                ParamSlot::MosW(m) => [kernel::param::MOS_W, m],
+                ParamSlot::MosL(m) => [kernel::param::MOS_L, m],
+                ParamSlot::MosVto(m) => [kernel::param::MOS_VTO, m],
+                ParamSlot::MosKp(m) => [kernel::param::MOS_KP, m],
+                ParamSlot::MosLambda(m) => [kernel::param::MOS_LAMBDA, m],
             })
             .collect();
 
-        // the factors read the reordered matrix: non-zero `k_new` of it is `csc_value_map[k_new]` of ours
-        let mut csc_to_lu = vec![0u32; nnz];
+        // the factors read the reordered matrix: non-zero `k_new` of it is `csc_value_map[k_new]` of ours; the
+        // plan's Jacobian is the entries the factors read, in CSC order
+        const DROPPED: u32 = u32::MAX;
+        let mut lu_of = vec![DROPPED; nnz];
         for (k_new, &k) in csc_value_map.iter().enumerate() {
-            csc_to_lu[k] = lu.csc_to_lu[k_new];
+            if k >= nnz || lu_of[k] != DROPPED {
+                return Err("the LU plan does not belong to this Jacobian".into());
+            }
+            lu_of[k] = lu.csc_to_lu[k_new];
         }
+        let kept: Vec<usize> = (0..nnz).filter(|&k| lu_of[k] != DROPPED).collect();
+        let csc_to_lu: Vec<u32> = kept.iter().map(|&k| lu_of[k]).collect();
         let mut is_gathered = vec![false; lu.lu_nnz];
         for &l in &csc_to_lu {
             is_gathered[l as usize] = true;
@@ -187,23 +376,35 @@ impl BatchPlan {
                 floating[k] = true;
             }
         }
-        let mut jac_static = vec![0.0f64; nnz];
+        let mut jac_static = Vec::with_capacity(kept.len());
         let (mut jac_dptr, mut jac_dsrc, mut jac_dsign) = (vec![0u32], Vec::new(), Vec::new());
         for k in 0..nnz {
             let mut acc = 0.0f64;
+            let mut dynamic = false;
             for t in &gt.nnz_terms[gt.nnz_ptr[k]..gt.nnz_ptr[k + 1]] {
                 let b = t.buffer_idx as usize;
                 if dcond[b] == STATIC {
                     acc += t.sign * soa.cond_buf[b];
                 } else {
-                    jac_dsrc.push(dcond[b]);
-                    jac_dsign.push(t.sign);
+                    dynamic = true;
+                    if lu_of[k] != DROPPED {
+                        jac_dsrc.push(dcond[b]);
+                        jac_dsign.push(t.sign);
+                    }
                 }
             }
             if floating[k] {
                 acc += 1e-12;
             }
-            jac_static[k] = acc;
+            if lu_of[k] == DROPPED {
+                if dynamic || acc != 0.0 {
+                    return Err(format!(
+                        "the LU plan leaves out Jacobian entry {k}, which is not constantly zero"
+                    ));
+                }
+                continue;
+            }
+            jac_static.push(acc);
             jac_dptr.push(jac_dsrc.len() as u32);
         }
         let mut rhs_static = vec![0.0f64; n];
@@ -225,18 +426,21 @@ impl BatchPlan {
 
         // rows of the Jacobian with their columns ascending (the order of the CPU's column sweep)
         let mut row_count = vec![0u32; n + 1];
-        for &r in &jac.row_idx {
-            row_count[r + 1] += 1;
+        for &k in &kept {
+            row_count[jac.row_idx[k] + 1] += 1;
         }
         for i in 0..n {
             row_count[i + 1] += row_count[i];
         }
         let row_ptr = row_count.clone();
         let mut next = row_count;
-        let (mut row_col, mut row_lu) = (vec![0u32; nnz], vec![0u32; nnz]);
+        let (mut row_col, mut row_lu) = (vec![0u32; kept.len()], vec![0u32; kept.len()]);
         for col in 0..n {
             let span = jac.col_ptr[col]..jac.col_ptr[col + 1];
-            for (&r, &l) in jac.row_idx[span.clone()].iter().zip(&csc_to_lu[span]) {
+            for (&r, &l) in jac.row_idx[span.clone()].iter().zip(&lu_of[span]) {
+                if l == DROPPED {
+                    continue;
+                }
                 let e = next[r] as usize;
                 row_col[e] = col as u32;
                 row_lu[e] = l;
@@ -271,7 +475,7 @@ impl BatchPlan {
         }
         pu[hdr::N] = n as u32;
         pu[hdr::NUM_NODES] = soa.num_nodes as u32;
-        pu[hdr::NNZ] = nnz as u32;
+        pu[hdr::NNZ] = kept.len() as u32;
         pu[hdr::LU_NNZ] = lu.lu_nnz as u32;
         pu[hdr::NDCOND] = dcond0.len() as u32;
         pu[hdr::NDRHS] = drhs0.len() as u32;
@@ -283,6 +487,8 @@ impl BatchPlan {
         pu[hdr::NFILL] = fill.len() as u32;
         pu[hdr::BOX_TIGHT] = u32::from(soa.isrc_names.is_empty() && soa.vccs_names.is_empty());
         pu[hdr::BOX_RELEASE] = newton.box_release_iters as u32;
+        pu[hdr::NMOS] = nmos as u32;
+        pu[hdr::NJUNC] = njunc as u32;
 
         push_u(&mut pu, hdr::ROW_PTR, row_ptr);
         push_u(&mut pu, hdr::ROW_COL, row_col);
@@ -341,6 +547,27 @@ impl BatchPlan {
         push_u(&mut pu, hdr::PARAMS, param_words.into_iter().flatten());
         push_u(
             &mut pu,
+            hdr::MOS,
+            (0..nmos).flat_map(|m| {
+                let s = mos_slots[m];
+                [
+                    soa.mos_drain[m] as u32,
+                    soa.mos_gate[m] as u32,
+                    soa.mos_source[m] as u32,
+                    soa.mos_bulk[m] as u32,
+                    s[0],
+                    s[1],
+                    s[2],
+                    s[3],
+                    s[4],
+                    s[5],
+                ]
+            }),
+        );
+        push_u(&mut pu, hdr::MOS_PARAM, mos_param);
+        push_u(&mut pu, hdr::JUNCS, junc_u);
+        push_u(
+            &mut pu,
             hdr::VSRC_DYN,
             soa.vsrc_rhs_buf_idx
                 .iter()
@@ -374,6 +601,24 @@ impl BatchPlan {
             hdr::F_DIODE_N,
             soa.diode_n.iter().copied(),
         );
+        push_f(
+            &mut pu,
+            &mut pf,
+            hdr::F_MOS,
+            (0..nmos).flat_map(|m| {
+                [
+                    soa.mos_polarity[m],
+                    soa.mos_kp[m],
+                    soa.mos_w[m],
+                    soa.mos_l[m],
+                    soa.mos_vto[m],
+                    soa.mos_gamma[m],
+                    soa.mos_phi[m],
+                    soa.mos_lambda[m],
+                ]
+            }),
+        );
+        push_f(&mut pu, &mut pf, hdr::F_JUNC, junc_f);
         push_f(
             &mut pu,
             &mut pf,
@@ -417,20 +662,22 @@ impl BatchPlan {
     }
 
     /// Sizes of the plan: dimension, Jacobian non-zeros, LU entries (fill-in), elimination operations, triangular
-    /// terms, diodes, and the per-corner values with the gather terms that read them.
+    /// terms, diodes, MOSFETs, junctions, and the per-corner values with the gather terms that read them.
     pub fn summary(&self) -> String {
         use kernel::hdr;
         let h = |k: usize| self.pu[k] as usize;
         let nnz = h(hdr::NNZ);
         let n = h(hdr::N);
         format!(
-            "n {n}, nnz {nnz}, LU entries {} ({} fill-in), elimination ops {}, L terms {}, U terms {}, diodes {}, per-corner conductances {} (Jacobian terms {}), per-corner RHS values {} (RHS terms {}), workspace {} words",
+            "n {n}, nnz {nnz}, LU entries {} ({} fill-in), elimination ops {}, L terms {}, U terms {}, diodes {}, MOSFETs {}, junctions {}, per-corner conductances {} (Jacobian terms {}), per-corner RHS values {} (RHS terms {}), workspace {} words",
             h(hdr::LU_NNZ),
             h(hdr::NFILL),
             h(hdr::NOPS),
             self.pu[h(hdr::L_PTR) + n],
             self.pu[h(hdr::U_PTR) + n],
             h(hdr::NDIODE),
+            h(hdr::NMOS),
+            h(hdr::NJUNC),
             h(hdr::NDCOND),
             self.pu[h(hdr::JAC_DPTR) + nnz],
             h(hdr::NDRHS),

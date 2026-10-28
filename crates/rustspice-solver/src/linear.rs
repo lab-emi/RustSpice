@@ -68,13 +68,22 @@ impl SymmetricOrdering {
     /// Returns `None` if the ordering work budget is exceeded (indicating a high-fill mesh
     /// better served by `faer` sparse LU).
     fn compute(csc: &CscMatrix<f64>) -> Option<Self> {
-        let n = csc.nrows;
-        let perm = if n <= 16 {
-            (0..n).collect()
-        } else {
-            Self::min_degree_order(csc)?
-        };
+        Some(Self::with_perm(csc, Self::fill_reducing_order(csc)?))
+    }
 
+    /// The unrolled tier's column order: natural up to 16 unknowns, minimum degree above (`None` past its work
+    /// budget).
+    fn fill_reducing_order(csc: &CscMatrix<f64>) -> Option<Vec<usize>> {
+        if csc.nrows <= 16 {
+            Some((0..csc.nrows).collect())
+        } else {
+            Self::min_degree_order(csc)
+        }
+    }
+
+    /// The reordered matrix `P A P^T` of `perm[new] = old`.
+    fn with_perm(csc: &CscMatrix<f64>, perm: Vec<usize>) -> Self {
+        let n = csc.nrows;
         let mut inv_perm = vec![0usize; n];
         for (new_i, &old_i) in perm.iter().enumerate() {
             inv_perm[old_i] = new_i;
@@ -119,13 +128,13 @@ impl SymmetricOrdering {
             diag_idx,
         };
 
-        Some(Self {
+        Self {
             perm,
             reordered_csc,
             csc_value_map,
             rhs_perm: vec![0.0; n],
             x_perm: vec![0.0; n],
-        })
+        }
     }
 
     fn min_degree_order(csc: &CscMatrix<f64>) -> Option<Vec<usize>> {
@@ -695,6 +704,109 @@ impl AdaptiveSparseSolver {
                 self.lu_buf.resize(lu_nnz, 0.0);
             }
         }
+    }
+
+    /// A static-pivot plan for a solver that cannot re-pivot (the batched DC kernel) of `csc` without the entries
+    /// marked in `drop` (structural entries that stay zero): the unrolled tier's fill-reducing order with every node
+    /// held by a grounded voltage source moved to the front together with the source's branch current, the source
+    /// in `csc.values` of each reordered non-zero (the dropped ones have none), and the symbolic LU of the
+    /// reordered matrix. `None` when the unrolled tier does not apply (dimension, ordering or operation budget).
+    ///
+    /// Eliminating such a node on its branch row (a single `±1`) takes its column out of the rest of the
+    /// factorization. Left last, as minimum degree orders a supply node, that column's `U` entries are multiplied
+    /// by the gain of every saturated stage of a MOSFET chain (to 4e32 after 20 inverters), far beyond the growth
+    /// bound that a static pivot order must keep; the CPU solver re-pivots there, the kernel cannot. The branch's
+    /// structural zero diagonal must be among the dropped entries: kept, the node's elimination copies it into
+    /// every row of the node's column and the branch pivot then fills all of them.
+    pub fn static_pivot_plan(
+        csc: &CscMatrix<f64>,
+        drop: &[bool],
+    ) -> Option<(Vec<usize>, Vec<usize>, UnrolledSymbolicLu)> {
+        let dim = csc.nrows;
+        if dim > Self::MAX_UNROLLED_DIM || csc.ncols != dim || drop.len() != csc.nnz() {
+            return None;
+        }
+        // the matrix without the dropped entries, and where each kept entry comes from
+        let mut kept = Vec::with_capacity(csc.nnz());
+        let mut col_ptr = Vec::with_capacity(dim + 1);
+        col_ptr.push(0);
+        for col in 0..dim {
+            kept.extend((csc.col_ptr[col]..csc.col_ptr[col + 1]).filter(|&k| !drop[k]));
+            col_ptr.push(kept.len());
+        }
+        let mut diag_idx = vec![usize::MAX; dim];
+        let row_idx: Vec<usize> = kept.iter().map(|&k| csc.row_idx[k]).collect();
+        for col in 0..dim {
+            for (i, &r) in row_idx
+                .iter()
+                .enumerate()
+                .take(col_ptr[col + 1])
+                .skip(col_ptr[col])
+            {
+                if r == col {
+                    diag_idx[col] = i;
+                }
+            }
+        }
+        let csc = &CscMatrix {
+            nrows: dim,
+            ncols: dim,
+            col_ptr,
+            values: kept.iter().map(|&k| csc.values[k]).collect(),
+            row_idx,
+            diag_idx,
+        };
+        let max_ops = if dim >= 256 {
+            (32 * dim).min(Self::MAX_UNROLLED_OPS)
+        } else {
+            Self::MAX_UNROLLED_OPS
+        };
+        // a grounded source's branch column `br` has no diagonal (its structural zero is dropped) and its only entry
+        // in the KCL row of node `p`, and row `br` its only off-diagonal entry in column `p`
+        let mut row_count = vec![0usize; dim];
+        let mut row_col = vec![0usize; dim];
+        let mut has_diag = vec![false; dim];
+        for (col, d) in has_diag.iter_mut().enumerate() {
+            for &r in &csc.row_idx[csc.col_ptr[col]..csc.col_ptr[col + 1]] {
+                if r == col {
+                    *d = true;
+                } else {
+                    row_count[r] += 1;
+                    row_col[r] = col;
+                }
+            }
+        }
+        let mut first = Vec::new();
+        let mut moved = vec![false; dim];
+        for br in 0..dim {
+            let mut off = csc.row_idx[csc.col_ptr[br]..csc.col_ptr[br + 1]]
+                .iter()
+                .filter(|&&r| r != br);
+            if let (Some(&p), None) = (off.next(), off.next()) {
+                if !has_diag[br]
+                    && row_count[br] == 1
+                    && row_col[br] == p
+                    && !moved[p]
+                    && !moved[br]
+                {
+                    first.extend([p, br]);
+                    moved[p] = true;
+                    moved[br] = true;
+                }
+            }
+        }
+        let perm: Vec<usize> = first
+            .into_iter()
+            .chain(
+                SymmetricOrdering::fill_reducing_order(csc)?
+                    .into_iter()
+                    .filter(|&i| !moved[i]),
+            )
+            .collect();
+        let ord = SymmetricOrdering::with_perm(csc, perm);
+        let lu = UnrolledSymbolicLu::compile_with_budget(&ord.reordered_csc, max_ops).ok()?;
+        let value_map = ord.csc_value_map.iter().map(|&i| kept[i]).collect();
+        Some((ord.perm, value_map, lu))
     }
 
     /// The static-pivot plan of the unrolled tier: the fill-reducing order (`perm[new] = old`), the source of each

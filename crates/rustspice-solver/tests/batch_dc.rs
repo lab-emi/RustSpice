@@ -18,12 +18,64 @@ struct Diode {
     area: f64,
 }
 
-/// Resistors, diodes, grounded voltage sources and current sources (`(from, to, amps)`: `amps` leave `from` and
-/// enter `to` through the source), with nodes named by their numbers.
+/// A level-1 MOSFET with its own model card (bulk junctions at the default `IS` = 1e-14 A, no capacitances).
+#[derive(Clone, Copy)]
+struct Mos {
+    d: usize,
+    g: usize,
+    s: usize,
+    b: usize,
+    pmos: bool,
+    w: f64,
+    l: f64,
+    vto: f64,
+    kp: f64,
+    lambda: f64,
+    gamma: f64,
+    phi: f64,
+}
+
+impl Mos {
+    /// Drain current (drain to source through the channel) from the SPICE level-1 (Shichman-Hodges) equations:
+    /// the device is symmetric (drain and source swap when `vds < 0`), a PMOS is an NMOS with every voltage and the
+    /// current negated, and the threshold rises with reverse body bias, linearised in `vbs` for forward bias.
+    fn drain_current(&self, vd: f64, vg: f64, vs: f64, vb: f64) -> f64 {
+        let p = if self.pmos { -1.0 } else { 1.0 };
+        let swap = p * (vd - vs) < 0.0;
+        let (vds, vgs, vbs) = if swap {
+            (p * (vs - vd), p * (vg - vd), p * (vb - vd))
+        } else {
+            (p * (vd - vs), p * (vg - vs), p * (vb - vs))
+        };
+        let body = if vbs <= 0.0 {
+            (self.phi - vbs).sqrt() - self.phi.sqrt()
+        } else {
+            -vbs / (2.0 * self.phi.sqrt())
+        };
+        let vov = vgs - (p * self.vto + self.gamma * body);
+        let beta = self.kp * self.w / self.l;
+        let i = if vov <= 0.0 {
+            0.0
+        } else if vds < vov {
+            beta * (vov - 0.5 * vds) * vds * (1.0 + self.lambda * vds)
+        } else {
+            0.5 * beta * vov * vov * (1.0 + self.lambda * vds)
+        };
+        if swap {
+            -p * i
+        } else {
+            p * i
+        }
+    }
+}
+
+/// Resistors, diodes, MOSFETs, grounded voltage sources and current sources (`(from, to, amps)`: `amps` leave
+/// `from` and enter `to` through the source), with nodes named by their numbers.
 #[derive(Clone, Default)]
 struct Circuit {
     res: Vec<(usize, usize, f64)>,
     diodes: Vec<Diode>,
+    mos: Vec<Mos>,
     vsrc: Vec<(usize, f64)>,
     isrc: Vec<(usize, usize, f64)>,
 }
@@ -33,6 +85,17 @@ impl Circuit {
         let mut s = String::from("batch test\n");
         for (k, d) in self.diodes.iter().enumerate() {
             s += &format!(".model DM{k} D(IS={:e} N={})\n", d.is, d.n);
+        }
+        for (k, m) in self.mos.iter().enumerate() {
+            s += &format!(
+                ".model MM{k} {}(VTO={} KP={:e} LAMBDA={} GAMMA={} PHI={})\n",
+                if m.pmos { "PMOS" } else { "NMOS" },
+                m.vto,
+                m.kp,
+                m.lambda,
+                m.gamma,
+                m.phi
+            );
         }
         for (k, &(node, v)) in self.vsrc.iter().enumerate() {
             s += &format!("V{} {node} 0 DC {v}\n", k + 1);
@@ -45,6 +108,18 @@ impl Circuit {
         }
         for (k, d) in self.diodes.iter().enumerate() {
             s += &format!("D{} {} {} DM{k} {}\n", k + 1, d.a, d.c, d.area);
+        }
+        for (k, m) in self.mos.iter().enumerate() {
+            s += &format!(
+                "M{} {} {} {} {} MM{k} W={:e} L={:e}\n",
+                k + 1,
+                m.d,
+                m.g,
+                m.s,
+                m.b,
+                m.w,
+                m.l
+            );
         }
         s + ".end\n"
     }
@@ -64,6 +139,11 @@ impl Circuit {
                 }
                 (b'D', "n") => c.diodes[idx].n = *v,
                 (b'D', "area") => c.diodes[idx].area = *v,
+                (b'M', "w") => c.mos[idx].w = *v,
+                (b'M', "l") => c.mos[idx].l = *v,
+                (b'M', "vto") => c.mos[idx].vto = *v,
+                (b'M', "kp") => c.mos[idx].kp = *v,
+                (b'M', "lambda") => c.mos[idx].lambda = *v,
                 _ => panic!("override {dev} {p}"),
             }
         }
@@ -96,6 +176,22 @@ impl Circuit {
             } + GMIN * vd;
             add(d.a, id);
             add(d.c, -id);
+        }
+        for m in &self.mos {
+            let id = m.drain_current(v(m.d), v(m.g), v(m.s), v(m.b));
+            add(m.d, id);
+            add(m.s, -id);
+            // bulk-drain and bulk-source junctions (anode at the bulk of an NMOS), each with `gmin` across it; none
+            // where the terminal is the bulk itself
+            for node in [m.d, m.s] {
+                if node != m.b {
+                    let (a, c) = if m.pmos { (node, m.b) } else { (m.b, node) };
+                    let vj = v(a) - v(c);
+                    let i = 1e-14 * ((vj / VT).exp() - 1.0) + GMIN * vj;
+                    add(a, i);
+                    add(c, -i);
+                }
+            }
         }
         for &(a, b, i) in &self.isrc {
             add(a, i);
@@ -137,6 +233,78 @@ fn cascade(n: usize) -> Circuit {
         c.res.push((n_in, n_mid, 10000.0));
     }
     c
+}
+
+fn nmos(d: usize, g: usize, s: usize, b: usize) -> Mos {
+    Mos {
+        d,
+        g,
+        s,
+        b,
+        pmos: false,
+        w: 2e-6,
+        l: 1e-6,
+        vto: 0.7,
+        kp: 1.1e-4,
+        lambda: 0.02,
+        gamma: 0.4,
+        phi: 0.7,
+    }
+}
+
+fn pmos(d: usize, g: usize, s: usize, b: usize) -> Mos {
+    Mos {
+        pmos: true,
+        w: 4e-6,
+        vto: -0.8,
+        kp: 4e-5,
+        lambda: 0.03,
+        gamma: 0.3,
+        ..nmos(d, g, s, b)
+    }
+}
+
+/// `n` CMOS inverters in a chain: VDD at node 1 (`V1`), the input at node 2 (`V2`), stage `k` drives node
+/// `2 + k`. Every bulk junction lies across a drain and a source tied to the bulk (folded into the MOSFET).
+fn inverter_chain(n: usize) -> Circuit {
+    let mut c = Circuit {
+        vsrc: vec![(1, 3.3), (2, 0.0)],
+        ..Default::default()
+    };
+    for k in 1..=n {
+        c.mos.push(nmos(2 + k, 1 + k, 0, 0));
+        c.mos.push(pmos(2 + k, 1 + k, 1, 1));
+    }
+    c
+}
+
+/// Analog stages with body effect: a differential pair on a mirrored tail, a source follower, a PMOS common
+/// source stage, an NMOS gain stage and a pass transistor that runs reversed (source above drain). VDD at node 1,
+/// the inputs at nodes 2 and 3.
+fn amplifier() -> Circuit {
+    Circuit {
+        vsrc: vec![(1, 3.3), (2, 1.6), (3, 1.5)],
+        res: vec![
+            (1, 4, 2e4),
+            (1, 5, 2e4),
+            (1, 7, 5e4),
+            (8, 0, 2e4),
+            (9, 0, 2e4),
+            (1, 10, 2e4),
+            (11, 0, 2e4),
+        ],
+        mos: vec![
+            nmos(4, 2, 6, 0),
+            nmos(5, 3, 6, 0),
+            nmos(6, 7, 0, 0),
+            nmos(7, 7, 0, 0),
+            nmos(1, 4, 8, 0),
+            pmos(9, 5, 1, 1),
+            nmos(10, 9, 0, 0),
+            nmos(11, 1, 10, 0),
+        ],
+        ..Default::default()
+    }
 }
 
 struct Lcg(u64);
@@ -195,6 +363,9 @@ fn nodes_of(c: &Circuit) -> usize {
     }
     for d in &c.diodes {
         m = m.max(d.a).max(d.c);
+    }
+    for t in &c.mos {
+        m = m.max(t.d).max(t.g).max(t.s).max(t.b);
     }
     m
 }
@@ -258,6 +429,102 @@ fn mesh_corners(c: &Circuit, n: usize, seed: u64) -> Vec<BatchCircuitInput> {
             BatchCircuitInput { overrides: o }
         })
         .collect()
+}
+
+fn chain_corners(n: usize) -> Vec<BatchCircuitInput> {
+    let mut g = Lcg(5);
+    (0..n)
+        .map(|k| {
+            let vdd = 1.8 + 1.5 * g.next();
+            BatchCircuitInput {
+                overrides: vec![
+                    ("V1".to_string(), "dc".to_string(), vdd),
+                    (
+                        "V2".to_string(),
+                        "dc".to_string(),
+                        vdd * k as f64 / (n - 1) as f64,
+                    ),
+                ],
+            }
+        })
+        .collect()
+}
+
+/// Supply and input corners with every MOSFET parameter kind varied on random devices (W, L, VTO, KP, LAMBDA,
+/// some overridden twice in one corner) and a resistor.
+fn amplifier_corners(c: &Circuit, n: usize, seed: u64) -> Vec<BatchCircuitInput> {
+    let mut g = Lcg(seed);
+    (0..n)
+        .map(|_| {
+            let mut o = vec![
+                ("V1".to_string(), "dc".to_string(), 2.5 + 1.1 * g.next()),
+                ("V2".to_string(), "dc".to_string(), 1.2 + 0.6 * g.next()),
+                ("V3".to_string(), "dc".to_string(), 1.2 + 0.6 * g.next()),
+            ];
+            for _ in 0..5 {
+                let k = g.pick(c.mos.len());
+                let m = c.mos[k];
+                let s = 0.8 + 0.4 * g.next();
+                let (p, v) = match g.pick(5) {
+                    0 => ("w", m.w * s),
+                    1 => ("l", m.l * s),
+                    2 => ("vto", m.vto * s),
+                    3 => ("kp", m.kp * s),
+                    _ => ("lambda", m.lambda * s),
+                };
+                o.push((format!("M{}", k + 1), p.to_string(), v));
+            }
+            let k = 1 + g.pick(c.res.len());
+            o.push((format!("R{k}"), "r".to_string(), 1e4 + 3e4 * g.next()));
+            BatchCircuitInput { overrides: o }
+        })
+        .collect()
+}
+
+/// The kernel path (`cpu_ref`) against the CPU batch API (within the Newton tolerance) and the KCL check; returns
+/// the number of CPU fallbacks.
+fn check_against_cpu(name: &str, c: &Circuit, inputs: &[BatchCircuitInput]) -> usize {
+    let sim = Simulator::from_spice(&c.deck()).unwrap();
+    let cpu = sim.run_batch_dc_op(inputs).unwrap();
+    let run = sim
+        .run_batch_dc_op_with(inputs, BatchDcEngine::CpuRef)
+        .unwrap();
+    assert_eq!(run.unsupported, None);
+    eprintln!(
+        "{name} plan: {}",
+        sim.batch_dc_plan(&inputs[..1]).unwrap().0.summary()
+    );
+    let mut worst = 0.0f64;
+    for (k, (a, b)) in run.outputs.iter().zip(&cpu).enumerate() {
+        worst = worst.max(assert_close(
+            &format!("{name} corner {k}"),
+            &a.solution,
+            &b.solution,
+            1e-9,
+        ));
+        check_kcl(&sim, &c.with(&inputs[k].overrides), &a.solution);
+    }
+    eprintln!(
+        "{name}: {} corners, {} CPU fallbacks, largest relative difference to the CPU batch API {worst:e}",
+        inputs.len(),
+        run.cpu_fallback
+    );
+    run.cpu_fallback
+}
+
+#[test]
+fn cpu_ref_matches_the_cpu_batch_api_on_a_cmos_inverter_chain() {
+    let inputs = chain_corners(256);
+    let fallback = check_against_cpu("inverter chain", &inverter_chain(20), &inputs);
+    assert!(fallback <= inputs.len() / 10, "{fallback} CPU fallbacks");
+}
+
+#[test]
+fn cpu_ref_maps_every_mosfet_parameter_like_set_device_parameter() {
+    let c = amplifier();
+    let inputs = amplifier_corners(&c, 192, 17);
+    let fallback = check_against_cpu("amplifier", &c, &inputs);
+    assert!(fallback <= inputs.len() / 10, "{fallback} CPU fallbacks");
 }
 
 #[test]
@@ -324,13 +591,13 @@ fn cpu_ref_maps_every_parameter_kind_like_set_device_parameter() {
 
 #[test]
 fn unsupported_circuits_run_on_the_cpu_solver() {
-    let deck = "inverter\n.model NM NMOS(VTO=0.7 KP=1e-4)\n.model PM PMOS(VTO=-0.7 KP=5e-5)\n\
-                VDD vdd 0 DC 3\nVIN in 0 DC 1\nM1 out in 0 0 NM W=2u L=1u\nM2 out in vdd vdd PM W=4u L=1u\n\
-                R1 out 0 1meg\n.end\n";
+    // a diode with breakdown is a full junction
+    let deck = "clamp\n.model DZ D(IS=1e-14 BV=2.5)\nV1 in 0 DC 1\nR1 in out 1k\nD1 0 out DZ\n\
+                R2 out 0 10k\n.end\n";
     let sim = Simulator::from_spice(deck).unwrap();
     let inputs: Vec<BatchCircuitInput> = (0..8)
         .map(|k| BatchCircuitInput {
-            overrides: vec![("VIN".into(), "dc".into(), 0.4 * k as f64)],
+            overrides: vec![("V1".into(), "dc".into(), 0.5 * k as f64)],
         })
         .collect();
     let run = sim
@@ -339,7 +606,7 @@ fn unsupported_circuits_run_on_the_cpu_solver() {
     assert!(run
         .unsupported
         .as_deref()
-        .is_some_and(|r| r.contains("MOSFET")));
+        .is_some_and(|r| r.contains("breakdown")));
     let cpu = sim.run_batch_dc_op(&inputs).unwrap();
     for (a, b) in run.outputs.iter().zip(&cpu) {
         assert_eq!(a.solution, b.solution);
@@ -394,6 +661,12 @@ fn cuda_kernel_matches_cpu_ref() {
     for (name, c, inputs) in [
         ("cascade", cascade(32), supply_corners(2000)),
         ("mesh", mesh(40, 7), mesh_corners(&mesh(40, 7), 1000, 13)),
+        ("inverter chain", inverter_chain(20), chain_corners(1000)),
+        (
+            "amplifier",
+            amplifier(),
+            amplifier_corners(&amplifier(), 1000, 19),
+        ),
     ] {
         let sim = Simulator::from_spice(&c.deck()).unwrap();
         let (plan, params) = sim.batch_dc_plan(&inputs).unwrap();

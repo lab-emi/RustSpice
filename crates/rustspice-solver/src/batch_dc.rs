@@ -1,10 +1,12 @@
 //! Batched DC operating points on the batch kernel of `rustspice-backend-cuda-simt` (its rayon `cpu_ref` or a
 //! CUDA GPU), with the CPU solver for what the kernel leaves.
 //!
-//! The kernel replays the CPU solver's own data (gather tables, fill-reducing order, static-pivot elimination
-//! stream, Newton tolerances) without the CPU's fallbacks: a corner that does not converge, needs a new pivot order
-//! or puts a junction beyond the exponential's range is re-solved by [`Simulator::run_batch_dc_op`], which has
-//! dynamic re-pivoting, gmin stepping and source stepping. So every corner meets the same criteria as on the CPU.
+//! The kernel replays the CPU solver's own data (gather tables, static-pivot LU compiler, Newton tolerances) without
+//! the CPU's fallbacks: a corner that does not converge, needs a new pivot order or puts a junction beyond the
+//! exponential's range is re-solved by [`Simulator::run_batch_dc_op`], which has dynamic re-pivoting, gmin stepping
+//! and source stepping. So every corner meets the same criteria as on the CPU. Its column order is the CPU's with
+//! the nodes of grounded voltage sources first ([`AdaptiveSparseSolver::static_pivot_plan`]), which keeps one
+//! static pivot order stable through the regimes of a MOSFET circuit.
 
 use rustc_hash::FxHashMap;
 use rustspice_backend_cpu::{BatchCircuitInput, BatchCircuitOutput};
@@ -44,6 +46,8 @@ enum Target {
     DiodeIs(u32),
     DiodeN(u32),
     DiodeArea(u32),
+    /// A MOSFET value set as given (`W`, `L`, `VTO`, `KP`, `LAMBDA`).
+    Mos(ParamSlot),
 }
 
 fn resolve(soa: &DeviceSoaBuffer, dev: &str, param: &str) -> Result<Target, String> {
@@ -54,8 +58,16 @@ fn resolve(soa: &DeviceSoaBuffer, dev: &str, param: &str) -> Result<Target, Stri
             return Ok(Target::Resistor(soa.res_cond_buf_idx[i]));
         }
     }
-    if find(&soa.mos_names).is_some() {
-        return Err(format!("`{dev}` is a MOSFET"));
+    if let Some(m) = find(&soa.mos_names) {
+        let m = m as u32;
+        return match p.as_str() {
+            "w" => Ok(Target::Mos(ParamSlot::MosW(m))),
+            "l" => Ok(Target::Mos(ParamSlot::MosL(m))),
+            "vto" | "vt0" => Ok(Target::Mos(ParamSlot::MosVto(m))),
+            "kp" => Ok(Target::Mos(ParamSlot::MosKp(m))),
+            "lambda" => Ok(Target::Mos(ParamSlot::MosLambda(m))),
+            _ => Err(format!("unsupported MOSFET parameter `{param}`")),
+        };
     }
     if let Some(d) = find(&soa.diode_names) {
         return match p.as_str() {
@@ -103,11 +115,6 @@ impl Simulator {
         self.backend
             .stamp_jacobian(&topo.soa, &mut topo.jacobian, &mut rhs)
             .map_err(|e| e.to_string())?;
-        // the plan a freshly compiled CPU solver uses for these values
-        let lin = AdaptiveSparseSolver::compile(&topo.jacobian).map_err(|e| e.to_string())?;
-        let (perm, value_map, lu) = lin
-            .unrolled_plan()
-            .ok_or("the CPU solver is not on its unrolled LU tier for this circuit")?;
 
         let soa = &topo.soa;
         let mut slots: Vec<ParamSlot> = Vec::new();
@@ -152,6 +159,7 @@ impl Simulator {
                                 slot(ParamSlot::DiodeIs(d), &mut slots)
                             }
                             Target::DiodeN(d) => slot(ParamSlot::DiodeN(d), &mut slots),
+                            Target::Mos(p) => slot(p, &mut slots),
                         };
                         at_pos[j] = Some((dev.as_str(), param.as_str(), t, s));
                         (t, s)
@@ -168,6 +176,11 @@ impl Simulator {
                 ParamSlot::SourceValue(i) => soa.rhs_buf[i as usize],
                 ParamSlot::DiodeIs(d) => soa.diode_is[d as usize],
                 ParamSlot::DiodeN(d) => soa.diode_n[d as usize],
+                ParamSlot::MosW(m) => soa.mos_w[m as usize],
+                ParamSlot::MosL(m) => soa.mos_l[m as usize],
+                ParamSlot::MosVto(m) => soa.mos_vto[m as usize],
+                ParamSlot::MosKp(m) => soa.mos_kp[m as usize],
+                ParamSlot::MosLambda(m) => soa.mos_lambda[m as usize],
             })
             .collect();
         let corners = inputs.len();
@@ -182,7 +195,9 @@ impl Simulator {
             for &(target, s, v) in &flat[start..end] {
                 match target {
                     Target::Resistor(_) => vals[s] = DeviceSoaBuffer::resistor_conductance("", v),
-                    Target::Source(_) | Target::DiodeIs(_) | Target::DiodeN(_) => vals[s] = v,
+                    Target::Source(_) | Target::DiodeIs(_) | Target::DiodeN(_) | Target::Mos(_) => {
+                        vals[s] = v
+                    }
                     Target::DiodeArea(d) => {
                         let old = *area.get(&d).unwrap_or(&soa.diode_area[d as usize]);
                         if old > 0.0 {
@@ -207,7 +222,13 @@ impl Simulator {
             res_reltol: o.res_reltol,
             box_release_iters: o.box_release_iters,
         };
-        let plan = BatchPlan::build(&topo, perm, value_map, lu, &newton, &slots)?;
+        // the static pivot order of these values, without the entries that stay zero
+        let constant_zero = BatchPlan::constant_zero_entries(&topo, &slots);
+        let (perm, value_map, lu) =
+            AdaptiveSparseSolver::static_pivot_plan(&topo.jacobian, &constant_zero).ok_or(
+                "the circuit is beyond the unrolled LU tier (dimension or operation budget)",
+            )?;
+        let plan = BatchPlan::build(&topo, &perm, &value_map, &lu, &newton, &slots)?;
         Ok((plan, params))
     }
 

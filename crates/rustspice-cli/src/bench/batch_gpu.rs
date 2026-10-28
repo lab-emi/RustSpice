@@ -1,6 +1,6 @@
-//! `rustspice bench-batch`: batched DC operating points of the b6 diode cascade at many corners, on the CPU solver's
-//! batch API (`Simulator::run_batch_dc_op`), the batch kernel's rayon `cpu_ref` and a CUDA GPU
-//! (`Simulator::run_batch_dc_op_with`).
+//! `rustspice bench-batch`: batched DC operating points of the b6 diode cascade and the b4 CMOS inverter chain at
+//! many corners, on the CPU solver's batch API (`Simulator::run_batch_dc_op`), the batch kernel's rayon `cpu_ref`
+//! and a CUDA GPU (`Simulator::run_batch_dc_op_with`).
 //!
 //! Every time is end to end: from the list of `BatchCircuitInput`s to one `BatchCircuitOutput` per corner, so it
 //! includes plan building, parameter mapping, host-device transfers, CPU re-solves of corners the kernel leaves and
@@ -16,7 +16,7 @@ use rustspice_backend_cpu::{BatchCircuitInput, BatchCircuitOutput};
 use rustspice_backend_cuda_simt::batch::CudaBatchSolver;
 use rustspice_solver::{BatchDcEngine, Simulator};
 
-use super::legacy::{cpu_model, diode_cascade_deck_with, git_label, git_state};
+use super::legacy::{cmos_chain_deck, cpu_model, diode_cascade_deck_with, git_label, git_state};
 
 #[derive(Args, Debug, Clone)]
 pub struct BatchArgs {
@@ -33,6 +33,15 @@ pub struct BatchArgs {
     /// Diodes of the cascade (b6 uses 32)
     #[arg(long, default_value_t = 32)]
     pub diodes: usize,
+    /// Corner counts of the CMOS inverter chain's supply and input corners
+    #[arg(long, value_delimiter = ',', default_value = "128,1024,16384,131072")]
+    pub mos_corners: Vec<usize>,
+    /// Corner counts of the CMOS inverter chain's Monte Carlo workload (VTO and KP of every MOSFET vary)
+    #[arg(long, value_delimiter = ',', default_value = "128,1024,16384")]
+    pub mos_mc_corners: Vec<usize>,
+    /// Stages of the CMOS inverter chain (b4 uses 100)
+    #[arg(long, default_value_t = 100)]
+    pub stages: usize,
     /// Repetitions per measurement (the median is reported; at most 3 above 100k corners)
     #[arg(long, default_value_t = 5)]
     pub reps: usize,
@@ -69,17 +78,7 @@ fn supply_inputs(n: usize) -> Vec<BatchCircuitInput> {
 /// Monte Carlo corners: supply 3.3 V +- 5 %, every resistor with a 1 % Gaussian spread, every diode IS log-normal
 /// with a 10 % spread (deterministic seed).
 fn monte_carlo_inputs(n: usize, diodes: usize) -> Vec<BatchCircuitInput> {
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut uniform = move || {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-    };
-    let mut gauss = move || {
-        let (u1, u2) = (uniform(), uniform());
-        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-    };
+    let mut gauss = gaussian(0x9e37_79b9_7f4a_7c15);
     (0..n)
         .map(|_| {
             let mut o = Vec::with_capacity(3 * diodes + 1);
@@ -92,6 +91,73 @@ fn monte_carlo_inputs(n: usize, diodes: usize) -> Vec<BatchCircuitInput> {
                     10000.0 * (1.0 + 0.01 * gauss()),
                 ));
                 o.push((format!("D{k}"), "is".into(), 1e-14 * (0.1 * gauss()).exp()));
+            }
+            BatchCircuitInput { overrides: o }
+        })
+        .collect()
+}
+
+/// A deterministic standard normal generator: Box-Muller over a 64-bit LCG seeded with `seed`.
+fn gaussian(seed: u64) -> impl FnMut() -> f64 {
+    let mut state = seed;
+    let mut uniform = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    move || {
+        let (u1, u2) = (uniform(), uniform());
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+}
+
+/// Supply and input corners of the inverter chain: VDD from 1.8 V to 3.6 V, the input from 0 to VDD (a grid of
+/// 64 input levels per supply; fewer than 64 corners sweep the input at 3.3 V).
+fn chain_inputs(n: usize) -> Vec<BatchCircuitInput> {
+    let levels = n.min(64);
+    let supplies = n.div_ceil(levels);
+    (0..n)
+        .map(|c| {
+            let vdd = if supplies > 1 {
+                1.8 + 1.8 * (c / levels) as f64 / (supplies - 1) as f64
+            } else {
+                3.3
+            };
+            let vin = vdd * (c % levels) as f64 / (levels.max(2) - 1) as f64;
+            BatchCircuitInput {
+                overrides: vec![
+                    ("VDD".into(), "dc".into(), vdd),
+                    ("VIN".into(), "dc".into(), vin),
+                ],
+            }
+        })
+        .collect()
+}
+
+/// Monte Carlo corners of the inverter chain: VDD 3.3 V +- 5 %, the input at a quarter of VDD (the first stages in
+/// their transition region), and for every MOSFET `VTO` with a 15 mV and `KP` with a 3 % Gaussian spread.
+fn chain_monte_carlo_inputs(n: usize, stages: usize) -> Vec<BatchCircuitInput> {
+    let mut gauss = gaussian(0x2545_f491_4f6c_dd1d);
+    (0..n)
+        .map(|_| {
+            let vdd = 3.3 * (1.0 + 0.05 * gauss());
+            let mut o = Vec::with_capacity(4 * stages + 2);
+            o.push(("VDD".into(), "dc".into(), vdd));
+            o.push(("VIN".into(), "dc".into(), 0.25 * vdd));
+            for k in 1..=stages {
+                o.push((format!("MN{k}"), "vto".into(), 0.7 + 0.015 * gauss()));
+                o.push((
+                    format!("MN{k}"),
+                    "kp".into(),
+                    120e-6 * (1.0 + 0.03 * gauss()),
+                ));
+                o.push((format!("MP{k}"), "vto".into(), -0.7 + 0.015 * gauss()));
+                o.push((
+                    format!("MP{k}"),
+                    "kp".into(),
+                    60e-6 * (1.0 + 0.03 * gauss()),
+                ));
             }
             BatchCircuitInput { overrides: o }
         })
@@ -169,7 +235,7 @@ fn run_workload(
         let rref = rref.map_err(|e| e.to_string())?;
         if let Some(why) = &rref.unsupported {
             return Err(format!(
-                "the batch kernel does not support the cascade: {why}"
+                "the batch kernel does not support the {name} workload: {why}"
             ));
         }
         let cuda = match gpu {
@@ -327,6 +393,9 @@ fn run_inner(args: &BatchArgs) -> Result<String, String> {
         Err(e) => (None, format!("none ({e}): CUDA columns not run"), None),
     };
     let (plan, _) = sim.batch_dc_plan(&supply_inputs(1))?;
+    let chain_deck = cmos_chain_deck(args.stages);
+    let chain = Simulator::from_spice(&chain_deck).map_err(|e| e.to_string())?;
+    let (chain_plan, _) = chain.batch_dc_plan(&chain_inputs(1))?;
     let supply = run_workload(
         &sim,
         gpu.as_ref(),
@@ -343,6 +412,22 @@ fn run_inner(args: &BatchArgs) -> Result<String, String> {
         &args.mc_corners,
         &|n| monte_carlo_inputs(n, args.diodes),
     )?;
+    let chain_grid = run_workload(
+        &chain,
+        gpu.as_ref(),
+        args,
+        "inverter chain",
+        &args.mos_corners,
+        &chain_inputs,
+    )?;
+    let chain_mc = run_workload(
+        &chain,
+        gpu.as_ref(),
+        args,
+        "inverter chain monte-carlo",
+        &args.mos_mc_corners,
+        &|n| chain_monte_carlo_inputs(n, args.stages),
+    )?;
 
     let (head, dirty) = git_state(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
     let threads = std::env::var("RAYON_NUM_THREADS")
@@ -353,11 +438,15 @@ fn run_inner(args: &BatchArgs) -> Result<String, String> {
     let _ = writeln!(s, "# Batched DC operating points: CPU vs CUDA\n");
     let _ = writeln!(
         s,
-        "Generated by `rustspice bench-batch`{}. Circuit: the {}-diode cascade of b6 (MNA dimension {}, {} workspace words per corner).\n",
+        "Generated by `rustspice bench-batch`{}. Circuits: the {}-diode cascade of b6 (MNA dimension {}, {} workspace words per corner) and the {}-stage CMOS inverter chain of b4 ({} level-1 MOSFETs with their bulk junctions, MNA dimension {}, {} workspace words per corner).\n",
         git_label(head.as_deref(), dirty),
         args.diodes,
         plan.dim(),
-        plan.workspace_slots()
+        plan.workspace_slots(),
+        args.stages,
+        2 * args.stages,
+        chain_plan.dim(),
+        chain_plan.workspace_slots()
     );
     let _ = writeln!(s, "- CPU: {} ({threads} rayon threads)", cpu_model());
     let _ = writeln!(s, "- GPU: {gpu_line}");
@@ -380,5 +469,18 @@ fn run_inner(args: &BatchArgs) -> Result<String, String> {
     );
     table(&mut s, &mc, init);
     split(&mut s, &mc);
+    let _ = writeln!(
+        s,
+        "\n## CMOS inverter chain: supply and input corners (VDD from 1.8 V to 3.6 V, the input from 0 to VDD)\n"
+    );
+    table(&mut s, &chain_grid, init);
+    split(&mut s, &chain_grid);
+    let _ = writeln!(
+        s,
+        "\n## CMOS inverter chain: Monte Carlo corners (VDD, and VTO and KP of every MOSFET: {} parameters per corner)\n",
+        4 * args.stages + 2
+    );
+    table(&mut s, &chain_mc, init);
+    split(&mut s, &chain_mc);
     Ok(s)
 }

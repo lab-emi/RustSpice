@@ -9,7 +9,9 @@
 // fill-reducing order and static-pivot elimination stream of `UnrolledSymbolicLu`, and the base `cond_buf` /
 // `rhs_buf` of every linear device. The Newton loop is `NonlinearSolver::solve_in_place` without its Shamanskii
 // shortcut: the same junction limiting, KCL residual test, step test and source voltage box, so an accepted corner
-// meets the CPU solver's convergence criteria.
+// meets the CPU solver's convergence criteria. The devices are evaluated in the CPU backend's order (plain diodes,
+// level-1 MOSFETs, then the plain junctions, which add onto the drain-source slots of the MOSFET they are folded
+// into).
 //
 // The kernel is bound by memory traffic, so a corner keeps only what differs between corners: device values that
 // are the same everywhere (resistors and sources that no parameter changes) are summed into the plan once
@@ -88,7 +90,23 @@ pub mod hdr {
     pub const F_DIODE_N: usize = 41;
     /// Static voltage source values.
     pub const F_VSRC: usize = 42;
-    pub const LEN: usize = 43;
+    /// Level-1 MOSFETs and plain junctions (MOSFET bulk junctions).
+    pub const NMOS: usize = 43;
+    pub const NJUNC: usize = 44;
+    /// 10 words per MOSFET: drain, gate, source, bulk, the dynamic conductance slots of `gm`, `gds`, `gmbs`,
+    /// reversed `gm`, reversed `gmbs`, and the dynamic RHS slot of its current.
+    pub const MOS: usize = 45;
+    /// 5 words per MOSFET (`W`, `L`, `VTO`, `KP`, `LAMBDA`): 0 for the plan's value (`F_MOS`), else 1 + the
+    /// parameter slot that holds the corner's value.
+    pub const MOS_PARAM: usize = 46;
+    /// 5 words per junction: anode, cathode, dynamic conductance slot, dynamic RHS slot, 1 when it is folded into
+    /// a MOSFET's drain-source slots (adds onto them) or 0 (owns them).
+    pub const JUNCS: usize = 47;
+    /// 8 values per MOSFET: polarity, `KP`, `W`, `L` (effective), `VTO`, `GAMMA`, `PHI`, `LAMBDA`.
+    pub const F_MOS: usize = 48;
+    /// 6 values per junction: `is`, `n Vt`, `1 / (n Vt)`, `is / (n Vt)`, critical voltage, fold sign.
+    pub const F_JUNC: usize = 49;
+    pub const LEN: usize = 50;
 }
 
 /// Scalars in the `f64` plan header.
@@ -119,6 +137,13 @@ pub mod param {
     pub const DIODE_IS: u32 = 2;
     /// Emission coefficient of diode `index`.
     pub const DIODE_N: u32 = 3;
+    /// `W`, `L`, `VTO`, `KP`, `LAMBDA` of MOSFET `index` (read from the parameter array where the MOSFET is
+    /// evaluated, not copied into the workspace).
+    pub const MOS_W: u32 = 4;
+    pub const MOS_L: u32 = 5;
+    pub const MOS_VTO: u32 = 6;
+    pub const MOS_KP: u32 = 7;
+    pub const MOS_LAMBDA: u32 = 8;
 }
 
 /// Outcome of one corner.
@@ -145,6 +170,7 @@ pub fn workspace_slots(pu: &[u32]) -> usize {
         + pu[hdr::NDRHS] as usize
         + pu[hdr::LU_NNZ] as usize
         + 3 * pu[hdr::NDIODE] as usize
+        + pu[hdr::NJUNC] as usize
 }
 
 /// Slot offsets of the workspace.
@@ -158,6 +184,8 @@ pub struct Slots {
     pub vd: usize,
     pub dis: usize,
     pub dn: usize,
+    /// Junction voltages of the last evaluation (the step limiter's reference).
+    pub vj: usize,
 }
 
 impl Slots {
@@ -171,6 +199,7 @@ impl Slots {
         let vd = lu + pu[hdr::LU_NNZ] as usize;
         let dis = vd + pu[hdr::NDIODE] as usize;
         let dn = dis + pu[hdr::NDIODE] as usize;
+        let vj = dn + pu[hdr::NDIODE] as usize;
         Slots {
             x,
             dx,
@@ -180,6 +209,7 @@ impl Slots {
             vd,
             dis,
             dn,
+            vj,
         }
     }
 }
@@ -266,6 +296,106 @@ pub fn diode_current(vd: f64, is: f64, n_vt: f64, gmin: f64) -> (f64, f64) {
     }
 }
 
+/// Level-1 (Shichman-Hodges) MOSFET at the node voltages `vd`, `vg`, `vs`, `vb`: the CPU backend's
+/// `eval_mosfets`, operation for operation. Returns `gm`, `gds`, `gmbs`, the Norton current and whether the device
+/// runs reversed (drain and source swapped).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn mos_level1(
+    vd: f64,
+    vg: f64,
+    vs: f64,
+    vb: f64,
+    pol: f64,
+    kp: f64,
+    w: f64,
+    l: f64,
+    vto: f64,
+    gamma: f64,
+    phi: f64,
+    lambda: f64,
+) -> (f64, f64, f64, f64, bool) {
+    let vds_signed = pol * (vd - vs);
+    let (mode, vds, vgs, vbs) = if vds_signed >= 0.0 {
+        (1.0_f64, vds_signed, pol * (vg - vs), pol * (vb - vs))
+    } else {
+        (-1.0_f64, -vds_signed, pol * (vg - vd), pol * (vb - vd))
+    };
+    let inv_l = 1.0 / l;
+    let beta = kp * (w * inv_l);
+    let phi = phi.max(0.0);
+    let vt0 = pol * vto;
+    let (von, d_von_d_vbs) = if gamma > 0.0 {
+        let sqrt_phi = phi.sqrt();
+        if vbs <= 0.0 {
+            let sarg = (phi - vbs).max(1e-30).sqrt();
+            (vt0 + gamma * (sarg - sqrt_phi), -gamma / (2.0 * sarg))
+        } else if sqrt_phi > 0.0 {
+            (
+                vt0 - gamma * vbs / (2.0 * sqrt_phi),
+                -gamma / (2.0 * sqrt_phi),
+            )
+        } else {
+            (vt0, 0.0)
+        }
+    } else {
+        (vt0, 0.0)
+    };
+    let clm = lambda.mul_add(vds, 1.0);
+    let v_ov = vgs - von;
+    let (cdrain, gm, gds) = if v_ov <= 0.0 {
+        (0.0, 0.0, 0.0)
+    } else if vds < v_ov {
+        let core = vds * (v_ov - 0.5 * vds);
+        (
+            beta * core * clm,
+            beta * vds * clm,
+            beta * (v_ov - vds) * clm + beta * lambda * core,
+        )
+    } else {
+        let core = 0.5 * v_ov * v_ov;
+        (beta * core * clm, beta * v_ov * clm, beta * lambda * core)
+    };
+    let gmbs = -gm * d_von_d_vbs;
+    let id = pol * mode * cdrain;
+    if mode > 0.0 {
+        let ieq = id - gm * (vg - vs) - gmbs * (vb - vs) - gds * (vd - vs);
+        (gm, gds, gmbs, ieq, false)
+    } else {
+        let ieq = id + gm * (vg - vd) + gmbs * (vb - vd) - gds * (vd - vs);
+        (gm, gds, gmbs, ieq, true)
+    }
+}
+
+/// Conductance and Norton current of a plain junction at `vd` (`BulkJunctions::evaluate` of the CPU backend):
+/// `is (exp(vd / nvt) - 1) + gmin vd`, with `exp - 1` from its Taylor series near zero bias.
+#[inline(always)]
+pub fn junction_current(
+    vd: f64,
+    is: f64,
+    nvt: f64,
+    inv_nvt: f64,
+    g_sat: f64,
+    gmin: f64,
+) -> (f64, f64) {
+    if vd < -40.0 * nvt {
+        (gmin, -is)
+    } else {
+        let arg = vd * inv_nvt;
+        let (em1, e) = if arg.abs() < 1e-3 {
+            let em1 = arg
+                * (1.0
+                    + arg * (0.5 + arg * (1.0 / 6.0 + arg * (1.0 / 24.0 + arg * (1.0 / 120.0)))));
+            (em1, 1.0 + em1)
+        } else {
+            let (e, de) = diode_exp(arg);
+            (e - 1.0, de)
+        };
+        let g = g_sat * e + gmin;
+        (g, is * em1 + gmin * vd - g * vd)
+    }
+}
+
 /// Solves one corner; the solution is left in the `x` slots. Returns the [`status`] and the Newton iterations.
 ///
 /// # Safety
@@ -335,6 +465,13 @@ unsafe fn solve_corner_inner(
     let f_dis = pu[hdr::F_DIODE_IS] as usize;
     let f_dn = pu[hdr::F_DIODE_N] as usize;
     let f_vsrc = pu[hdr::F_VSRC] as usize;
+    let nmos = pu[hdr::NMOS] as usize;
+    let njunc = pu[hdr::NJUNC] as usize;
+    let mos = pu[hdr::MOS] as usize;
+    let mos_param = pu[hdr::MOS_PARAM] as usize;
+    let juncs = pu[hdr::JUNCS] as usize;
+    let f_mos = pu[hdr::F_MOS] as usize;
+    let f_junc = pu[hdr::F_JUNC] as usize;
     let vt = pf[fhdr::VT];
     let gmin = pf[fhdr::GMIN];
     let reltol = pf[fhdr::RELTOL];
@@ -365,9 +502,12 @@ unsafe fn solve_corner_inner(
                 work.st(s.drhs + idx, v);
             } else if kind == param::DIODE_IS {
                 work.st(s.dis + idx, v);
-            } else {
+            } else if kind == param::DIODE_N {
                 work.st(s.dn + idx, v);
             }
+        }
+        for j in 0..njunc {
+            work.st(s.vj + j, 0.0);
         }
         for i in 0..n {
             work.st(s.x + i, 0.0);
@@ -398,7 +538,7 @@ unsafe fn solve_corner_inner(
 
         let mut iter = 1u32;
         while iter <= max_iters {
-            // 1. junctions (`eval_diodes`, step limiting on)
+            // 1. devices: plain diodes (`eval_diodes`, step limiting on)
             let mut limited = false;
             for d in 0..ndiode {
                 let anode = pu[diodes + 4 * d];
@@ -415,6 +555,64 @@ unsafe fn solve_corner_inner(
                 let (id, gd) = diode_current(vd, is, n_vt, gmin);
                 work.st(s.dcond + pu[diodes + 4 * d + 2] as usize, gd);
                 work.st(s.drhs + pu[diodes + 4 * d + 3] as usize, id - gd * vd);
+            }
+            // level-1 MOSFETs (no step limiting, as on the CPU); a value the corner overrides comes from `params`
+            for m in 0..nmos {
+                let u = mos + 10 * m;
+                let fm = f_mos + 8 * m;
+                let mp = mos_param + 5 * m;
+                let (gm, gds, gmbs, ieq, reversed) = mos_level1(
+                    work.node(s.x, pu[u]),
+                    work.node(s.x, pu[u + 1]),
+                    work.node(s.x, pu[u + 2]),
+                    work.node(s.x, pu[u + 3]),
+                    pf[fm],
+                    corner_value(pu[mp + 3], pf[fm + 1], params, pstride, pcorner),
+                    corner_value(pu[mp], pf[fm + 2], params, pstride, pcorner),
+                    corner_value(pu[mp + 1], pf[fm + 3], params, pstride, pcorner),
+                    corner_value(pu[mp + 2], pf[fm + 4], params, pstride, pcorner),
+                    pf[fm + 5],
+                    pf[fm + 6],
+                    corner_value(pu[mp + 4], pf[fm + 7], params, pstride, pcorner),
+                );
+                let (fwd_gm, fwd_gmbs, rev_gm, rev_gmbs) = if reversed {
+                    (0.0, 0.0, -gm, -gmbs)
+                } else {
+                    (gm, gmbs, 0.0, 0.0)
+                };
+                work.st(s.dcond + pu[u + 4] as usize, fwd_gm);
+                work.st(s.dcond + pu[u + 5] as usize, gds);
+                work.st(s.dcond + pu[u + 6] as usize, fwd_gmbs);
+                work.st(s.dcond + pu[u + 7] as usize, rev_gm);
+                work.st(s.dcond + pu[u + 8] as usize, rev_gmbs);
+                work.st(s.drhs + pu[u + 9] as usize, ieq);
+            }
+            // plain junctions (after the MOSFETs, whose drain-source slots the folded ones add onto)
+            for j in 0..njunc {
+                let u = juncs + 5 * j;
+                let fj = f_junc + 6 * j;
+                let raw = work.node(s.x, pu[u]) - work.node(s.x, pu[u + 1]);
+                let (is, nvt, vcrit) = (pf[fj], pf[fj + 1], pf[fj + 4]);
+                let vd = if raw > vcrit {
+                    let v = pnjlim(raw, work.ld(s.vj + j), nvt, vcrit);
+                    if v != raw || v > DIODE_EXP_ARG_MAX * nvt {
+                        limited = true;
+                    }
+                    v
+                } else {
+                    raw
+                };
+                work.st(s.vj + j, vd);
+                let (g, ieq) = junction_current(vd, is, nvt, pf[fj + 2], pf[fj + 3], gmin);
+                let c = s.dcond + pu[u + 2] as usize;
+                let r = s.drhs + pu[u + 3] as usize;
+                if pu[u + 4] == 0 {
+                    work.st(c, g);
+                    work.st(r, ieq);
+                } else {
+                    work.st(c, work.ld(c) + g);
+                    work.st(r, work.ld(r) + pf[fj + 5] * ieq);
+                }
             }
 
             // 2. Jacobian straight into the LU array: static sum plus the dynamic terms; max |J| for the growth test
@@ -459,7 +657,7 @@ unsafe fn solve_corner_inner(
                 work.st(s.dx + pu[row_pos + i] as usize, r);
             }
             if iter > 1 && prev_step_converged && res_ok && !limited {
-                return (exp_range_status(pu, work, s, vt), iter - 1);
+                return (exp_range_status(pu, pf, work, s, vt), iter - 1);
             }
 
             // 4. static-pivot LU of J (`UnrolledSymbolicLu::factorize`)
@@ -547,7 +745,7 @@ unsafe fn solve_corner_inner(
             }
             prev_step_converged = step_ok && !box_binding;
             if step_ok && res_ok && max_step <= vntol && !limited && !box_binding {
-                return (exp_range_status(pu, work, s, vt), iter);
+                return (exp_range_status(pu, pf, work, s, vt), iter);
             }
             iter += 1;
         }
@@ -555,15 +753,33 @@ unsafe fn solve_corner_inner(
     }
 }
 
+/// The plan's value `plan`, or the corner's value of parameter slot `slot - 1` when `slot > 0`.
+#[inline(always)]
+fn corner_value(slot: u32, plan: f64, params: &[f64], pstride: usize, pcorner: usize) -> f64 {
+    if slot == 0 {
+        plan
+    } else {
+        params[(slot as usize - 1) * pstride + pcorner]
+    }
+}
+
 /// [`status::EXP_RANGE`] when an accepted iterate puts a junction beyond the exponential's range.
 #[inline(always)]
-unsafe fn exp_range_status(pu: &[u32], work: Work, s: Slots, vt: f64) -> u32 {
+unsafe fn exp_range_status(pu: &[u32], pf: &[f64], work: Work, s: Slots, vt: f64) -> u32 {
     let diodes = pu[hdr::DIODES] as usize;
     for d in 0..pu[hdr::NDIODE] as usize {
-        let vd = unsafe {
-            work.node(s.x, pu[diodes + 4 * d]) - work.node(s.x, pu[diodes + 4 * d + 1])
-        };
+        let vd =
+            unsafe { work.node(s.x, pu[diodes + 4 * d]) - work.node(s.x, pu[diodes + 4 * d + 1]) };
         if vd / (unsafe { work.ld(s.dn + d) } * vt) > DIODE_EXP_ARG_MAX {
+            return status::EXP_RANGE;
+        }
+    }
+    let juncs = pu[hdr::JUNCS] as usize;
+    let f_junc = pu[hdr::F_JUNC] as usize;
+    for j in 0..pu[hdr::NJUNC] as usize {
+        let vd =
+            unsafe { work.node(s.x, pu[juncs + 5 * j]) - work.node(s.x, pu[juncs + 5 * j + 1]) };
+        if vd > DIODE_EXP_ARG_MAX * pf[f_junc + 6 * j + 1] {
             return status::EXP_RANGE;
         }
     }
