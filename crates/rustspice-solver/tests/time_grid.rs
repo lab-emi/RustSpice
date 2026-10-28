@@ -106,3 +106,78 @@ fn dc_sweep_decimal_steps_keep_the_last_point() {
         assert!((v - (k as f64) * 1e-3).abs() <= 1e-12, "point {k}: {v}");
     }
 }
+
+/// Linear-interpolated crossings of `level` between the rows.
+fn crossings(t: &[f64], y: &[f64], level: f64) -> Vec<f64> {
+    (1..t.len())
+        .filter_map(|k| {
+            let (a, b) = (y[k - 1] - level, y[k] - level);
+            ((a < 0.0 && b >= 0.0) || (a > 0.0 && b <= 0.0))
+                .then(|| t[k - 1] + a / (a - b) * (t[k] - t[k - 1]))
+        })
+        .collect()
+}
+
+#[test]
+fn internal_points_resolve_an_edge_shorter_than_tstep() {
+    // RC (tau = 5 ps) driven by a 10 ps ramp to 1 V, rows every 10 ps. Closed form: the ramp response
+    // g(t) = (t - tau (1 - exp(-t / tau))) / tr, and v(t) = g(t) - g(t - tr) after the ramp.
+    let deck =
+        "edge\nV1 in 0 PULSE(0 1 0 10p 10p 1n 2n)\nR1 in out 1k\nC1 out 0 5f\n.tran 10p 1n\n.end\n";
+    let (tau, tr) = (5e-12, 10e-12);
+    let g = |t: f64| {
+        if t <= 0.0 {
+            0.0
+        } else {
+            (t - tau * (1.0 - (-t / tau).exp())) / tr
+        }
+    };
+    let v = |t: f64| g(t) - g(t - tr);
+    let (mut lo, mut hi) = (0.0, 100e-12);
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if v(mid) < 0.5 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let exact = 0.5 * (lo + hi);
+
+    let run = |internal: bool| {
+        let mut sim = Simulator::from_spice(deck).unwrap();
+        sim.transient_solver.options.internal_points = internal;
+        let res = sim.run_transient(10e-12, 1e-9).unwrap();
+        let out = sim.netlist.find_node("out").unwrap() - 1;
+        let y: Vec<f64> = res.waveforms.iter().map(|w| w[out]).collect();
+        (res.time_points, y)
+    };
+    let (t_grid, y_grid) = run(false);
+    let (t_all, y_all) = run(true);
+
+    // the grid rows are written either way, with the same values; the extra rows lie strictly between them
+    let on_grid: Vec<usize> = (0..t_all.len())
+        .filter(|&i| t_grid.contains(&t_all[i]))
+        .collect();
+    assert_eq!(on_grid.len(), t_grid.len());
+    for (k, &i) in on_grid.iter().enumerate() {
+        assert_eq!(y_all[i].to_bits(), y_grid[k].to_bits(), "row {k}");
+    }
+    assert!(t_all.len() > t_grid.len());
+    assert!(t_all.windows(2).all(|w| w[1] > w[0]));
+
+    let c_grid = crossings(&t_grid, &y_grid, 0.5);
+    let c_all = crossings(&t_all, &y_all, 0.5);
+    assert_eq!((c_grid.len(), c_all.len()), (1, 1));
+    // 10 ps rows cannot place a crossing that lies inside a 10 ps edge; the accepted steps can
+    assert!(
+        (c_grid[0] - exact).abs() > 0.3e-12,
+        "grid {:e} vs {exact:e}",
+        c_grid[0]
+    );
+    assert!(
+        (c_all[0] - exact).abs() < 0.05e-12,
+        "internal {:e} vs {exact:e}",
+        c_all[0]
+    );
+}

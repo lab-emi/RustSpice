@@ -47,6 +47,10 @@ enum Commands {
         /// Write a JSON timing/status summary (unavailable numbers are null)
         #[arg(long)]
         stats: Option<PathBuf>,
+        /// `.tran`: also write every accepted internal step between two `k * tstep` rows (as ngspice does without
+        /// `.options interp`), so that edges shorter than `tstep` are resolved
+        #[arg(long)]
+        internal_points: bool,
         /// Refuse the deck (exit 1) when the reader had to ignore, approximate or re-interpret anything
         #[arg(long)]
         strict: bool,
@@ -110,6 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             backend,
             raw,
             stats,
+            internal_points,
             strict,
             max_points,
             max_result_mib,
@@ -138,6 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &backend,
                 raw.as_deref(),
                 stats.as_deref(),
+                internal_points,
                 strict,
                 &limits,
             ) {
@@ -336,6 +342,7 @@ fn run_deck(
     backend: &str,
     raw: Option<&std::path::Path>,
     stats_path: Option<&std::path::Path>,
+    internal_points: bool,
     strict: bool,
     limits: &ResourceLimits,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -344,7 +351,15 @@ fn run_deck(
         let _ = fs::remove_file(r);
     }
     let mut stats = RunStats::default();
-    let result = run_deck_inner(netlist, backend, raw, &mut stats, strict, limits);
+    let result = run_deck_inner(
+        netlist,
+        backend,
+        raw,
+        &mut stats,
+        internal_points,
+        strict,
+        limits,
+    );
     stats.peak_rss_kib = peak_rss_kib();
     stats.status = Some(match &result {
         Ok(()) => "ok".to_string(),
@@ -365,6 +380,7 @@ fn run_deck_inner(
     backend: &str,
     raw: Option<&std::path::Path>,
     stats: &mut RunStats,
+    internal_points: bool,
     strict: bool,
     limits: &ResourceLimits,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -391,6 +407,7 @@ fn run_deck_inner(
     let t1 = Instant::now();
     let mut sim = Simulator::from_netlist(parsed, backend_arc)?;
     sim.set_limits(*limits);
+    sim.transient_solver.options.internal_points = internal_points;
     let compile_us = t1.elapsed().as_secs_f64() * 1e6;
     stats.compile_us = Some(compile_us);
     stats.solver_kind = Some(format!("{:?}", sim.linear_solver.kind));

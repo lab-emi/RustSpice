@@ -4,7 +4,8 @@
 //!
 //! # Time control
 //!
-//! * Output rows sit on the nominal grid `k * tstep` (plus `tstop`, and `tstart` when it is off-grid). A
+//! * Output rows sit on the nominal grid `k * tstep` (plus `tstop`, and `tstart` when it is off-grid; with
+//!   [`TranOptions::internal_points`] also every accepted step between two rows). A
 //!   nonlinear (or memoryless) circuit lands on them, stretching or shortening a step within `[0.5, 1.25] h`;
 //!   a linear circuit keeps its step (and its LU factors) and interpolates the rows between accepted steps
 //!   (quadratic through the last three accepted points of the current segment, linear right after a
@@ -70,6 +71,10 @@ pub struct TranOptions {
     pub abstol: f64,
     /// Factor by which the LTE estimate may exceed the tolerance (SPICE `trtol`).
     pub trtol: f64,
+    /// Also store every accepted internal step that falls between two output rows (ngspice's rawfile without
+    /// `.options interp`), so that edges shorter than `tstep` are resolved. The `k * tstep` rows are written either
+    /// way, with the same values. Extra rows stop once only the remaining grid rows fit in the point budget.
+    pub internal_points: bool,
 }
 
 impl Default for TranOptions {
@@ -81,6 +86,7 @@ impl Default for TranOptions {
             vntol: 1e-6,
             abstol: 1e-12,
             trtol: 7.0,
+            internal_points: false,
         }
     }
 }
@@ -820,6 +826,16 @@ impl TransientSolver {
                 time_points.push(t_out);
                 waveforms.push(row);
                 grid.advance();
+            }
+            // an accepted step between two rows: the solution there is exact, not interpolated
+            if self.options.internal_points
+                && t_new >= tstart
+                && time_points.last().is_none_or(|&tl| t_new > tl + teps)
+                && grid.peek().is_some_and(|tr| t_new < tr - teps)
+                && ((time_points.len() + grid.remaining()) as u64) < point_cap
+            {
+                time_points.push(t_new);
+                waveforms.push(x.clone());
             }
             self.cap_v_prev3.copy_from_slice(&topo.soa.cap_v_prev2);
             self.ind_i_prev3.copy_from_slice(&topo.soa.ind_i_prev2);

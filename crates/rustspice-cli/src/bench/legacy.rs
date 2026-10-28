@@ -1345,9 +1345,16 @@ pub struct Accuracy {
     /// What `rs_le_ng` compares: `independent oracle` where one exists, else `tight reference` (whose own error then
     /// bounds the RustSpice figure from below)
     pub rs_le_ng_basis: Option<String>,
-    /// Transients: largest 50 %-crossing time shift against the reference (seconds)
+    /// Transients: largest 50 %-crossing time shift against the reference (seconds), each waveform's crossings
+    /// interpolated between its own rawfile rows
     pub rs_edge_shift_s: Option<f64>,
     pub ng_edge_shift_s: Option<f64>,
+    /// The same with the reference read at the tool's own rows: the simulator's timing error alone
+    pub rs_edge_shift_at_rows_s: Option<f64>,
+    pub ng_edge_shift_at_rows_s: Option<f64>,
+    /// Shift of the reference's crossings when it is read only at the tool's rows: the resolution of those rows
+    pub rs_edge_row_floor_s: Option<f64>,
+    pub ng_edge_row_floor_s: Option<f64>,
     /// Transients without an oracle: the reference judged against a still tighter ngspice run (same metric as `rs_err`)
     pub ref_selfcheck: Option<f64>,
     pub ref_selfcheck_label: Option<String>,
@@ -1498,6 +1505,8 @@ struct Folded {
     err: Option<f64>,
     abs_v: Option<f64>,
     edge: Option<f64>,
+    edge_at_rows: Option<f64>,
+    edge_row_floor: Option<f64>,
     worst: Option<(String, Option<f64>)>,
     total: usize,
     vacuous: usize,
@@ -1523,6 +1532,18 @@ fn fold_one(cr: &CompareResult) -> Folded {
             .iter()
             .filter(|p| !p.vacuous)
             .filter_map(|p| p.edge_shift)
+            .reduce(f64::max),
+        edge_at_rows: cr
+            .probes
+            .iter()
+            .filter(|p| !p.vacuous)
+            .filter_map(|p| p.edge_shift_at_rows)
+            .reduce(f64::max),
+        edge_row_floor: cr
+            .probes
+            .iter()
+            .filter(|p| !p.vacuous)
+            .filter_map(|p| p.edge_row_floor)
             .reduce(f64::max),
         worst,
         total: cr.probes.len(),
@@ -1760,6 +1781,8 @@ fn accuracy_of(
     acc.rs_err = f.err;
     acc.rs_abs_v = f.abs_v;
     acc.rs_edge_shift_s = f.edge;
+    acc.rs_edge_shift_at_rows_s = f.edge_at_rows;
+    acc.rs_edge_row_floor_s = f.edge_row_floor;
     if let Some((name, at)) = f.worst {
         acc.worst_probe = Some(name);
         acc.worst_at = at;
@@ -1785,6 +1808,8 @@ fn accuracy_of(
         acc.ng_err = g.err;
         acc.ng_abs_v = g.abs_v;
         acc.ng_edge_shift_s = g.edge;
+        acc.ng_edge_shift_at_rows_s = g.edge_at_rows;
+        acc.ng_edge_row_floor_s = g.edge_row_floor;
     }
     if let (Some(a), Some(b)) = (acc.rs_err, acc.ng_err) {
         acc.rs_le_ng = Some(a <= b);
@@ -4290,12 +4315,16 @@ fn accuracy_section(cases: &[CaseResult], bench_filter: &dyn Fn(&CaseResult) -> 
         .map(|c| {
             let a = &c.accuracy;
             let rows_of = |n: Option<usize>| n.map_or("n/a".to_string(), |n| n.to_string());
+            let pair = |r: Option<f64>, n: Option<f64>| {
+                let ps =
+                    |v: Option<f64>| v.map_or("n/a".to_string(), |v| format!("{:.2} ps", v * 1e12));
+                format!("{} / {}", ps(r), ps(n))
+            };
             vec![
                 c.id.clone(),
-                a.rs_edge_shift_s
-                    .map_or("n/a".to_string(), |v| format!("{:.2} ps", v * 1e12)),
-                a.ng_edge_shift_s
-                    .map_or("n/a".to_string(), |v| format!("{:.2} ps", v * 1e12)),
+                pair(a.rs_edge_shift_s, a.ng_edge_shift_s),
+                pair(a.rs_edge_shift_at_rows_s, a.ng_edge_shift_at_rows_s),
+                pair(a.rs_edge_row_floor_s, a.ng_edge_row_floor_s),
                 a.worst_probe.clone().unwrap_or_else(|| "n/a".to_string()),
                 a.worst_at
                     .map_or("n/a".to_string(), |t| format!("{:.2} ns", t * 1e9)),
@@ -4321,8 +4350,9 @@ fn accuracy_section(cases: &[CaseResult], bench_filter: &dyn Fn(&CaseResult) -> 
         s.push_str(&md_table(
             &[
                 "Case",
-                "RustSpice max 50 % crossing shift",
-                "ngspice default max 50 % crossing shift",
+                "max 50 % crossing shift, rawfile rows: RustSpice / ngspice default",
+                "same, reference read at each tool's rows: RustSpice / ngspice default",
+                "resolution of the rows (reference read at them): RustSpice / ngspice default",
                 "RustSpice worst probe",
                 "worst at",
                 "rawfile rows: RustSpice / ngspice default / reference",
@@ -4331,6 +4361,7 @@ fn accuracy_section(cases: &[CaseResult], bench_filter: &dyn Fn(&CaseResult) -> 
             &tran_rows,
         ));
         s.push_str("\n`ngspice -b -r` writes its own adaptive internal time points (the row counts above), not a uniform grid. The comparison interpolates RustSpice, ngspice and the reference linearly onto the nominal `k * tstep` grid, so the ngspice error reported here depends on that comparison grid.\n");
+        s.push_str("\nThe first crossing column locates every crossing by linear interpolation between the tool's own rows, as a reader of the rawfile would. Rows that are coarser than an edge cannot place its crossing even when every row value is exact: the third column is that limit, measured on the reference itself read only at the tool's rows. The second column reads the reference at the same rows as the tool, so it is the simulator's own timing error. RustSpice writes the nominal `k * tstep` rows; `rustspice run --internal-points` also writes every accepted step in between, as ngspice does, and resolves edges shorter than `tstep`.\n");
     }
     let mut notes: Vec<String> = Vec::new();
     for c in cases.iter().filter(|c| bench_filter(c)) {

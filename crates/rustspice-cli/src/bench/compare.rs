@@ -145,8 +145,17 @@ pub struct ProbeResult {
     pub within_ng_error: Option<bool>,
     pub oracle_rs_err: Option<f64>,
     pub oracle_ng_err: Option<f64>,
-    /// Maximum 50 %-crossing time shift (tag `timing_edge`).
+    /// Maximum 50 %-crossing time shift (tag `timing_edge`), each waveform's crossings located by linear interpolation
+    /// between its own rows: what a reader of the two rawfiles sees.
     pub edge_shift: Option<f64>,
+    /// The same shift with the reference read at RustSpice's own rows (same sampling, same interpolation): the
+    /// simulator's own timing error, without the resolution of its output rows.
+    #[serde(default)]
+    pub edge_shift_at_rows: Option<f64>,
+    /// Maximum shift of the reference's own crossings when it is read only at RustSpice's rows: the resolution limit
+    /// of those rows (an edge shorter than the row spacing cannot be placed by linear interpolation).
+    #[serde(default)]
+    pub edge_row_floor: Option<f64>,
     /// `error / allowed error` for the probe's own metric: at most 1 passes. `None` for vacuous probes.
     pub tol_ratio: Option<f64>,
     /// Transient only: linear-resampling noise of the reference for this probe (normalised), see
@@ -1766,10 +1775,18 @@ fn compare_tran(
         if want_edge {
             let level = 0.5 * (lo + hi);
             let (cr, cs) = (crossings(t_rf, y_rf, level), crossings(t_rs, y_rs, level));
+            let rf_at_rows: Vec<f64> = t_rs.iter().map(|&t| interp(t_rf, y_rf, t)).collect();
+            let ca = crossings(t_rs, &rf_at_rows, level);
             let in_win = |v: Vec<f64>| -> Vec<f64> {
                 v.into_iter().filter(|t| *t >= t0 && *t <= tend).collect()
             };
-            let (cr, cs) = (in_win(cr), in_win(cs));
+            let (cr, cs, ca) = (in_win(cr), in_win(cs), in_win(ca));
+            let max_shift = |a: &[f64], b: &[f64]| {
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0, f64::max)
+            };
             if cr.len() != cs.len() {
                 p.note = Some(format!(
                     "50% crossings: rustspice {} vs reference {}",
@@ -1777,12 +1794,11 @@ fn compare_tran(
                     cr.len()
                 ));
             } else if !cr.is_empty() {
-                p.edge_shift = Some(
-                    cr.iter()
-                        .zip(&cs)
-                        .map(|(x, y)| (x - y).abs())
-                        .fold(0.0, f64::max),
-                );
+                p.edge_shift = Some(max_shift(&cr, &cs));
+                if ca.len() == cs.len() {
+                    p.edge_shift_at_rows = Some(max_shift(&ca, &cs));
+                    p.edge_row_floor = Some(max_shift(&cr, &ca));
+                }
             }
         }
         if let Some(acc) = oracle_acc.as_mut() {
@@ -2261,6 +2277,22 @@ mod tests {
         let r = run(&m, deck, &rs, &rf2);
         let shift = r.probes[0].edge_shift.unwrap();
         assert!((shift - 5e-6).abs() < 1e-7, "shift {shift}");
+        assert!((r.probes[0].edge_shift_at_rows.unwrap() - 5e-6).abs() < 1e-7);
+        // exact values on rows far coarser than the edge: the whole shift is the rows' resolution, not the simulator
+        let sharp = |t: f64| ((t - 3.03e-4) / 2e-6).tanh() - ((t - 7.03e-4) / 2e-6).tanh();
+        let rf3 = tran_plots(sharp, 1e-3, 100_000);
+        let rs = tran_plots(sharp, 1e-3, 100);
+        let r = run(&m, deck, &rs, &rf3);
+        let (naive, at_rows, floor) = (
+            r.probes[0].edge_shift.unwrap(),
+            r.probes[0].edge_shift_at_rows.unwrap(),
+            r.probes[0].edge_row_floor.unwrap(),
+        );
+        assert!(naive > 1e-6, "{naive}");
+        assert!(
+            at_rows < 1e-4 * naive && (floor - naive).abs() < 1e-4 * naive,
+            "{naive} {at_rows} {floor}"
+        );
         // rustspice stops early
         let rs = tran_plots(f, 5e-4, 500);
         let r = run(&m, deck, &rs, &rf);
