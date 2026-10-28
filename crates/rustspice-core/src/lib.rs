@@ -32,4 +32,4 @@ pub use soa::{
     intrinsic_mosfet_kernel_eval_with_derivatives, intrinsic_mosfet_kernel_msl_shader,
     intrinsic_mosfet_kernel_wgsl_shader, AlignedVec, CompiledTopology, DeviceSoaBuffer,
 };
-pub use sparse::{CscGatherTable, CscMatrix, CsrMatrix, GatherTerm};
+pub use sparse::{CscGatherTable, CscMatrix, CsrMatrix, GatherTerm, JaggedTerms};

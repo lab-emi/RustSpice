@@ -127,6 +127,80 @@ fn slope_kinks_do_not_ring_in_the_branch_current() {
     }
 }
 
+/// Node voltages of an `n`-section RC line (series `r`, shunt `c` to ground at every section end, open far end)
+/// driven by a ramp from 0 to `v` over `tr`, at the times `ts`: classical fourth-order Runge-Kutta with a step `h`
+/// far below the smallest time constant (an explicit method RustSpice does not use).
+fn rc_line_rk4(n: usize, r: f64, c: f64, v: f64, tr: f64, ts: &[f64], h: f64) -> Vec<Vec<f64>> {
+    let u = |t: f64| v * (t / tr).clamp(0.0, 1.0);
+    let f = |t: f64, x: &[f64], dx: &mut [f64]| {
+        for i in 0..n {
+            let left = if i == 0 { u(t) } else { x[i - 1] };
+            let right = if i + 1 < n { x[i + 1] } else { x[i] };
+            dx[i] = (left - 2.0 * x[i] + right) / (r * c);
+        }
+    };
+    let (mut x, mut t) = (vec![0.0; n], 0.0);
+    let mut k = [vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+    let mut tmp = vec![0.0; n];
+    let mut out = Vec::with_capacity(ts.len());
+    for &tg in ts {
+        while t < tg - 1e-6 * h {
+            let hh = h.min(tg - t);
+            f(t, &x, &mut k[0]);
+            for (j, (a, b)) in [(0.5, 0), (0.5, 1), (1.0, 2)].into_iter().enumerate() {
+                for i in 0..n {
+                    tmp[i] = x[i] + a * hh * k[b][i];
+                }
+                let (_, rest) = k.split_at_mut(j + 1);
+                f(t + a * hh, &tmp, &mut rest[0]);
+            }
+            for i in 0..n {
+                x[i] += hh / 6.0 * (k[0][i] + 2.0 * k[1][i] + 2.0 * k[2][i] + k[3][i]);
+            }
+            t += hh;
+        }
+        out.push(x.clone());
+    }
+    out
+}
+
+#[test]
+fn fast_ramp_corners_keep_the_rc_line_in_phase() {
+    // 60-section line (5 ohm, 10 fF: 50 fs per section) driven by a 10 ps ramp with hmax = tstep = 10 ps. The
+    // ramp spans one step: first-order restart steps of hmax / 8 at its two corners used to put the diffusion front
+    // ~2 ps ahead (4.5e-3 of the swing at v(22), t = 10 ps).
+    let n = 60;
+    let mut deck = String::from("rc line\nV1 1 0 PULSE(0 3.3 0 10p 10p 10n 20n)\n");
+    for k in 1..=n {
+        deck += &format!("R{k} {k} {} 5\nC{k} {} 0 10f\n", k + 1, k + 1);
+    }
+    deck += ".tran 10p 500p\n.end\n";
+    let (sim, res) = run(&deck);
+    // the corners act during the first rows: compare up to 100 ps
+    let rows: Vec<usize> = (0..res.time_points.len())
+        .filter(|&k| res.time_points[k] <= 100e-12 * (1.0 + 1e-9))
+        .collect();
+    let ts: Vec<f64> = rows.iter().map(|&k| res.time_points[k]).collect();
+    let exact = rc_line_rk4(n, 5.0, 10e-15, 3.3, 10e-12, &ts, 2e-15);
+    let mut worst = (0.0_f64, 0usize, 0.0_f64);
+    for (j, &k) in rows.iter().enumerate() {
+        for (i, &v) in exact[j].iter().enumerate() {
+            let id = sim.netlist.find_node(&(i + 2).to_string()).unwrap();
+            let e = (res.waveforms[k][id - 1] - v).abs() / 3.3;
+            if e > worst.0 {
+                worst = (e, i + 2, ts[j]);
+            }
+        }
+    }
+    assert!(
+        worst.0 < 1.5e-3,
+        "max error {:.3e} of the swing at v({}), t = {:e}",
+        worst.0,
+        worst.1,
+        worst.2
+    );
+}
+
 #[test]
 fn tmax_bounds_the_internal_step() {
     let base = "tmax\nV1 in 0 SIN(0 1 1k)\nR1 in out 1k\nC1 out 0 1n\n";

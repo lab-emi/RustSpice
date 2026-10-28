@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{SimError, SimResult};
 use crate::netlist::{Netlist, SourceWaveform};
-use crate::sparse::{CscGatherTable, CscMatrix, GatherTerm};
+use crate::sparse::{CscGatherTable, CscMatrix, GatherTerm, JaggedTerms};
 
 /// 64-byte cache-line aligned contiguous array for AVX-512 / AVX2 / NEON and GPU DMA transfers.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1338,6 +1338,8 @@ fn build_gather_table(
     }
 
     CscGatherTable {
+        jagged_nnz: JaggedTerms::build(&active_nnz, &nnz_terms),
+        jagged_rhs: JaggedTerms::build(&active_rhs, &rhs_terms),
         nnz_ptr,
         nnz_terms,
         active_nnz,

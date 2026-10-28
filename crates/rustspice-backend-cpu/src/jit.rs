@@ -442,46 +442,42 @@ impl UnrolledSymbolicLu {
 
     /// Verifies that the computed `lu_buf` factors did not suffer catastrophic element growth
     /// (`max(|L|, |U|) / max(|A|) <= MAX_FACTOR_GROWTH`) or near-zero pivots relative to `||A||_max`.
+    ///
+    /// Runs on every factorization, so it works on the bit patterns of `|v|`: for non-negative IEEE values the
+    /// integer order is the numeric order and every non-finite value lies above `+inf`'s pattern, so one integer
+    /// maximum per array replaces a chain of NaN-aware float maxima, and the extreme pivots come from the extreme
+    /// stored inverses instead of one division per pivot.
     #[inline]
     pub fn factors_are_stable(&self, csc_values: &[f64], lu_buf: &[f64]) -> bool {
-        let mut max_a = 0.0_f64;
-        for &v in csc_values {
-            if !v.is_finite() {
-                return false;
-            }
-            max_a = max_a.max(v.abs());
-        }
-        if max_a == 0.0 {
+        const ABS: u64 = !(1 << 63);
+        const INF: u64 = 0x7ff0_0000_0000_0000;
+        let max_bits =
+            |it: &mut dyn Iterator<Item = f64>| it.fold(0u64, |m, v| m.max(v.to_bits() & ABS));
+        let a_bits = max_bits(&mut csc_values.iter().copied());
+        if a_bits == 0 || a_bits >= INF {
             return false;
         }
-        // Check diagonal pivots (stored as 1.0 / U[k, k] in diag_lu_idx)
-        let mut max_u_diag = 0.0_f64;
-        let mut min_piv = f64::INFINITY;
+        let max_a = f64::from_bits(a_bits);
+        // Diagonal pivots are stored as 1.0 / U[k, k]
+        let (mut inv_min, mut inv_max) = (u64::MAX, 0u64);
         for &d_idx in &self.diag_lu_idx {
-            let inv_piv = lu_buf[d_idx as usize];
-            if !inv_piv.is_finite() || inv_piv == 0.0 {
-                return false;
-            }
-            let piv_abs = (1.0 / inv_piv).abs();
-            max_u_diag = max_u_diag.max(piv_abs);
-            min_piv = min_piv.min(piv_abs);
+            let b = lu_buf[d_idx as usize].to_bits() & ABS;
+            inv_min = inv_min.min(b);
+            inv_max = inv_max.max(b);
         }
-        // Check off-diagonal L multipliers and U entries
-        let mut max_lu = max_u_diag;
-        for term in &self.l_terms {
-            let v = lu_buf[term.lu_idx as usize];
-            if !v.is_finite() {
-                return false;
-            }
-            max_lu = max_lu.max(v.abs());
+        if self.diag_lu_idx.is_empty() || inv_min == 0 || inv_max >= INF {
+            return false;
         }
-        for term in &self.u_terms {
-            let v = lu_buf[term.lu_idx as usize];
-            if !v.is_finite() {
-                return false;
-            }
-            max_lu = max_lu.max(v.abs());
+        // Off-diagonal L multipliers and U entries
+        let lu_bits = max_bits(&mut self.l_terms.iter().map(|t| lu_buf[t.lu_idx as usize])).max(
+            max_bits(&mut self.u_terms.iter().map(|t| lu_buf[t.lu_idx as usize])),
+        );
+        if lu_bits >= INF {
+            return false;
         }
+        let max_u_diag = 1.0 / f64::from_bits(inv_min);
+        let min_piv = 1.0 / f64::from_bits(inv_max);
+        let max_lu = max_u_diag.max(f64::from_bits(lu_bits));
         max_lu <= Self::MAX_FACTOR_GROWTH * max_a && min_piv >= 1e-12 * max_a
     }
 

@@ -252,6 +252,74 @@ pub struct CscGatherTable {
     pub rhs_terms: Vec<GatherTerm>,
     /// Compact list of `(row_index, term_start, term_end)` for non-empty RHS buckets.
     pub active_rhs: Vec<(u32, u32, u32)>,
+    /// [`JaggedTerms`] copy of `active_nnz` / `nnz_terms` for the CPU gather (`None` when a sign is not `+-1`).
+    #[serde(default)]
+    pub jagged_nnz: Option<JaggedTerms>,
+    /// [`JaggedTerms`] copy of `active_rhs` / `rhs_terms`.
+    #[serde(default)]
+    pub jagged_rhs: Option<JaggedTerms>,
+}
+
+/// Jagged-diagonal copy of the terms of a [`CscGatherTable`]: the targets sorted by their number of terms (most
+/// first), the `k`-th term of every target stored together (`lanes[k]` targets have one), each source index with
+/// its sign (`-1`) in bit 31.
+///
+/// The bucket-per-target loop pays a mispredicted loop exit per target and reads 16-byte terms; here the inner loop
+/// runs over distinct targets with a fixed trip count and 4-byte entries. Every target still adds its terms in table
+/// order, so the sums are bit-identical.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct JaggedTerms {
+    pub target: Vec<u32>,
+    pub lanes: Vec<u32>,
+    pub src: Vec<u32>,
+}
+
+impl JaggedTerms {
+    const NEG: u32 = 1 << 31;
+
+    /// The jagged form of the buckets `active` (`(target, term_start, term_end)`) of `terms`; `None` when a sign is
+    /// not `+-1` or a source index needs bit 31.
+    pub fn build(active: &[(u32, u32, u32)], terms: &[GatherTerm]) -> Option<Self> {
+        if terms
+            .iter()
+            .any(|t| (t.sign != 1.0 && t.sign != -1.0) || t.buffer_idx >= Self::NEG)
+        {
+            return None;
+        }
+        let mut order: Vec<(u32, u32, u32)> = active.to_vec();
+        order.sort_by_key(|&(k, s, e)| (std::cmp::Reverse(e - s), k));
+        let longest = order.first().map_or(0, |&(_, s, e)| e - s);
+        let mut lanes = Vec::with_capacity(longest as usize);
+        let mut src = Vec::with_capacity(terms.len());
+        for j in 0..longest {
+            let n = order.partition_point(|&(_, s, e)| e - s > j);
+            lanes.push(n as u32);
+            for &(_, s, _) in &order[..n] {
+                let t = terms[(s + j) as usize];
+                src.push(t.buffer_idx | if t.sign < 0.0 { Self::NEG } else { 0 });
+            }
+        }
+        Some(Self {
+            target: order.iter().map(|&(k, ..)| k).collect(),
+            lanes,
+            src,
+        })
+    }
+
+    /// `out[target] += +-buf[src]` for every term.
+    #[inline]
+    pub fn add_into(&self, buf: &[f64], out: &mut [f64]) {
+        let mut off = 0usize;
+        for &n in &self.lanes {
+            let n = n as usize;
+            for (&code, &t) in self.src[off..off + n].iter().zip(&self.target[..n]) {
+                let v = buf[(code & !Self::NEG) as usize];
+                out[t as usize] +=
+                    f64::from_bits(v.to_bits() ^ (u64::from(code & Self::NEG) << 32));
+            }
+            off += n;
+        }
+    }
 }
 
 impl CscGatherTable {
@@ -266,15 +334,28 @@ impl CscGatherTable {
         rhs: &mut [f64],
     ) {
         csc_values.fill(0.0);
-        for &(k, start, end) in &self.active_nnz {
-            let mut acc = 0.0_f64;
-            for term in &self.nnz_terms[start as usize..end as usize] {
-                acc = term.sign.mul_add(cond_buf[term.buffer_idx as usize], acc);
+        if let Some(j) = &self.jagged_nnz {
+            j.add_into(cond_buf, csc_values);
+        } else {
+            for &(k, start, end) in &self.active_nnz {
+                let mut acc = 0.0_f64;
+                for term in &self.nnz_terms[start as usize..end as usize] {
+                    acc = term.sign.mul_add(cond_buf[term.buffer_idx as usize], acc);
+                }
+                csc_values[k as usize] = acc;
             }
-            csc_values[k as usize] = acc;
         }
+        self.gather_rhs(rhs_buf, rhs);
+    }
 
+    /// `rhs` from the device current buffer `rhs_buf` (rows without a term are zero).
+    #[inline]
+    pub fn gather_rhs(&self, rhs_buf: &[f64], rhs: &mut [f64]) {
         rhs.fill(0.0);
+        if let Some(j) = &self.jagged_rhs {
+            j.add_into(rhs_buf, rhs);
+            return;
+        }
         for &(i, start, end) in &self.active_rhs {
             let mut acc = 0.0_f64;
             for term in &self.rhs_terms[start as usize..end as usize] {
@@ -296,21 +377,17 @@ impl CscGatherTable {
         rhs: &mut [f64],
     ) {
         csc_values.copy_from_slice(static_base);
-        for &(k, start, end) in &self.active_nnz {
-            let mut acc = csc_values[k as usize];
-            for term in &self.nnz_terms[start as usize..end as usize] {
-                acc = term.sign.mul_add(cond_buf[term.buffer_idx as usize], acc);
+        if let Some(j) = &self.jagged_nnz {
+            j.add_into(cond_buf, csc_values);
+        } else {
+            for &(k, start, end) in &self.active_nnz {
+                let mut acc = csc_values[k as usize];
+                for term in &self.nnz_terms[start as usize..end as usize] {
+                    acc = term.sign.mul_add(cond_buf[term.buffer_idx as usize], acc);
+                }
+                csc_values[k as usize] = acc;
             }
-            csc_values[k as usize] = acc;
         }
-
-        rhs.fill(0.0);
-        for &(i, start, end) in &self.active_rhs {
-            let mut acc = 0.0_f64;
-            for term in &self.rhs_terms[start as usize..end as usize] {
-                acc = term.sign.mul_add(rhs_buf[term.buffer_idx as usize], acc);
-            }
-            rhs[i as usize] = acc;
-        }
+        self.gather_rhs(rhs_buf, rhs);
     }
 }

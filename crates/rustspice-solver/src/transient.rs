@@ -19,6 +19,11 @@
 //!   factors once). The L-stable restart damps the stiff modes excited by the corner, which the trapezoid would
 //!   otherwise carry on as a sign-alternating ("ringing") error, and the BDF-2 step hands the trapezoid a
 //!   second-order accurate capacitor current / inductor voltage.
+//! * A corner where only the slope changes (the start from an operating point is one) excites the stiff modes in
+//!   proportion to their time constant, not with the full step of a value jump. Next to a source segment shorter
+//!   than `4 hmax` (a fast edge) the restart takes one backward-Euler step of `h1` = 1/32 of the shortest adjacent
+//!   segment and goes on with BDF-2: first-order steps of `hmax / 8` across an edge of a few `hmax` would shift the
+//!   whole response by a sizeable fraction of a step.
 
 use rustspice_core::{
     netlist::SourceWaveform, CompiledTopology, ComputeBackend, DeviceSoaBuffer, ResourceLimits,
@@ -136,6 +141,9 @@ pub struct TransientSolver {
 /// Fraction of `hmax` used for the first step after a breakpoint (and after `t = 0`): a power of two, so that
 /// doubling the step reaches `hmax` exactly.
 const RESTART_FRACTION: f64 = 0.125;
+/// Fraction of the shortest source segment next to a slope corner used for the first step after it (when that is
+/// below `RESTART_FRACTION * hmax`).
+const EDGE_FRACTION: f64 = 1.0 / 32.0;
 /// Ratio of the BDF-2 step to the backward-Euler step that precedes it after a restart: with `w = phi` (golden
 /// ratio, `w^2 = w + 1`) the BDF-2 companion factor `(1 + 2w) / ((1 + w) h_2)` equals the backward-Euler one
 /// `1 / h_1`, and the trapezoid step `2 h_1` that follows has it too, so a linear circuit factors its matrix once
@@ -229,6 +237,18 @@ fn quantize_step(h: f64, hmax: f64) -> f64 {
     }
     let k = (hmax / h).log2().ceil().min(1000.0);
     hmax * 0.5_f64.powi(k as i32)
+}
+
+/// First step after a restart and whether the restart is a fast slope corner (one backward-Euler step instead of
+/// two): `prev_seg` / `next_seg` are the lengths of the source segments that end / start at the restart.
+fn restart_step(hmax: f64, jump: bool, prev_seg: f64, next_seg: f64) -> (f64, bool) {
+    let h1 = RESTART_FRACTION * hmax;
+    let edge = EDGE_FRACTION * prev_seg.min(next_seg);
+    if !jump && edge < h1 {
+        (edge, true)
+    } else {
+        (h1, false)
+    }
 }
 
 fn plan_step(left: f64, h_prop: f64, stretch: f64) -> (f64, bool) {
@@ -341,7 +361,7 @@ impl FactorCache {
 /// Where the integration restarts its order (BE twice, then BDF-2, then the configured method).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
-    /// First backward-Euler step.
+    /// First backward-Euler step (the only one at a fast slope corner).
     Startup,
     /// Second backward-Euler step (same `h`): damps what is left of the stiff modes the corner excited, so that
     /// the BDF-2 step does not see the pre-corner amplitude in its history.
@@ -547,6 +567,7 @@ impl TransientSolver {
         let land_rows = !is_linear || !has_reactive;
         let mut x_acc = x.clone();
         let mut x_acc_prev = x.clone();
+        let mut x_acc_prev2 = x.clone();
         let mut total_nr_iterations = start_iters;
         let mut lu_factorizations = 1usize;
         let mut accepted_steps = 0usize;
@@ -562,6 +583,18 @@ impl TransientSolver {
         // (post-jump) solution
         let mut jump_restart = false;
         let mut next_src_bp = Self::next_source_breakpoint(&topo.soa, 0.0, teps, tstop);
+        // The start is a restart too: a jump when the states are imposed (`uic`) or a source steps at t = 0, a slope
+        // corner after an operating point (every derivative is zero there).
+        let start_jump = uic || Self::sources_jump_at(&topo.soa, 0.0, teps);
+        let (h1, mut fast_edge) = restart_step(
+            hmax,
+            start_jump,
+            f64::INFINITY,
+            next_src_bp.unwrap_or(f64::INFINITY),
+        );
+        h_next = h1;
+        // start of the source segment that ends at the next restart
+        let mut last_bp = 0.0_f64;
         if let Some(bp) = next_src_bp {
             h_next = h_next.min(0.25 * bp).max(hmin);
             if quantized {
@@ -666,16 +699,29 @@ impl TransientSolver {
                     self.solve_linear_cached(topo, linear_solver, &mut x)
                         .map(|()| 1usize)
                 } else {
-                    // initial guess for Newton: extrapolation of the last two accepted points
+                    // initial guess for Newton: extrapolation of the last accepted points
                     if self.options.use_predictor
                         && !is_linear
                         && stage == Stage::Running
                         && n_hist >= 2
                         && h_prev > 0.0
                     {
-                        let ratio = (h / h_prev).min(1.0);
-                        for i in 0..dim {
-                            x[i] = x_acc[i] + ratio * (x_acc[i] - x_acc_prev[i]);
+                        let tn = t + h;
+                        let [t0, t1, t2] = t_hist;
+                        if n_hist >= 3 {
+                            // quadratic through the last three accepted points: the second-order methods' own
+                            // order, so the guess is already close to the converged step
+                            let l0 = (tn - t1) * (tn - t2) / ((t0 - t1) * (t0 - t2));
+                            let l1 = (tn - t0) * (tn - t2) / ((t1 - t0) * (t1 - t2));
+                            let l2 = (tn - t0) * (tn - t1) / ((t2 - t0) * (t2 - t1));
+                            for i in 0..dim {
+                                x[i] = l0 * x_acc[i] + l1 * x_acc_prev[i] + l2 * x_acc_prev2[i];
+                            }
+                        } else {
+                            let ratio = (h / h_prev).min(1.0);
+                            for i in 0..dim {
+                                x[i] = x_acc[i] + ratio * (x_acc[i] - x_acc_prev[i]);
+                            }
                         }
                     } else {
                         x.copy_from_slice(&x_acc);
@@ -731,9 +777,10 @@ impl TransientSolver {
                     }
                 }
 
-                // LTE estimate (none during the restart: too little history on this side of the corner)
+                // LTE estimate (none on the backward-Euler restart steps: too little history on this side of the
+                // corner; the BDF-2 step is checked once two steps lie after it)
                 let order = step_method.order();
-                let r = if !has_reactive || stage != Stage::Running {
+                let r = if !has_reactive || matches!(stage, Stage::Startup | Stage::Damping) {
                     0.0
                 } else {
                     self.lte_ratio(topo, &x, step_method, h, t_new, &t_hist, n_hist)
@@ -775,6 +822,7 @@ impl TransientSolver {
             self.cap_v_prev3.copy_from_slice(&topo.soa.cap_v_prev2);
             self.ind_i_prev3.copy_from_slice(&topo.soa.ind_i_prev2);
             Self::commit_reactive_history(topo, &x);
+            x_acc_prev2.copy_from_slice(&x_acc_prev);
             x_acc_prev.copy_from_slice(&x_acc);
             x_acc.copy_from_slice(&x);
             t_hist = [t_new, t_hist[0], t_hist[1]];
@@ -783,7 +831,7 @@ impl TransientSolver {
             t = t_new;
 
             // next step: what the estimate allows, never more than twice the step that was planned
-            let grow = if r > (SAFETY / MAX_GROWTH).powi(order + 1) {
+            let fit = if r > (SAFETY / MAX_GROWTH).powi(order + 1) {
                 (SAFETY * r.powf(-1.0 / f64::from(order + 1))).clamp(MIN_SHRINK, MAX_GROWTH)
             } else {
                 MAX_GROWTH
@@ -791,38 +839,54 @@ impl TransientSolver {
             // small changes are not worth a new factorization: a linear circuit's step only doubles (when the
             // estimate allows it) or stays, so it stays on the `hmax / 2^k` ladder
             let grow = if quantized {
-                if grow >= 2.0 {
+                if fit >= 2.0 {
                     2.0
                 } else {
                     1.0
                 }
-            } else if (1.0..MIN_GROWTH).contains(&grow) {
+            } else if (1.0..MIN_GROWTH).contains(&fit) {
                 1.0
             } else {
-                grow
+                fit
             };
             h_next = match stage {
                 // the BDF-2 and first trapezoid steps after a restart share the backward-Euler companion factor
+                Stage::Startup if fast_edge => h * BDF2_STARTUP_RATIO,
                 Stage::Startup => h,
                 Stage::Damping => h * BDF2_STARTUP_RATIO,
+                // unless the estimate of the BDF-2 step asks for less
+                Stage::Second if fit < 2.0 / BDF2_STARTUP_RATIO => {
+                    if quantized {
+                        quantize_step(h * fit, hmax)
+                    } else {
+                        h * fit
+                    }
+                }
                 Stage::Second => h * (2.0 / BDF2_STARTUP_RATIO),
                 _ => h * grow,
             };
             stage = match stage {
+                Stage::Startup if fast_edge => Stage::Second,
                 Stage::Startup => Stage::Damping,
                 Stage::Damping => Stage::Second,
                 Stage::Second | Stage::Running => Stage::Running,
             };
 
             // the first step after the restart is done
-            if stage == Stage::Damping {
-                jump_restart = false;
-            }
+            jump_restart = false;
             if lands && stop_is_bp {
                 jump_restart = Self::sources_jump_at(&topo.soa, t, teps);
                 // restart the order at the corner: its left history says nothing about the right side
                 let gap = Self::next_source_breakpoint(&topo.soa, t, teps, tstop);
-                let mut h1 = (RESTART_FRACTION * hmax).min(h_next);
+                let (h1, fast) = restart_step(
+                    hmax,
+                    jump_restart,
+                    t - last_bp,
+                    gap.map_or(f64::INFINITY, |g| g - t),
+                );
+                fast_edge = fast;
+                last_bp = t;
+                let mut h1 = h1.min(h_next);
                 if let Some(g) = gap {
                     h1 = h1.min(0.25 * (g - t));
                 }
@@ -969,13 +1033,20 @@ impl TransientSolver {
 
     /// Whether a source value jumps at `t` (its limits from both sides differ): rows between `t` and the next
     /// step must then not be interpolated through the pre-jump solution.
+    ///
+    /// A steep but continuous edge also differs across `t +- e` (by `2 e` times its slope, far above any absolute
+    /// floor near 0 V), so a jump must in addition not grow when the interval doubles.
     fn sources_jump_at(soa: &DeviceSoaBuffer, t: f64, teps: f64) -> bool {
+        // `t +- teps` must be distinct from `t` in floating point
+        let e = teps.max(4.0 * f64::EPSILON * t.abs());
         soa.vsrc_waveforms
             .iter()
             .chain(soa.isrc_waveforms.iter())
             .any(|w| {
-                let (l, r) = (w.evaluate_at(t - teps), w.evaluate_at(t + teps));
-                (l - r).abs() > 1e-6 * l.abs().max(r.abs()) + 1e-15
+                let (l, r) = (w.evaluate_at(t - e), w.evaluate_at(t + e));
+                let d1 = (r - l).abs();
+                let d2 = (w.evaluate_at(t + 2.0 * e) - w.evaluate_at(t - 2.0 * e)).abs();
+                d1 > 1e-6 * l.abs().max(r.abs()) + 1e-15 && d2 < 1.5 * d1
             })
     }
 
@@ -1013,16 +1084,8 @@ impl TransientSolver {
             soa.rhs_buf[soa.ind_rhs_buf_idx[i] as usize] = soa.ind_veq[i];
         }
         // Assemble only the RHS vector (zero matrix work)
-        self.rhs_scratch.fill(0.0);
-        for &(row_i, start, end) in &soa.dynamic_gather_table.active_rhs {
-            let mut acc = 0.0_f64;
-            for term in &soa.dynamic_gather_table.rhs_terms[start as usize..end as usize] {
-                acc = term
-                    .sign
-                    .mul_add(soa.rhs_buf[term.buffer_idx as usize], acc);
-            }
-            self.rhs_scratch[row_i as usize] = acc;
-        }
+        soa.dynamic_gather_table
+            .gather_rhs(&soa.rhs_buf, &mut self.rhs_scratch);
         linear_solver.solve_cached(&self.rhs_scratch, x)
     }
 
@@ -1203,5 +1266,92 @@ impl TransientSolver {
             topo.soa.ind_i_prev[i] = il;
             topo.soa.ind_v_prev[i] = vl;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn soa_with(w: SourceWaveform) -> DeviceSoaBuffer {
+        DeviceSoaBuffer {
+            vsrc_waveforms: vec![w],
+            ..Default::default()
+        }
+    }
+
+    fn pulse(v1: f64, v2: f64, td: f64, tr: f64) -> SourceWaveform {
+        SourceWaveform::Pulse {
+            dc_val: v1,
+            v1,
+            v2,
+            td,
+            tr,
+            tf: tr,
+            pw: 1e-9,
+            per: 2e-9,
+        }
+    }
+
+    #[test]
+    fn a_steep_edge_from_zero_is_a_slope_corner_not_a_jump() {
+        // 3.3 V in 10 ps: 3.3e11 V/s moves 3.3e-9 V across t +- 1e-20 s, far above an absolute floor near 0 V
+        let teps = 1e-20;
+        assert!(!TransientSolver::sources_jump_at(
+            &soa_with(pulse(0.0, 3.3, 0.0, 10e-12)),
+            0.0,
+            teps
+        ));
+        assert!(!TransientSolver::sources_jump_at(
+            &soa_with(pulse(0.0, 3.3, 0.0, 10e-12)),
+            10e-12,
+            teps
+        ));
+        // a delayed edge far from t = 0, where t +- teps rounds to t without the ulp floor
+        assert!(!TransientSolver::sources_jump_at(
+            &soa_with(pulse(0.0, 3.3, 1.0, 10e-12)),
+            1.0,
+            teps
+        ));
+    }
+
+    #[test]
+    fn a_vertical_step_is_a_jump() {
+        let step = SourceWaveform::Pwl {
+            dc_val: 0.0,
+            points: vec![(0.0, 0.0), (1e-9, 0.0), (1e-9, 1.0), (2e-9, 1.0)],
+            repeat: None,
+            delay: 0.0,
+        };
+        assert!(TransientSolver::sources_jump_at(
+            &soa_with(step),
+            1e-9,
+            1e-20
+        ));
+        assert!(TransientSolver::sources_jump_at(
+            &soa_with(pulse(0.0, 1.0, 1.0, 0.0)),
+            1.0,
+            1e-20
+        ));
+    }
+
+    #[test]
+    fn restart_step_shrinks_only_at_fast_slope_corners() {
+        let hmax = 10e-12;
+        // a 10 ps ramp next to the corner: 1/32 of it, one backward-Euler step
+        assert_eq!(
+            restart_step(hmax, false, f64::INFINITY, 10e-12),
+            (10e-12 / 32.0, true)
+        );
+        // a slow ramp: hmax / 8 and two damping steps
+        assert_eq!(
+            restart_step(hmax, false, 1e-9, 1e-9),
+            (RESTART_FRACTION * hmax, false)
+        );
+        // a value jump keeps the damping restart whatever the segments
+        assert_eq!(
+            restart_step(hmax, true, 10e-12, 10e-12),
+            (RESTART_FRACTION * hmax, false)
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! Accelerated Nonlinear Solver:
 //! - Damped Newton-Raphson with SPICE3f5 `pnjlim` / `fetlim`
 //! - Linear Circuit 1-Step Fast-Path
-//! - Early Residual Convergence Termination & Shamanskii Jacobian LU Reuse
+//! - Early Residual Convergence Termination, Contraction-Rate Acceptance (transient) & Shamanskii Jacobian LU Reuse
 //! - Secant Trajectory Predictor for DC Sweeps and Transient Time-Stepping
 //! - Homotopy Continuation (`Gmin Stepping` & `Source Stepping`)
 
@@ -179,6 +179,13 @@ impl NonlinearSolver {
         }
     }
 
+    /// Largest contraction `|dx_k| / |dx_(k-1)|` (in units of the step tolerance) for which a transient Newton
+    /// iterate is accepted from the rate of convergence alone.
+    const RATE_MAX_CONTRACTION: f64 = 0.1;
+    /// Error bound, as a fraction of the step tolerance, under which that iterate is accepted. At 1.0 the drift of
+    /// slowly converging diode circuits (boost converters) reached 6x the error of the residual criterion.
+    const RATE_ACCEPT_FRACTION: f64 = 0.1;
+
     /// Solves the nonlinear (or linear) MNA system starting from `x` in place.
     pub fn solve_in_place(
         &mut self,
@@ -219,7 +226,17 @@ impl NonlinearSolver {
                 (v_min, v_max)
             } else {
                 let span = (v_max - v_min).max(5.0);
-                (v_min - span, v_max + span)
+                let (mut lo, mut hi) = (v_min - span, v_max + span);
+                if topo.soa.is_transient {
+                    // A transient step starts from (an extrapolation of) the last accepted solution, which may lie
+                    // outside the source range (charge pumps, boost converters): keep the box around it, or every
+                    // such step spends `box_release_iters` iterations pinned to the box.
+                    for &v in &x[..num_nodes.min(x.len())] {
+                        lo = lo.min(v - span);
+                        hi = hi.max(v + span);
+                    }
+                }
+                (lo, hi)
             },
         );
         let mut box_binding_streak = 0usize;
@@ -227,6 +244,8 @@ impl NonlinearSolver {
         let mut prev_res_norm = f64::INFINITY;
         let mut prev_step_converged = false;
         let mut last_step_max = f64::INFINITY;
+        // size of the previous Newton update in units of the step tolerance
+        let mut prev_step_norm = f64::INFINITY;
 
         for iter in 1..=self.options.max_iters {
             backend.evaluate_devices(&mut topo.soa, x)?;
@@ -306,6 +325,7 @@ impl NonlinearSolver {
             let mut step_ok = true;
             let mut box_binding = false;
             let mut max_step = 0.0_f64;
+            let mut step_norm = 0.0_f64;
             for (i, &xi) in x.iter().enumerate().take(dim) {
                 let raw_dx = self.next_x[i] - xi;
                 if !raw_dx.is_finite() {
@@ -321,6 +341,7 @@ impl NonlinearSolver {
                 if dx_abs > tol {
                     step_ok = false;
                 }
+                step_norm = step_norm.max(dx_abs / tol);
                 if i < num_nodes {
                     if let Some((lo, hi)) = v_box {
                         let raw = self.next_x[i];
@@ -343,13 +364,27 @@ impl NonlinearSolver {
 
             x.copy_from_slice(&self.next_x);
             prev_res_norm = max_res;
-            prev_step_converged = step_ok;
+            // a projection onto the box moved the iterate away from the update the step test judged
+            prev_step_converged = step_ok && !box_binding;
             last_step_max = max_step;
 
-            if step_ok && res_ok && max_step <= self.options.vntol && !limited {
+            if step_ok && res_ok && max_step <= self.options.vntol && !limited && !box_binding {
                 Self::check_diode_exponent_range(&topo.soa, x)?;
                 return Ok((iter, max_res));
             }
+            // Transient: once the updates contract by `theta` per iteration, the error left in the new iterate is
+            // at most `theta / (1 - theta)` times the last update. When that bound is a small fraction of the step
+            // tolerance the iterate is accepted without the evaluation that would confirm its residual.
+            if topo.soa.is_transient && iter >= 2 && !limited && !box_binding {
+                let theta = step_norm / prev_step_norm;
+                if theta < Self::RATE_MAX_CONTRACTION
+                    && theta / (1.0 - theta) * step_norm <= Self::RATE_ACCEPT_FRACTION
+                {
+                    Self::check_diode_exponent_range(&topo.soa, x)?;
+                    return Ok((iter, max_res));
+                }
+            }
+            prev_step_norm = step_norm;
         }
 
         Err(SimError::ConvergenceFailure {
