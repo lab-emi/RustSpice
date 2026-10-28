@@ -4,6 +4,11 @@
 //! 1. Conflict-free `CscGatherTable` Jacobian assembly via PTX SIMT warps.
 //! 2. Large-scale parasitic RC power grid solving via Jacobi-Preconditioned Conjugate
 //!    Gradient (`PCG`) and CSR Sparse Matrix-Vector Multiplication (`SpMV`).
+//! 3. [`batch`]: batched DC operating points, one parameter corner per CUDA thread, with a rayon `cpu_ref` that
+//!    runs the same source. The CUDA driver is loaded at run time ([`driver`]), so nothing here needs CUDA to build.
+
+pub mod batch;
+pub mod driver;
 
 use rayon::prelude::*;
 use rustspice_backend_cpu::CpuSimdBackend;

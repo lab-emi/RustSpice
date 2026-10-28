@@ -1,0 +1,16 @@
+# Device code of the batched DC Newton solver, compiled to PTX by cuda-oxide (NVIDIA/cuda-rust).
+# Not a member of the RustSpice workspace: it needs the cuda-oxide codegen backend and its pinned toolchain.
+# Rebuild `../batch_newton.ptx` with `../build_ptx.sh` (see `../README.md`).
+[package]
+name = "rustspice-batch-kernels"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "a4a939a9b5f01f3bf712e92386922e1bc7c434a9" }
+cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "a4a939a9b5f01f3bf712e92386922e1bc7c434a9" }
+cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "a4a939a9b5f01f3bf712e92386922e1bc7c434a9" }

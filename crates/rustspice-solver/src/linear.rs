@@ -17,7 +17,7 @@ use faer::sparse::linalg::lu::{
 use faer::sparse::linalg::SupernodalThreshold;
 use faer::sparse::{SparseColMatRef, SymbolicSparseColMatRef};
 use faer::{Mat, Parallelism};
-use rustspice_backend_cpu::CraneliftTopologyJit;
+use rustspice_backend_cpu::{CraneliftTopologyJit, UnrolledSymbolicLu};
 use rustspice_core::{CscMatrix, CsrMatrix, Df64, SimError, SimResult};
 
 #[inline]
@@ -694,6 +694,16 @@ impl AdaptiveSparseSolver {
                 self.unrolled_jit = Some(std::sync::Arc::new(jit_solver));
                 self.lu_buf.resize(lu_nnz, 0.0);
             }
+        }
+    }
+
+    /// The static-pivot plan of the unrolled tier: the fill-reducing order (`perm[new] = old`), the source of each
+    /// reordered non-zero in the caller's CSC values, and the symbolic LU of the reordered matrix. `None` when the
+    /// solver is on another tier (faer, dense, PCG).
+    pub fn unrolled_plan(&self) -> Option<(&[usize], &[usize], &UnrolledSymbolicLu)> {
+        match (&self.ordering, &self.unrolled_jit) {
+            (Some(ord), Some(jit)) => Some((&ord.perm, &ord.csc_value_map, &jit.symbolic)),
+            _ => None,
         }
     }
 

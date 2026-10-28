@@ -11,11 +11,11 @@ pulp.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
 rustspice-backend-cpu.workspace = true
+rustspice-backend-cuda-simt.workspace = true
 rustspice-core.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-rustspice-backend-cuda-simt.workspace = true
 rustspice-backend-cuda-tile.workspace = true
 rustspice-backend-metal.workspace = true
 rustspice-backend-wasm.workspace = true

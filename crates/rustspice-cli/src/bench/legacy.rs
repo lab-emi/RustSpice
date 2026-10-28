@@ -4895,7 +4895,7 @@ pub fn run_series(ctx: &Ctx, stages: usize) -> (Vec<CaseResult>, SeriesResult) {
 // Driver
 // ---------------------------------------------------------------------------------------------------------
 
-fn cpu_model() -> String {
+pub(crate) fn cpu_model() -> String {
     fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|s| {

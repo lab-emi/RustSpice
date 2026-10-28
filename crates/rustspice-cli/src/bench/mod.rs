@@ -4,6 +4,7 @@
 //! H2 generators (families, fuzz, oracle), H3 legacy (legacy).
 #![allow(dead_code)]
 
+pub mod batch_gpu;
 pub mod compare;
 pub mod families;
 pub mod fuzz;

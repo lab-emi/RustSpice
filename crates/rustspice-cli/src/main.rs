@@ -91,6 +91,8 @@ enum Commands {
     BenchSuite(bench::SuiteArgs),
     /// Run the six legacy head-to-head benchmarks against local `ngspice` (interleaved subprocess timing, tight references)
     BenchNgspice(bench::legacy::LegacyArgs),
+    /// Time batched DC operating points on the CPU batch API, the batch kernel's CPU build and a CUDA GPU
+    BenchBatch(bench::batch_gpu::BatchArgs),
 }
 
 fn select_backend(name: &str) -> Result<Arc<dyn ComputeBackend>, String> {
@@ -221,6 +223,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::BenchNgspice(args) => {
             std::process::exit(bench::legacy::run(args));
+        }
+        Commands::BenchBatch(args) => {
+            std::process::exit(bench::batch_gpu::run(args));
         }
     }
     Ok(())

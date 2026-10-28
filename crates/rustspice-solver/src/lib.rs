@@ -7,14 +7,18 @@
 //!   factor caching and Local Truncation Error (LTE) step control.
 //! - [`adjoint`]: Discrete Adjoint Sensitivity engine computing gradients with respect to thousands
 //!   of circuit parameters in a single transposed triangular solve.
+//! - [`batch_dc`]: batched DC operating points on the batch kernel (rayon `cpu_ref` or CUDA), with the CPU solver
+//!   for the corners it leaves.
 
 pub mod adjoint;
+pub mod batch_dc;
 pub mod linear;
 pub mod nonlinear;
 pub mod simulator;
 pub mod transient;
 
 pub use adjoint::{AdjointGradientResult, AdjointSensitivityEngine, ParameterGradSpec};
+pub use batch_dc::{BatchDcEngine, BatchDcRun};
 pub use linear::{AdaptiveSparseSolver, LinearSolverKind};
 pub use nonlinear::{DcOpResult, DcSweepResult, NonlinearSolver, NrOptions};
 pub use simulator::Simulator;
