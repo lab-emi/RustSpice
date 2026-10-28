@@ -282,15 +282,23 @@ def check_netlists(rep, args, tmp, exes):
     ok = all(e <= 5e-12 + 1e-9 * abs(ii) for e, ii in zip(err, i))
     regions = {"cutoff": sum(1 for x in vg if x < 0.7), "saturation": sum(1 for x in vg if 0.7 < x < 1.7), "triode": sum(1 for x in vg if x > 1.7)}
     rep.add("codegen/mosfet-l1/vs_ngspice_dc", "PASS" if ok else "FAIL", f"{len(vg)} Vgs points {regions}, worst |kernel - (-i(v1))| = {max(err):.1e} A (gate 5e-12 + 1e-9 rel), peak current {abs(i).max():.2e} A")
-    # EKV kernel against the live RustSpice solution of the identical LEVEL=2 stage
+    # EKV kernel against the 50-digit mpmath operating point of the common-source stage (and verify that
+    # `.model ... LEVEL=2` in a SPICE deck is refused rather than silently evaluated as EKV)
     deck = tmp.f("ekv.sp")
     open(deck, "w").write("cap_cli level2 stage\nV1 vdd 0 DC 3.3\nV2 g 0 DC 0.9\nR1 vdd d 20k\nM1 d g 0 0 NM W=10u L=1u\n.model NM NMOS(LEVEL=2 VTO=0.7 KP=120u LAMBDA=0.04)\n.op\n.end\n")
-    vec = rustspice_op(open(deck).read(), tmp, binary=args.bin)
-    vd = vec["v(d)"]
+    rc_l2, _, err_l2, _ = run([args.bin, "run", deck], timeout=30)
+    vd_mp = mp.findroot(
+        lambda v: cf_ekv([mp.mpf("0.9"), v], [mp.mpf("120e-6"), mp.mpf("10e-6"), mp.mpf("1e-6"), mp.mpf("0.7"), mp.mpf("1.3"), mp.mpf(repr(VT_300K15)), mp.mpf("0.04")])[0]
+        + mp.mpf("1e-12") * v
+        - (mp.mpf("3.3") - v) / mp.mpf("20e3"),
+        mp.mpf("2.0"),
+    )
+    vd = float(vd_mp)
     i_res = (3.3 - vd) / 20e3
     k = kernel_eval(exes["mosfet-ekv"], [[0.9, vd, 120e-6, 10e-6, 1e-6, 0.7, 1.3, VT_300K15, 0.04]])[0][0] + 1e-12 * vd
     e = abs(k - i_res) / i_res
-    rep.add("codegen/mosfet-ekv/vs_simulator_op", "PASS" if e < 1e-9 else "FAIL", f"kernel i_d + gmin*vds = {k:.12e} A, resistor current of the RustSpice solution = {i_res:.12e} A, rel {e:.1e} (gate 1e-9)")
+    l2_refused = rc_l2 != 0 and "LEVEL=2 is not implemented" in err_l2
+    rep.add("codegen/mosfet-ekv/vs_simulator_op", "PASS" if (e < 1e-9 and l2_refused) else "FAIL", f"kernel i_d + gmin*vds = {k:.12e} A, resistor current of 50-digit EKV OP = {i_res:.12e} A, rel {e:.1e} (gate 1e-9); SPICE LEVEL=2 refused={l2_refused}")
     # IR default vt (300 K) differs from the simulator's 300.15 K value: a kernel used with its defaults is off by (informational)
     a = kernel_eval(exes["diode"], [[0.7, 1e-14, 1.0, 0.025851997, 1e-12, 0.0, 0.0]])[0][0]
     b = kernel_eval(exes["diode"], [[0.7, 1e-14, 1.0, VT_300K15, 1e-12, 0.0, 0.0]])[0][0]

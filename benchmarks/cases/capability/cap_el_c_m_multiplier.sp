@@ -4,8 +4,6 @@ Capacitor multiplier m=2 in an RC step
 * bench.title: Capacitor multiplier m=2 in an RC step
 * bench.probes: v(out)
 * bench.expect: match
-* bench.known_gap: silent-ignore-multiplier
-* bench.gap.note: m=2 is ignored: tau stays 1 ms instead of 2 ms (27 % normalised error)
 * bench.tags: passive, tran, multiplier, silent_risk
 * bench.note: Exact: C_eff = 2 uF, tau = 2 ms.
 V1 in 0 PULSE(0 1 0 1n 1n 1 2)

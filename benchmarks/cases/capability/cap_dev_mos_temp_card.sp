@@ -5,10 +5,8 @@ NMOS L1 at .temp 100 (mobility, threshold and phi shift)
 * bench.probes: i(vds)
 * bench.tol.abs: 1e-10
 * bench.expect: match
-* bench.known_gap: silent-ignore-temperature
-* bench.gap.note: .temp 100 ignored: 5.3 uA at Vgs=0.8 V (ngspice 10.7 uA)
 * bench.tags: mosfet, level1, dc, temperature
-* bench.note: evidence: RustSpice output is bit-identical with and without .temp 100; tight ngspice is a square law with mobility (T/Tnom)^-1.5 and Vth=0.633 V (implied Vth identical at four Vgs points): 2.14 mA vs RustSpice 2.80 mA at Vgs=3 V
+* bench.note: evidence: RustSpice output is bit-identical with and without .temp 100; tight ngspice is a square law with mobility (T/Tnom)^-1.5 and Vth=0.633 V (implied Vth identical at four Vgs points): 2.14 mA vs RustSpice 2.80 mA at Vgs=3 V [2026-10-28: gap closed; the RustSpice results quoted above predate the fix.]
 VDS d 0 3
 VG g 0 2
 M1 d g 0 0 NM W=10u L=1u

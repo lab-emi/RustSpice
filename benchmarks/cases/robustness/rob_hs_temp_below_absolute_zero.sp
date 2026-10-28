@@ -4,11 +4,9 @@ temp -300 (below absolute zero) on a diode circuit
 * bench.title: .temp -300 (below absolute zero) on a diode circuit
 * bench.probes: v(2)
 * bench.expect: loud_error
-* bench.known_gap: silent-ignore-temperature
-* bench.gap.note: .temp is ignored (fixed 300.15 K): a normal 27 C OP (v(2)=0.6929 V) is printed with exit 0; ngspice-47 fails (gmin/source stepping fail, 'The operating point could not be simulated successfully', rc 1). Confirmed mechanism: '.temp 100' on the same circuit gives 0.5713 V in ngspice and the unchanged 0.6929 V in RustSpice
 * bench.tags: hostile, temperature, directive, silent_risk
 * bench.est_rss_mib: 64
-* bench.note: -300 C is below absolute zero (-273.15 C, i.e. -26.85 K), so no physical answer exists and refusing is the only correct outcome. ngspice-47's refusal is a convergence failure, not validation: it fails the same way at -273.15, -273 and -400 C but solves -250 C (v(2) about 1.09 V), so its failure is not evidence of intentional validation. RustSpice drops the card (identical 0.6929 V output for .temp -250, -300 and 100 alike), hence the slug; once .temp is implemented the residual defect would be missing T>0 K validation (lenient-malformed-input)
+* bench.note: -300 C is below absolute zero (-273.15 C, i.e. -26.85 K), so no physical answer exists and refusing is the only correct outcome. ngspice-47's refusal is a convergence failure, not validation: it fails the same way at -273.15, -273 and -400 C but solves -250 C (v(2) about 1.09 V), so its failure is not evidence of intentional validation. RustSpice drops the card (identical 0.6929 V output for .temp -250, -300 and 100 alike), hence the slug; once .temp is implemented the residual defect would be missing T>0 K validation (lenient-malformed-input) [2026-10-28: gap closed; the RustSpice results quoted above predate the fix.]
 .temp -300
 V1 1 0 5
 R1 1 2 1k

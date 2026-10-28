@@ -49,8 +49,10 @@ fn flattened_card_budget_boundary_matches_closed_form() {
     for levels in 1..=3u32 {
         let deck = fanout_deck(levels as usize);
         let need = fanout_cards(levels);
-        let mut lim = ResourceLimits::default();
-        lim.max_expanded_cards = need;
+        let mut lim = ResourceLimits {
+            max_expanded_cards: need,
+            ..Default::default()
+        };
         let nl = parse_netlist_with_limits(&deck, &lim).expect("exact budget must pass");
         assert_eq!(nl.resistors.len(), 10usize.pow(levels));
         lim.max_expanded_cards = need - 1;
@@ -69,8 +71,10 @@ fn expansion_bomb_is_refused_by_default_budget_and_stays_small() {
 
 #[test]
 fn depth_budget_boundary() {
-    let mut lim = ResourceLimits::default();
-    lim.max_subckt_depth = 20;
+    let lim = ResourceLimits {
+        max_subckt_depth: 20,
+        ..Default::default()
+    };
     // chain of N subckts instantiated from the top: instantiation depth of the innermost is N + 1
     let ok = parse_netlist_with_limits(&chain_deck(19), &lim).expect("depth 20 fits");
     assert_eq!(ok.resistors.len(), 20);
@@ -82,8 +86,10 @@ fn depth_budget_boundary() {
 fn deep_chain_does_not_use_the_call_stack() {
     // 5000 levels with a raised budget: the former recursive expander overflowed the 8 MiB stack at ~15000
     // levels (and a 2 MiB test thread much earlier); the explicit stack has no such limit.
-    let mut lim = ResourceLimits::default();
-    lim.max_subckt_depth = 5000;
+    let lim = ResourceLimits {
+        max_subckt_depth: 5000,
+        ..Default::default()
+    };
     let nl = std::thread::Builder::new()
         .stack_size(256 * 1024)
         .spawn(move || {
@@ -97,8 +103,10 @@ fn deep_chain_does_not_use_the_call_stack() {
 
 #[test]
 fn flattened_text_budget() {
-    let mut lim = ResourceLimits::default();
-    lim.max_expanded_bytes = 500;
+    let lim = ResourceLimits {
+        max_expanded_bytes: 500,
+        ..Default::default()
+    };
     let e = parse_netlist_with_limits(&fanout_deck(2), &lim)
         .expect_err("100 resistors exceed 500 bytes");
     assert_eq!(limit_resource(&e), "expanded_bytes");

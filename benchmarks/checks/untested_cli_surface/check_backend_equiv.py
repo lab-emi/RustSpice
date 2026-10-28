@@ -163,6 +163,17 @@ def equivalence(rep, args, tmp):
     table = {}
     for name, deck in decks.items():
         ref = run_backend(args.bin, deck, "cpu", tmp, "ref")
+        if name == "gen_level2_divider" and ref["rc"] != 0 and "LEVEL=2 is not implemented" in ref["err"]:
+            all_refuse = all(
+                run_backend(args.bin, deck, b, tmp, f"refuse_{b}")["rc"] != 0
+                for b in BACKENDS[1:]
+            )
+            rep.add(
+                f"equiv/{name}/refused",
+                "GAP_CLOSED" if all_refuse else "FAIL",
+                "LEVEL=2 refused across all backends (was silent-wrong-model-level / backend-df64-mos-model-mismatch)",
+            )
+            continue
         if ref["rc"] != 0 or ref["raw"] is None:
             rep.add(f"equiv/{name}/cpu_runs", "FAIL", f"rc={ref['rc']} {ref['err'][-150:]}")
             continue

@@ -4,8 +4,6 @@ Inductor multiplier m=2 in an RL step
 * bench.title: Inductor multiplier m=2 in an RL step
 * bench.probes: v(out)
 * bench.expect: match
-* bench.known_gap: silent-ignore-multiplier
-* bench.gap.note: m=2 is ignored: L stays 1 uH instead of 0.5 uH (25 % normalised error)
 * bench.tags: passive, tran, multiplier, silent_risk
 * bench.note: ngspice divides the inductance by m (parallel inductors): tau = 0.5 us.
 V1 in 0 PULSE(0 1 0 1n 1n 1 2)

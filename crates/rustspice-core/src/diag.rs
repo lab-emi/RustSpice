@@ -9,7 +9,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
-use crate::netlist::{number_prefix_len, parse_spice_number, SourceWaveform};
+use crate::netlist::{number_prefix_len, parse_spice_number};
 
 /// Upper bound on stored diagnostics per deck (Rule 9: no unbounded growth on hostile input).
 pub const MAX_DIAGNOSTICS: usize = 100;
@@ -96,11 +96,25 @@ pub struct DiagSink {
     items: Vec<Diagnostic>,
     seen: FxHashSet<(usize, String)>,
     suppressed: usize,
+    /// First input the reader refuses (SPICE rejects it, and no lenient reading is defensible).
+    fatal: Option<(usize, String)>,
 }
 
 impl DiagSink {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Records a refusal: the deck is rejected with this message (the first one wins) once reading ends.
+    pub fn fatal(&mut self, line: usize, message: impl Into<String>) {
+        if self.fatal.is_none() {
+            self.fatal = Some((line, message.into()));
+        }
+    }
+
+    /// The refusal recorded by [`DiagSink::fatal`], if any.
+    pub fn take_fatal(&mut self) -> Option<(usize, String)> {
+        self.fatal.take()
     }
 
     fn push(&mut self, line: usize, severity: Severity, code: &str, mut message: String) {
@@ -141,12 +155,6 @@ impl DiagSink {
         self.push(line, Severity::Note, code, message.into());
     }
 
-    /// Drops every diagnostic of `line` except those with `keep_code` (used when a card is only an artifact of
-    /// another diagnostic, e.g. a title line that the reader parsed as a card).
-    pub fn retain_only_code_on_line(&mut self, line: usize, keep_code: &str) {
-        self.items.retain(|d| d.line != line || d.code == keep_code);
-    }
-
     /// Finishes the collection (source order, whole-deck notes last, a trailing note reports what was dropped).
     pub fn finish(mut self) -> Vec<Diagnostic> {
         self.items
@@ -180,7 +188,7 @@ pub(crate) fn is_clean_literal(t: &str) -> bool {
     }
     let sfx = &b[end..];
     if !sfx.iter().all(|c| c.is_ascii_alphanumeric())
-        || sfx.first().map_or(false, |c| *c == b'x' || *c == b'X')
+        || sfx.first().is_some_and(|c| *c == b'x' || *c == b'X')
     {
         return false;
     }
@@ -359,15 +367,13 @@ pub(crate) fn audit_ignored_dot_card(
     let card = toks[0];
     match cmd {
         "end" => {}
-        "ac" | "tf" | "noise" | "sens" | "pz" | "disto" => sink.warn(
+        "ac" | "tf" | "noise" | "sens" | "pz" | "disto" => sink.fatal(
             line,
-            code::IGNORED_ANALYSIS,
-            format!("`{card}` analysis is not supported and was skipped (only .op/.dc/.tran run; a DC .op is substituted when none remains)"),
+            format!("`{card}` analysis is not supported (only .op, .dc and .tran are): refusing the deck rather than running a different analysis"),
         ),
-        "step" => sink.warn(
+        "step" => sink.fatal(
             line,
-            code::IGNORED_ANALYSIS,
-            "`.step` is not supported: the deck is simulated once with the unstepped values",
+            "`.step` is not supported: refusing the deck rather than simulating only the unstepped values",
         ),
         "meas" | "measure" | "four" | "fourier" => sink.warn(
             line,
@@ -375,21 +381,15 @@ pub(crate) fn audit_ignored_dot_card(
             format!("`{card}` post-processing is not supported and was skipped"),
         ),
         "options" | "option" | "opt" => audit_options(toks, params, line, sink),
-        "temp" => audit_temp(toks, params, line, sink),
-        "nodeset" => sink.warn(
-            line,
-            code::IGNORED_DIRECTIVE,
-            "`.nodeset` is not applied: no initial guess is used (bistable circuits may settle in another state)",
-        ),
         "global" => sink.warn(
             line,
             code::IGNORED_DIRECTIVE,
             format!(
-                "`.global {}` is not supported: such nodes stay local inside subcircuits",
+                "`.global {}` inside a `.subckt` body was ignored (declare global nodes at the top level)",
                 toks[1..].join(" ")
             ),
         ),
-        "include" | "inc" | "lib" | "hdl" => sink.warn(
+        "hdl" => sink.warn(
             line,
             code::IGNORED_DIRECTIVE,
             format!(
@@ -397,10 +397,9 @@ pub(crate) fn audit_ignored_dot_card(
                 toks.join(" ")
             ),
         ),
-        "if" | "elseif" | "else" | "endif" => sink.warn(
+        "if" | "elseif" | "else" | "endif" => sink.fatal(
             line,
-            code::IGNORED_DIRECTIVE,
-            format!("`{card}`: conditional blocks are not evaluated, the elements of every branch are instantiated"),
+            format!("`{card}`: conditional blocks are not supported (refusing rather than instantiating every branch)"),
         ),
         "func" | "csparam" => sink.warn(
             line,
@@ -427,11 +426,7 @@ pub(crate) fn audit_ignored_dot_card(
             code::IGNORED_DIRECTIVE,
             format!("`{card}` is not supported: output selection is ignored (all vectors are written)"),
         ),
-        _ => sink.warn(
-            line,
-            code::IGNORED_DIRECTIVE,
-            format!("unknown card `{card}` was ignored (SPICE rejects unknown cards)"),
-        ),
+        _ => sink.fatal(line, format!("unknown card `{card}` (SPICE rejects unknown cards)")),
     }
 }
 
@@ -447,16 +442,9 @@ fn audit_options(toks: &[&str], params: &FxHashMap<String, f64>, line: usize, si
         let (k, v) = tok.split_once('=').unwrap_or((tok, ""));
         let key = k.to_ascii_lowercase();
         match key.as_str() {
-            "temp" | "tnom" => {
-                let at_default = parse_spice_number(v, params)
-                    .map(|t| (t - 27.0).abs() < 1e-9)
-                    .unwrap_or(false);
-                if !at_default {
-                    sink.warn(
-                        line,
-                        code::IGNORED_TEMPERATURE,
-                        format!("`.options {tok}` is ignored: RustSpice always simulates at 300.15 K (27 C)"),
-                    );
+            "temp" | "tnom" | "gmin" => {
+                if parse_spice_number(v, params).is_none() {
+                    sink.fatal(line, format!("`.options {tok}`: the value is not a number"));
                 }
             }
             "list" | "nopage" | "node" | "post" | "nomod" | "acct" | "noacct" | "opts"
@@ -469,7 +457,7 @@ fn audit_options(toks: &[&str], params: &FxHashMap<String, f64>, line: usize, si
             line,
             code::IGNORED_OPTION,
             format!(
-                "`.options {}` is ignored: RustSpice runs with fixed built-in settings (reltol 1e-6, vntol 1e-10, abstol 1e-12, gmin 1e-12, 300.15 K)",
+                "`.options {}` is ignored: RustSpice runs with fixed built-in settings (reltol 1e-6, vntol 1e-10, abstol 1e-12)",
                 ignored.join(" ")
             ),
         );
@@ -486,27 +474,7 @@ fn audit_options(toks: &[&str], params: &FxHashMap<String, f64>, line: usize, si
     }
 }
 
-fn audit_temp(toks: &[&str], params: &FxHashMap<String, f64>, line: usize, sink: &mut DiagSink) {
-    let all_default = toks.len() > 1
-        && toks[1..].iter().all(|t| {
-            parse_spice_number(t, params)
-                .map(|v| (v - 27.0).abs() < 1e-9)
-                .unwrap_or(false)
-        });
-    if !all_default {
-        sink.warn(
-            line,
-            code::IGNORED_TEMPERATURE,
-            format!(
-                "`{}` is ignored: RustSpice always simulates at 300.15 K (27 C)",
-                toks.join(" ")
-            ),
-        );
-    }
-}
-
-/// `.tran <tstep> <tstop> [tstart [tmax]] [uic]`: the reader parses tstart/tmax but the transient engine uses
-/// neither, and `uic` is not stored at all.
+/// `.tran <tstep> <tstop> [tstart [tmax]] [uic]`: checks the optional fields; returns whether `uic` is present.
 pub(crate) fn audit_tran(
     toks: &[&str],
     tstop: f64,
@@ -527,13 +495,6 @@ pub(crate) fn audit_tran(
         match parse_spice_number(t, params) {
             Some(v) => {
                 audit_number(t, params, ".tran", "tstart", line, sink);
-                if v != 0.0 {
-                    sink.warn(
-                        line,
-                        code::IGNORED_TRAN_OPTION,
-                        format!("`.tran` tstart={t} is ignored: results are produced from t=0"),
-                    );
-                }
                 if v > tstop {
                     sink.warn(
                         line,
@@ -550,12 +511,23 @@ pub(crate) fn audit_tran(
         }
     }
     if let Some(t) = pos.get(1) {
-        audit_number(t, params, ".tran", "tmax", line, sink);
-        sink.warn(
-            line,
-            code::IGNORED_TRAN_OPTION,
-            format!("`.tran` tmax={t} is ignored: RustSpice uses the fixed step tstep (no step limit, no breakpoints)"),
-        );
+        match parse_spice_number(t, params) {
+            Some(v) => {
+                audit_number(t, params, ".tran", "tmax", line, sink);
+                if v <= 0.0 || v.is_nan() {
+                    sink.warn(
+                        line,
+                        code::IGNORED_TRAN_OPTION,
+                        format!("`.tran` tmax={t} is not positive and was ignored"),
+                    );
+                }
+            }
+            None => sink.warn(
+                line,
+                code::MALFORMED_INPUT,
+                format!("`.tran` field `{t}` is not a number and was ignored"),
+            ),
+        }
     }
     if pos.len() > 2 {
         sink.warn(
@@ -567,58 +539,29 @@ pub(crate) fn audit_tran(
     uic_seen
 }
 
-/// `.dc <src> <start> <stop> <step> [<src2> ...]`: only the first sweep is read.
-pub(crate) fn audit_dc(toks: &[&str], line: usize, sink: &mut DiagSink) {
-    if toks.len() > 5 {
-        sink.warn(
-            line,
-            code::DC_SWEEP,
-            format!(
-                "`.dc` fields `{}` were ignored: nested / additional sweeps are not supported, only `{}` is swept",
-                toks[5..].join(" "),
-                toks[1]
-            ),
-        );
-    }
-}
-
-/// `.ic`: only `v(node)=value` tokens without blanks around `=` are understood.
+/// `.ic`: `v(node)=value` assignments (blanks around `=` allowed); anything else is reported.
 pub(crate) fn audit_ic(
-    toks: &[&str],
+    pairs: &[(String, String)],
+    rejected: &[String],
     params: &FxHashMap<String, f64>,
     line: usize,
     sink: &mut DiagSink,
 ) {
-    let mut rejected: Vec<&str> = Vec::new();
-    let mut accepted = 0usize;
-    for tok in &toks[1..] {
-        let lower = tok.to_ascii_lowercase();
-        let ok = lower
-            .strip_prefix("v(")
-            .and_then(|rest| rest.split_once(")="))
-            .map(|(_, val)| parse_spice_number(val, params).is_some())
-            .unwrap_or(false);
-        if ok {
-            accepted += 1;
+    let mut bad: Vec<String> = rejected.to_vec();
+    for (node, val) in pairs {
+        if parse_spice_number(val, params).is_none() {
+            bad.push(format!("v({node})={val}"));
         } else {
-            rejected.push(tok);
+            audit_number(val, params, ".ic", node, line, sink);
         }
     }
-    if !rejected.is_empty() {
-        sink.warn(
+    if !bad.is_empty() {
+        sink.fatal(
             line,
-            code::IGNORED_IC,
             format!(
-                "`.ic` tokens `{}` were not understood and ignored (only `v(node)=value` without blanks around `=` is read)",
-                rejected.join(" ")
+                "`.ic` fields `{}` are not understood (expected `v(node)=value` with a numeric value)",
+                bad.join(" ")
             ),
-        );
-    }
-    if accepted > 0 {
-        sink.note(
-            line,
-            code::IGNORED_IC,
-            "`.ic` values are imposed after the t=0 operating point is solved (SPICE solves that point with the .ic nodes forced); unlisted nodes keep their operating-point values",
         );
     }
 }
@@ -645,10 +588,11 @@ pub(crate) fn audit_model_params(
     sink: &mut DiagSink,
 ) {
     let honored: &[&str] = if mtype == "D" {
-        &["is", "n", "cjo"]
+        &["is", "n", "cjo", "eg", "xti", "tnom"]
     } else {
         &[
-            "level", "vto", "vt0", "kp", "gamma", "phi", "lambda", "cgso", "cgdo", "cgbo", "w", "l",
+            "level", "vto", "vt0", "kp", "gamma", "phi", "lambda", "cgso", "cgdo", "cgbo", "w",
+            "l", "tnom",
         ]
     };
     let mut unmodelled: Vec<String> = Vec::new();
@@ -668,10 +612,12 @@ pub(crate) fn audit_model_params(
             } else {
                 p.raw.as_str()
             };
-            sink.warn(
+            sink.fatal(
                 line,
-                code::MALFORMED_INPUT,
-                format!("model `{model}`: value `{shown}` of parameter `{}` is not a number; the parameter was dropped and its default is used", p.key.to_ascii_uppercase()),
+                format!(
+                    "model `{model}`: value `{shown}` of parameter `{}` is not a number",
+                    p.key.to_ascii_uppercase()
+                ),
             );
             continue;
         }
@@ -685,16 +631,7 @@ pub(crate) fn audit_model_params(
             sink,
         );
         let up = p.key.to_ascii_uppercase();
-        if k == "tnom" {
-            sink.warn(
-                line,
-                code::IGNORED_TEMPERATURE,
-                format!(
-                    "model `{model}`: TNOM={} is ignored (fixed 300.15 K, no temperature scaling)",
-                    p.raw
-                ),
-            );
-        } else if k == "uo" && mtype != "D" && pairs.iter().any(|q| q.key == "kp") {
+        if k == "uo" && mtype != "D" && pairs.iter().any(|q| q.key == "kp") {
             // KP wins over UO in the reader: UO is simply not used
             unmodelled.push(up);
         } else if k == "uo" && mtype != "D" {
@@ -721,10 +658,12 @@ pub(crate) fn audit_model_params(
             }
         } else if k == "level" && mtype != "D" {
             if p.val.unwrap_or(1.0) >= 2.0 {
-                sink.warn(
+                sink.fatal(
                     line,
-                    code::WRONG_MODEL_LEVEL,
-                    format!("model `{model}`: LEVEL={} is not implemented; the device is evaluated with the EKV model, not with the requested model", p.raw),
+                    format!(
+                        "model `{model}`: MOSFET LEVEL={} is not implemented (only LEVEL=1 is)",
+                        p.raw
+                    ),
                 );
             }
         } else if k == "phi" && mtype != "D" {
@@ -769,11 +708,11 @@ pub(crate) enum Elem {
 impl Elem {
     fn honored(self) -> &'static [&'static str] {
         match self {
-            Elem::R => &["r"],
-            Elem::C | Elem::L => &[],
-            Elem::G => &[],
-            Elem::D => &["area"],
-            Elem::M => &["w", "l"],
+            Elem::R => &["r", "m", "tc1", "tc2", "temp", "dtemp"],
+            Elem::C | Elem::L => &["m", "tc1", "tc2", "temp", "dtemp"],
+            Elem::G => &["m"],
+            Elem::D => &["area", "m", "temp", "dtemp"],
+            Elem::M => &["w", "l", "m", "temp", "dtemp"],
         }
     }
 
@@ -844,25 +783,18 @@ pub(crate) fn audit_element_tail(
         if let Some((k, v)) = tok.split_once('=') {
             if key_in(k, kind.honored()) {
                 if num_value(v, params).is_none() {
-                    sink.warn(
+                    sink.fatal(
                         line,
-                        code::MALFORMED_INPUT,
-                        format!("{name}: value `{v}` of `{k}` is not a number and was dropped"),
+                        format!("{name}: value `{v}` of `{k}` is not a number"),
                     );
                 } else {
                     audit_number(v, params, name, k, line, sink);
                 }
-            } else if k.eq_ignore_ascii_case("m") {
-                sink.warn(
-                    line,
-                    code::IGNORED_MULTIPLIER,
-                    format!("{name}: `{tok}` multiplier is ignored (the device is not replicated)"),
-                );
-            } else if key_in(k, &["temp", "dtemp", "tc1", "tc2", "tce"]) {
+            } else if key_in(k, &["tce"]) {
                 sink.warn(
                     line,
                     code::IGNORED_TEMPERATURE,
-                    format!("{name}: `{tok}` is ignored: RustSpice simulates at a fixed 300.15 K with no temperature coefficients"),
+                    format!("{name}: `{tok}` is ignored: the exponential temperature coefficient is not modelled"),
                 );
             } else if k.eq_ignore_ascii_case("ic") {
                 // C/L `ic=` is reported by the caller (its severity depends on whether `uic` is given)
@@ -880,20 +812,15 @@ pub(crate) fn audit_element_tail(
                     format!("{name}: parameter `{k}` is not modelled and was ignored"),
                 );
             } else {
-                sink.warn(
+                sink.fatal(
                     line,
-                    code::MALFORMED_INPUT,
-                    format!("{name}: unknown parameter `{k}` was ignored (SPICE rejects unknown instance parameters)"),
+                    format!("{name}: unknown instance parameter `{k}` (SPICE rejects it)"),
                 );
             }
         } else {
             positional += 1;
             if kind == Elem::D && positional == 1 && num_value(tok, params).is_some() {
-                sink.warn(
-                    line,
-                    code::IGNORED_MULTIPLIER,
-                    format!("{name}: positional area `{tok}` is ignored (use `area=`)"),
-                );
+                // positional area: honoured by the reader
             } else if matches!(kind, Elem::D | Elem::M) && tok.eq_ignore_ascii_case("off") {
                 sink.warn(
                     line,
@@ -906,11 +833,10 @@ pub(crate) fn audit_element_tail(
         }
     }
     if !extras.is_empty() {
-        sink.warn(
+        sink.fatal(
             line,
-            code::MALFORMED_INPUT,
             format!(
-                "{name}: extra token(s) `{}` after the value were ignored",
+                "{name}: unexpected token(s) `{}` after the value",
                 extras.join(" ")
             ),
         );
@@ -922,10 +848,9 @@ pub(crate) fn audit_element_tail(
 pub(crate) fn audit_nodes(name: &str, nodes: &[&str], line: usize, sink: &mut DiagSink) {
     for n in nodes {
         if n.bytes().any(|c| c == b'(' || c == b')' || c == b'=') {
-            sink.warn(
+            sink.fatal(
                 line,
-                code::MISPARSE,
-                format!("{name}: `{n}` is used as a node name; it looks like unsupported syntax (e.g. POLY(...)) or a missing field"),
+                format!("{name}: `{n}` in a node position looks like unsupported syntax (e.g. POLY(...)) or a missing field"),
             );
         }
     }
@@ -934,308 +859,6 @@ pub(crate) fn audit_nodes(name: &str, nodes: &[&str], line: usize, sink: &mut Di
 // ---------------------------------------------------------------------------------------------------------
 // independent sources
 // ---------------------------------------------------------------------------------------------------------
-
-const FUNCS: &[(&str, &str)] = &[
-    ("pulse", "PULSE"),
-    ("sin", "SIN"),
-    ("pwl", "PWL"),
-    ("exp", "EXP"),
-    ("sffm", "SFFM"),
-    ("am", "AM"),
-    ("trnoise", "TRNOISE"),
-    ("trrandom", "TRRANDOM"),
-    ("external", "EXTERNAL"),
-];
-
-/// Byte offset of `tok` inside `card` when `tok` is a sub-slice of it (tokens come from `split_whitespace`).
-fn offset_in(card: &str, tok: &str) -> Option<usize> {
-    let (c0, t0) = (card.as_ptr() as usize, tok.as_ptr() as usize);
-    (t0 >= c0 && t0 + tok.len() <= c0 + card.len()).then(|| t0 - c0)
-}
-
-/// Audits the value / waveform specification (`spec` = tokens after the two nodes of `card`) of a V or I source
-/// against the waveform the reader actually built (`built`). Returns the text of a dropped `DC <v>` attribute
-/// (its severity depends on the analyses of the deck, which the caller knows at the end).
-pub(crate) fn audit_source(
-    name: &str,
-    card: &str,
-    spec: &[&str],
-    built: &SourceWaveform,
-    params: &FxHashMap<String, f64>,
-    line: usize,
-    sink: &mut DiagSink,
-) -> Option<String> {
-    // fast path: a single clean literal (`V1 a 0 5`)
-    if spec.is_empty() || (spec.len() == 1 && is_clean_literal(spec[0])) {
-        return None;
-    }
-    let built_kind = match built {
-        SourceWaveform::Dc(_) => "dc",
-        SourceWaveform::Pulse { .. } => "pulse",
-        SourceWaveform::Sin { .. } => "sin",
-    };
-    // intended waveform function: first token that starts with a known function name
-    let func: Option<(usize, &'static str, &'static str)> =
-        spec.iter().enumerate().find_map(|(i, t)| {
-            let head = t.split('(').next().unwrap_or("");
-            FUNCS
-                .iter()
-                .find(|f| head.eq_ignore_ascii_case(f.0))
-                .map(|f| (i, f.0, f.1))
-        });
-    let track = spec.len() <= 64;
-    let mut consumed: u64 = 0;
-    let mut mark = |i: usize| {
-        if i < 64 {
-            consumed |= 1u64 << i;
-        }
-    };
-    let dc_val = built.dc_value();
-
-    // 1) leading plain value
-    let first = spec[0];
-    let is_kw = first.eq_ignore_ascii_case("dc")
-        || first.eq_ignore_ascii_case("ac")
-        || func.map(|f| f.0 == 0).unwrap_or(false);
-    if !is_kw {
-        if num_value(first, params).is_some() {
-            mark(0);
-            audit_number(first, params, name, "value", line, sink);
-        } else if first.len() >= 3 && first.as_bytes()[..3].eq_ignore_ascii_case(b"dc=") {
-            mark(0);
-            sink.warn(
-                line,
-                code::DC_VALUE_DROPPED,
-                format!("{name}: `{first}` is not recognised (write `DC <value>`); the source value defaults to 0"),
-            );
-        } else {
-            mark(0);
-            sink.warn(
-                line,
-                code::MISPARSE,
-                format!("{name}: value `{first}` is not a number; the source defaults to 0"),
-            );
-        }
-    }
-
-    // 2) `DC <v>` and `AC <mag> [phase]` attributes
-    let mut explicit_dc: Option<(String, f64)> = None;
-    let mut i = 0;
-    while i < spec.len() {
-        if spec[i].eq_ignore_ascii_case("dc") {
-            mark(i);
-            if let Some(v) = spec.get(i + 1) {
-                mark(i + 1);
-                match num_value(v, params) {
-                    Some(x) => {
-                        audit_number(v, params, name, "DC value", line, sink);
-                        explicit_dc = Some(((*v).to_string(), x));
-                    }
-                    None => sink.warn(
-                        line,
-                        code::MISPARSE,
-                        format!("{name}: DC value `{v}` is not a number and was dropped"),
-                    ),
-                }
-            }
-        } else if spec[i].eq_ignore_ascii_case("ac") {
-            mark(i);
-            for j in 1..=2 {
-                if let Some(v) = spec.get(i + j) {
-                    if num_value(v, params).is_some() {
-                        mark(i + j);
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-
-    // 3) waveform function
-    let Some((fi, fname, upper_name)) = func else {
-        // no function at all: did the keyword search still fire on the element name?
-        if built_kind != "dc" {
-            sink.warn(
-                line,
-                code::MISPARSE,
-                format!("{name}: a {} waveform was built from a keyword found in the element name, not from the source specification", built_kind.to_ascii_uppercase()),
-            );
-        }
-        if track {
-            report_leftovers(name, spec, consumed, line, sink);
-        }
-        return None;
-    };
-    // text of the card from the function keyword on (no allocation when the token is a slice of the card)
-    let joined_fallback: String;
-    let rest: &str = match offset_in(card, spec[fi]) {
-        Some(off) => &card[off..],
-        None => {
-            joined_fallback = spec[fi..].join(" ");
-            &joined_fallback
-        }
-    };
-    let open = rest.find('(');
-    let close = rest.find(')');
-    let (args_text, balanced): (&str, bool) = match (open, close) {
-        (Some(l), Some(r)) if l < r => (&rest[l + 1..r], true),
-        (Some(l), _) => (&rest[l + 1..], false),
-        (None, _) => (&rest[fname.len()..], false),
-    };
-    // tokens consumed by the function span
-    let mut end_tok = spec.len() - 1;
-    if balanced {
-        if let Some(j) = (fi..spec.len()).find(|&j| spec[j].contains(')')) {
-            end_tok = j;
-        }
-    }
-    for j in fi..=end_tok {
-        mark(j);
-    }
-
-    if matches!(
-        fname,
-        "pwl" | "exp" | "sffm" | "am" | "trnoise" | "trrandom" | "external"
-    ) {
-        sink.warn(
-            line,
-            code::IGNORED_WAVEFORM,
-            format!("{name}: `{upper_name}(...)` waveforms are not supported; the source is a constant {dc_val} (SPICE evaluates the waveform)"),
-        );
-        return None;
-    }
-    let min_args = if fname == "pulse" { 2 } else { 3 };
-
-    // argument scan: counts, the first 8 values, the unparsable ones
-    let mut vals = [0.0f64; 8];
-    let mut n_ok = 0usize;
-    let mut dropped: Vec<&str> = Vec::new();
-    for tok in args_text
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .filter(|s| !s.is_empty())
-    {
-        match num_value(tok, params) {
-            Some(v) => {
-                if n_ok < vals.len() {
-                    vals[n_ok] = v;
-                }
-                n_ok += 1;
-                if !is_clean_literal(tok) {
-                    audit_number(tok, params, name, upper_name, line, sink);
-                }
-            }
-            None => dropped.push(tok),
-        }
-    }
-
-    if built_kind == "dc" || built_kind != fname {
-        let reason = if open.is_none() {
-            format!("`{upper_name}` is not followed by a parenthesised argument list")
-        } else if !balanced {
-            "the argument list is not closed by `)`".to_string()
-        } else if n_ok < min_args {
-            format!("{n_ok} usable numeric arguments found, {min_args} required")
-        } else {
-            format!(
-                "the card was read as a {} waveform: the keyword is searched in the whole card, including the element name `{name}`",
-                built_kind.to_ascii_uppercase()
-            )
-        };
-        sink.warn(
-            line,
-            code::IGNORED_WAVEFORM,
-            format!("{name}: {upper_name} waveform not built ({reason}); the source is evaluated as the constant {dc_val}"),
-        );
-        if !dropped.is_empty() {
-            sink.warn(
-                line,
-                code::EXPR_TRUNCATION,
-                format!(
-                    "{name}: argument(s) `{}` could not be parsed as numbers and were dropped",
-                    dropped.join(" ")
-                ),
-            );
-        }
-        return None;
-    }
-
-    // built as intended: audit the arguments
-    if !dropped.is_empty() {
-        sink.warn(
-            line,
-            code::EXPR_TRUNCATION,
-            format!("{name}: {upper_name} argument(s) `{}` could not be parsed and were dropped; the later arguments shift left", dropped.join(" ")),
-        );
-    }
-    if fname == "pulse" {
-        if n_ok < 5 {
-            let missing = if n_ok < 4 {
-                "rise and fall times"
-            } else {
-                "fall time"
-            };
-            sink.warn(
-                line,
-                code::MISPARSE,
-                format!("{name}: PULSE has {n_ok} arguments; the {missing} default(s) to 0 (SPICE: the .tran step)"),
-            );
-        }
-        if n_ok > 7 {
-            sink.warn(
-                line,
-                code::IGNORED_WAVEFORM,
-                format!(
-                    "{name}: {} PULSE argument(s) beyond the 7th were ignored",
-                    n_ok - 7
-                ),
-            );
-        }
-    } else {
-        if n_ok > 5 && vals[5] != 0.0 {
-            sink.warn(
-                line,
-                code::IGNORED_WAVEFORM,
-                format!(
-                    "{name}: SIN phase argument {} was ignored (the sine starts at phase 0)",
-                    vals[5]
-                ),
-            );
-        }
-        if n_ok > 6 {
-            sink.warn(
-                line,
-                code::IGNORED_WAVEFORM,
-                format!("{name}: SIN arguments beyond the 6th were ignored"),
-            );
-        }
-    }
-    if track {
-        report_leftovers(name, spec, consumed, line, sink);
-    }
-    // `DC <v>` next to a waveform only matters for .op/.dc: the caller decides the severity once it knows the analyses
-    explicit_dc.filter(|(_, v)| *v != dc_val).map(|(raw, v)| {
-        format!("{name}: `DC {raw}` is discarded: .op/.dc use the waveform's initial value {dc_val} (SPICE uses the DC value {v})")
-    })
-}
-
-fn report_leftovers(name: &str, spec: &[&str], consumed: u64, line: usize, sink: &mut DiagSink) {
-    let left: Vec<&str> = spec
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| consumed & (1u64 << i) == 0)
-        .map(|(_, t)| *t)
-        .collect();
-    if !left.is_empty() {
-        sink.warn(
-            line,
-            code::MALFORMED_INPUT,
-            format!(
-                "{name}: unrecognised source field(s) `{}` were ignored",
-                left.join(" ")
-            ),
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1264,34 +887,19 @@ mod tests {
     fn ignored_constructs_are_reported() {
         let base = "t\nV1 in 0 DC 5\nR1 in out 1k\nR2 out 0 1k\n";
         for (extra, want) in [
-            (".options gmin=1e-9\n.op", "ignored-option"),
-            (".nodeset v(out)=1\n.op", "ignored-directive"),
-            (".include models.lib\n.op", "ignored-directive"),
-            (".frob 1 2\n.op", "ignored-directive"),
-            (".ac dec 10 1 1k", "ignored-analysis"),
-            (".temp 85\n.op", "ignored-temperature"),
-            (".tran 1n 1u 0 10n", "ignored-tran-option"),
-            (".tran 1n 1u uic", "ignored-ic"),
-            (".ic V(out) = 1\n.tran 1n 1u", "ignored-ic"),
-            ("R3 out 0 1k m=2\n.op", "ignored-multiplier"),
-            ("R3 out 0 1k tc1=0.1\n.op", "ignored-temperature"),
-            ("R3 out 0 {2*rv}\n.param rv=1k\n.op", "expr-truncation"),
+            (".options reltol=1e-4\n.op", "ignored-option"),
+            (".temp 0 27 85\n.op", "ignored-temperature"),
+            (".tran 1n 1u 0 -1n", "ignored-tran-option"),
+            ("R3 out 0 1k m=-1\n.op", "malformed-input"),
+            ("R3 out 0 1k tce=0.1\n.op", "ignored-temperature"),
             ("R3 out 0 1x\n.op", "misparse"),
-            ("R3 out 0 1k\nR3 out 0 1k\n.op", "malformed-input"),
-            ("D9 out 0 NOPE\n.op", "undefined-model"),
-            (
-                ".model MX NMOS(LEVEL=3 VTO=1)\nM1 out in 0 0 MX W=1u L=1u\n.op",
-                "wrong-model-level",
-            ),
+            (".model QX NPN(BF=100)\n.op", "ignored-directive"),
             (
                 ".model DM D(RS=10 BV=5)\nD9 out 0 DM\n.op",
                 "ignored-model-param",
             ),
-            ("V9 a 0 PWL(0 0 1u 1)\n.op", "ignored-waveform"),
-            ("V9 a 0 PULSE(0 1 0 1n 1n 1u\n.op", "ignored-waveform"),
-            ("V9 a 0 SIN(0 1 1k 0 0 90)\n.op", "ignored-waveform"),
-            ("V9 a 0 DC 2 SIN(1 1 1k)\n.op", "dc-value-dropped"),
-            (".subckt foo a b\nR9 a b 1k\n.op", "malformed-input"),
+            ("V9 a 0 PULSE(0 1 0 1n 1n 1u\n.op", "malformed-input"),
+            ("V9 a 0 SIN(0 1 1k 0 0 90 7)\n.op", "ignored-waveform"),
             (".control\nrun\n.endc\n.op", "ignored-analysis"),
         ] {
             let deck = format!("{base}{extra}\n.end\n");
@@ -1304,17 +912,90 @@ mod tests {
     }
 
     #[test]
+    fn malformed_or_unsupported_input_is_refused() {
+        // SPICE rejects these, or no lenient reading is defensible: the deck fails with a parse error
+        let base = "t\nV1 in 0 DC 5\nR1 in out 1k\nR2 out 0 1k\n";
+        for (extra, want) in [
+            (
+                ".include rustspice_no_such_models.lib\n.op",
+                "rustspice_no_such_models.lib",
+            ),
+            (".frob 1 2\n.op", "unknown card"),
+            (".ac dec 10 1 1k", ".ac"),
+            (".step param k 1 2 1\n.op", ".step"),
+            (".ic V(out) = 1 junk\n.tran 1n 1u", ".ic"),
+            ("R3 out 0 1k\nR3 out 0 1k\n.op", "more than once"),
+            ("R3 out 0 1k foo=2\n.op", "foo"),
+            ("R3 out 0 1k 2 3\n.op", "unexpected token"),
+            ("D9 out 0 NOPE\n.op", "NOPE"),
+            (
+                ".model DX DD(IS=1e-12)\nD9 out 0 DX\n.op",
+                "unknown model type",
+            ),
+            (".model DX D(IS=oops)\nD9 out 0 DX\n.op", "IS"),
+            (".model DX NMOS(VTO=1)\nD9 out 0 DX\n.op", "declared as"),
+            (
+                ".model MX NMOS(LEVEL=3 VTO=1)\nM1 out in 0 0 MX W=1u L=1u\n.op",
+                "LEVEL=3",
+            ),
+            (
+                "M1 out in 0 MX W=1u L=1u\n.model MX NMOS(VTO=1)\n.op",
+                "model-name position",
+            ),
+            ("V9 a 0 AM(1 1 1k 1meg 0)\n.op", "AM"),
+            ("V9 a 0 PWL(0 0 1u)\n.op", "PWL"),
+            ("V9 a 0 PWL()\n.op", "PWL"),
+            ("V9 a 0 nan\n.op", "nan"),
+            (".param a={b+1} b={a+1}\n.op", ".param"),
+            (".param x=\n.op", ".param"),
+            (".subckt foo a b\nR9 a b 1k\n.op", ".ends"),
+            (".options gmin=abc\n.op", "gmin"),
+            ("R3 out 0 1k \u{FFFD}\n.op", "UTF-8"),
+        ] {
+            let deck = format!("{base}{extra}\n.end\n");
+            match parse_netlist(&deck) {
+                Ok(n) => panic!(
+                    "`{extra}` should be refused, got diagnostics {:?}",
+                    n.diagnostics.iter().map(|d| &d.code).collect::<Vec<_>>()
+                ),
+                Err(e) => assert!(e.to_string().contains(want), "`{extra}`: {e}"),
+            }
+        }
+    }
+
+    #[test]
     fn harmless_forms_stay_silent() {
         let base = "t\nV1 in 0 DC 5\nR1 in out 1k\nR2 out 0 1k\n";
         for extra in [
+            // implemented: tstart / tmax / uic / spaced .ic
+            ".tran 1n 1u 0 10n",
+            ".tran 1n 1u 100n",
+            ".tran 1n 1u uic",
+            ".tran 1n 1u 0 10n uic",
+            ".ic V(out) = 1\n.tran 1n 1u",
+            ".ic v( out )=1 V(in) = 2\n.tran 1n 1u",
             ".temp 27\n.op",
             ".options temp=27\n.op",
+            ".temp 85\n.options tnom=50\n.op",
+            "R3 out 0 1k tc1=0.01 tc2=1e-5 dtemp=10\n.op",
             "R3 out 0 1k5\n.op",
             "C1 out 0 10uF\n.op",
             "V9 a 0 PULSE(0 1 0 1n 1n 1u 2u)\n.op",
             "V9 a 0 SIN(0 1 1k 0 0 0)\n.op",
             "V9 a 0 DC 0 PULSE(0 1 0 1n 1n 1u 2u)\n.op",
             ".param k=3\nR3 out 0 {k}\n.op",
+            ".param k = 3 j={k*2}\nR3 out 0 {k + j}\n.op",
+            "V9 a 0 PWL(0 0 1u 1) r=0\n.op",
+            "V9 a 0 EXP(0 1 1u 300n 2u 500n)\n.op",
+            "V9 a 0 SFFM(0 1 5meg 3 500k)\n.op",
+            "V9 a 0 SIN(0 1 1k 0 0 90)\n.op",
+            "V9 a 0 DC 2 SIN(1 1 1k)\n.op",
+            "V9 a 0 PULSE 0 5 1u 100n 100n 1u 3u\n.op",
+            ".options gmin=1e-9\n.op",
+            ".nodeset v(out)=1\n.op",
+            ".global vdd\n.op",
+            ".dc V1 0 1 0.5 R1 1k 2k 1k",
+            ".dc temp 0 50 25",
         ] {
             let deck = format!("{base}{extra}\n.end\n");
             assert!(
@@ -1327,22 +1008,22 @@ mod tests {
 
     #[test]
     fn diagnostics_never_change_the_circuit() {
-        // the legacy (lenient) readings are preserved bit for bit: only a diagnostic is added
+        // a lenient reading is kept as is: only a diagnostic is added
         let n = parse_netlist(
-            "t\n.param rv=1k\nV1 in 0 PWL(0 0 1u 1)\nR1 in out {2*rv}\nR2 out 0 1x\n.op\n",
+            "t\n.param rv=1k\nV1 in 0 PWL(0 0.5 1u 1)\nR1 in out {2*rv}\nR2 out 0 1x\n.op\n",
         )
         .unwrap();
-        assert_eq!(n.resistors[0].resistance, 2.0);
+        assert_eq!(n.resistors[0].resistance, 2e3);
         assert_eq!(n.resistors[1].resistance, 1e6);
-        assert_eq!(n.v_sources[0].waveform.dc_value(), 0.0);
-        assert!(n.diagnostics.len() >= 3);
+        assert_eq!(n.v_sources[0].waveform.dc_value(), 0.5);
+        assert!(!n.diagnostics.is_empty());
     }
 
     #[test]
     fn diagnostics_are_bounded() {
         let mut deck = String::from("t\nV1 in 0 1\n");
         for i in 0..1000 {
-            deck.push_str(&format!("R{i} in 0 1k m=2\n"));
+            deck.push_str(&format!("R{i} in 0 1k tce=2\n"));
         }
         deck.push_str(".op\n");
         let n = parse_netlist(&deck).unwrap();
@@ -1377,7 +1058,7 @@ mod tests {
             let want = crate::netlist::parse_spice_number(c, &params);
             if c.as_bytes()
                 .first()
-                .map_or(false, |b| b.is_ascii_digit() || *b == b'.')
+                .is_some_and(|b| b.is_ascii_digit() || *b == b'.')
             {
                 assert_eq!(
                     super::num_value(c, &params).map(f64::to_bits),
@@ -1397,7 +1078,9 @@ mod tests {
 
     #[test]
     fn title_line_handling() {
-        assert!(has("\nV1 in 0 1\nR1 in 0 1k\n.op\n", "title-line"));
+        // line 1 is the title even when it is blank: V1 on line 2 is a card
+        let n = parse_netlist("\nV1 in 0 1\nR1 in 0 1k\n.op\n").unwrap();
+        assert_eq!(n.v_sources.len(), 1);
         assert!(has(
             ".subckt x a b\nV1 1 0 5\nR1 1 0 1k\n.op\n",
             "title-line"

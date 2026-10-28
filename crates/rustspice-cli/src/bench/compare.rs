@@ -411,7 +411,19 @@ fn decimation_floor(t: &[f64], y: &[f64], grid: &[f64], denom: f64) -> f64 {
         td.push(t[n - 1]);
         yd.push(y[n - 1]);
     }
+    // At a grid point where the reference has a row of its own the comparison reads that row without interpolation,
+    // so there is no resampling noise to estimate: thinning would instead charge it with the interpolation across a
+    // corner (a source breakpoint on the output grid) that the comparison never performs.
+    let has_row = |g: f64| {
+        let i = t[..n].partition_point(|tk| *tk < g);
+        [i.checked_sub(1), Some(i)]
+            .into_iter()
+            .flatten()
+            .filter_map(|j| t[..n].get(j))
+            .any(|tk| (tk - g).abs() <= 1e-12 * g.abs().max(tk.abs()))
+    };
     grid.iter()
+        .filter(|&&g| !has_row(g))
         .map(|&g| (interp(&t[..n], &y[..n], g) - interp(&td, &yd, g)).abs())
         .fold(0.0, f64::max)
         / denom
@@ -2714,6 +2726,24 @@ mod tests {
             "{:?}",
             coarse.notes
         );
+    }
+
+    #[test]
+    fn a_corner_on_a_grid_point_with_its_own_reference_row_adds_no_floor() {
+        // reference: 0 until a 10 ns edge that starts exactly on the 1 us grid point t = 500 us, rows every 0.3 us
+        // plus rows at the two corners (as a simulator that lands on its breakpoints writes them)
+        let edge = |t: f64| ((t - 500e-6) / 10e-9).clamp(0.0, 1.0);
+        let mut t: Vec<f64> = (0..=3333).map(|k| k as f64 * 0.3e-6).collect();
+        t.extend([500e-6, 500.01e-6]);
+        t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let y: Vec<f64> = t.iter().map(|&x| edge(x)).collect();
+        let grid: Vec<f64> = (0..=1000).map(|k| k as f64 * 1e-6).collect();
+        let fl = decimation_floor(&t, &y, &grid, 1.0);
+        assert!(fl < 1e-9, "floor {fl}");
+        // without the row at the corner the comparison itself interpolates there: the floor shows it
+        let keep: Vec<usize> = (0..t.len()).filter(|&k| t[k] != 500e-6).collect();
+        let (t2, y2): (Vec<f64>, Vec<f64>) = keep.iter().map(|&k| (t[k], y[k])).unzip();
+        assert!(decimation_floor(&t2, &y2, &grid, 1.0) > 1e-3);
     }
 
     #[test]

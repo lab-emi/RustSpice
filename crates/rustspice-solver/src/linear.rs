@@ -308,6 +308,7 @@ impl DenseLu {
         Ok(())
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn solve(&self, rhs: &[f64], x: &mut [f64]) {
         let n = self.dim;
         for i in 0..n {
@@ -329,6 +330,7 @@ impl DenseLu {
         }
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn solve_transpose(&self, rhs: &[f64], lambda: &mut [f64], work: &mut [f64]) {
         let n = self.dim;
         work[..n].copy_from_slice(&rhs[..n]);
@@ -364,7 +366,12 @@ struct FaerLuCache {
     solve_stack: GlobalPodBuffer,
     rhs_mat: Mat<f64>,
     valid: bool,
+    /// Identifies the symbolic factorization: numeric factors only fit the symbolic structure they came from.
+    epoch: u64,
 }
+
+/// Source of [`FaerLuCache::epoch`] values.
+static FAER_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Clone for FaerLuCache {
     fn clone(&self) -> Self {
@@ -386,6 +393,7 @@ impl Clone for FaerLuCache {
             solve_stack: GlobalPodBuffer::new(solve_req),
             rhs_mat: Mat::<f64>::zeros(n, 1),
             valid: false,
+            epoch: self.epoch,
         }
     }
 }
@@ -429,6 +437,7 @@ impl FaerLuCache {
             solve_stack: GlobalPodBuffer::new(solve_req),
             rhs_mat: Mat::<f64>::zeros(n, 1),
             valid: false,
+            epoch: FAER_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -527,6 +536,36 @@ impl FaerLuCache {
         }
         Ok(())
     }
+}
+
+/// A copy of the LU factors of an [`AdaptiveSparseSolver`] (see [`AdaptiveSparseSolver::snapshot_factors`]). It
+/// holds as much memory as the live factors.
+#[derive(Clone)]
+pub struct FactorSnapshot(SnapshotKind);
+
+impl FactorSnapshot {
+    /// Bytes of factor values held, when known (`None` for `faer` factors, whose size the library does not report:
+    /// such a snapshot is as large as the live factors).
+    pub fn known_bytes(&self) -> Option<usize> {
+        match &self.0 {
+            SnapshotKind::Unrolled { lu, .. } => Some(lu.len() * 8),
+            SnapshotKind::Dense(d) => Some(d.lu.len() * 8 + d.piv.len() * 8),
+            SnapshotKind::Faer { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum SnapshotKind {
+    Unrolled {
+        lu: Vec<f64>,
+        jit: std::sync::Arc<CraneliftTopologyJit>,
+    },
+    Dense(DenseLu),
+    Faer {
+        numeric: Box<NumericLu<usize, f64>>,
+        epoch: u64,
+    },
 }
 
 /// Adaptive Sparse Linear Solver with pre-allocated numerical factorization buffers.
@@ -670,6 +709,76 @@ impl AdaptiveSparseSolver {
     #[inline]
     pub fn has_valid_factorization(&self) -> bool {
         self.factors_valid
+    }
+
+    /// Copies the current LU factors (`None` without valid factors).
+    pub fn snapshot_factors(&self) -> Option<FactorSnapshot> {
+        if !self.factors_valid {
+            return None;
+        }
+        if self.factors_dense {
+            return self
+                .dense_lu
+                .clone()
+                .map(|d| FactorSnapshot(SnapshotKind::Dense(d)));
+        }
+        if self.factors_in_faer {
+            let c = self.faer_cache.as_ref()?;
+            return Some(FactorSnapshot(SnapshotKind::Faer {
+                numeric: Box::new(c.numeric.clone()),
+                epoch: c.epoch,
+            }));
+        }
+        let jit = self.unrolled_jit.as_ref()?;
+        Some(FactorSnapshot(SnapshotKind::Unrolled {
+            lu: self.lu_buf.clone(),
+            jit: jit.clone(),
+        }))
+    }
+
+    /// Makes `snap` the current factors. Returns `false` (and changes nothing) when the solver's pivot schedule or
+    /// symbolic structure is no longer the one the snapshot was taken with.
+    pub fn restore_factors(&mut self, snap: &FactorSnapshot) -> bool {
+        match &snap.0 {
+            SnapshotKind::Unrolled { lu, jit } => {
+                let same = self
+                    .unrolled_jit
+                    .as_ref()
+                    .is_some_and(|j| std::sync::Arc::ptr_eq(j, jit))
+                    && self.ordering.is_some()
+                    && self.lu_buf.len() == lu.len();
+                if !same {
+                    return false;
+                }
+                self.lu_buf.copy_from_slice(lu);
+                self.factors_in_faer = false;
+                self.factors_dense = false;
+            }
+            SnapshotKind::Dense(d) => {
+                if self.kind != LinearSolverKind::DensePartialPivotLu
+                    || self.dense_lu.as_ref().is_none_or(|x| x.dim != d.dim)
+                {
+                    return false;
+                }
+                self.dense_lu = Some(d.clone());
+                self.factors_in_faer = false;
+                self.factors_dense = true;
+            }
+            SnapshotKind::Faer { numeric, epoch } => {
+                let Some(c) = self.faer_cache.as_mut() else {
+                    return false;
+                };
+                if c.epoch != *epoch || self.kind != LinearSolverKind::FaerSupernodal {
+                    return false;
+                }
+                c.numeric = (**numeric).clone();
+                c.valid = true;
+                self.factors_in_faer = true;
+                self.factors_dense = false;
+            }
+        }
+        self.factors_valid = true;
+        true
     }
 
     /// Factorizes `csc` and solves $A x = b$ into `x`.
@@ -968,11 +1077,11 @@ impl AdaptiveSparseSolver {
         // r = rhs - A * x
         csc.spmv(x, &mut self.pcg_ap);
         let mut rhs_norm_sq = 0.0_f64;
-        for i in 0..n {
-            self.pcg_r[i] = rhs[i] - self.pcg_ap[i];
+        for (i, &r_val) in rhs.iter().enumerate().take(n) {
+            self.pcg_r[i] = r_val - self.pcg_ap[i];
             self.pcg_z[i] = self.inv_diag[i] * self.pcg_r[i];
             self.pcg_p[i] = self.pcg_z[i];
-            rhs_norm_sq += rhs[i] * rhs[i];
+            rhs_norm_sq += r_val * r_val;
         }
 
         if rhs_norm_sq == 0.0 {

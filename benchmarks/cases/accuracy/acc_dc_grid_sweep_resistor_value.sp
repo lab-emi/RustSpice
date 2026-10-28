@@ -4,8 +4,6 @@ DC sweep of a resistor value (.dc R2 1k 3k 1k): ngspice sweeps the element value
 * bench.title: DC sweep of a resistor value (.dc R2 1k 3k 1k): ngspice sweeps the element value
 * bench.probes: v(out)
 * bench.expect: match
-* bench.known_gap: unsupported-syntax-loud
-* bench.gap.note: RustSpice refuses `.dc R2 ...` loudly (TopologyError: Source `R2` not found in circuit) although ngspice sweeps the resistor value (v(out) = 1.5, 2.0, 2.25 V)
 * bench.tags: linear, dc, sweep, capability, unsupported_feature
 * bench.note: closed form v(out) = 3 V * R2 / (1k + R2) = 1.5, 2.0, 2.25 V, which ngspice reproduces; per policy 13.1 a loud refusal of a feature ngspice computes is a known gap (unsupported-syntax-loud), not an accepted outcome: when implemented the case must flip to gap_closed
 V1 in 0 3

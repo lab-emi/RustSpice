@@ -22,7 +22,7 @@ with a diode. These decks fill them with circuits whose answer is fixed by an in
 | `cap_xm_sub_cmos_chain4_tran` | 4-stage CMOS chain from one `.subckt inv`, `.tran` | pass |
 | `cap_xm_sub_rlc_ladder_tran` | RLC ladder from two nested `.subckt` levels | pass |
 | `cap_xm_sub_source_pulse_sin_tran` | PULSE V and SIN I sources declared inside a `.subckt` | pass |
-| `cap_xm_sub_instance_name_waveform_tran` | SIN source in a `.subckt` instantiated as `Xpulse1` (control: same `.subckt` as `X2`) | known_gap_confirmed (`silent-ignore-source-waveform`) |
+| `cap_xm_sub_instance_name_waveform_tran` | SIN source in a `.subckt` instantiated as `Xpulse1` (control: same `.subckt` as `X2`) | pass (closed 2026-10-28) |
 
 The gap: RustSpice flattens an instance into names like `i1_xpulse1` and looks for the waveform keyword as a
 substring of the whole card, name included, PULSE before SIN, so a valid `SIN(0 1m 10meg 0)` card is read as

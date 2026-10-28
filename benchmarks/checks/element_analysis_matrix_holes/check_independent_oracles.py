@@ -268,8 +268,10 @@ DECKS = {
     'sub_source_pulse_sin_tran':   ('tran', tr_subsource, {}),
     'sub_instance_name_waveform_tran': ('tran', tr_instname, {}),
 }
-# decks whose RustSpice result is KNOWN to be wrong on the listed probes (bench.known_gap): audit expects the error
-GAP_PROBES = {'sub_instance_name_waveform_tran': ['v(o1)']}
+# decks whose RustSpice result is KNOWN to be wrong on the listed probes (bench.known_gap): audit expects the error.
+# Empty since 2026-10-28: sub_instance_name_waveform_tran (instance name containing PULSE) was closed by the
+# keyword-based source reader and must now match the oracle like every other probe.
+GAP_PROBES = {}
 # teeth: (regex, replacement) mutations of the deck text; RustSpice on the mutated deck must leave the tolerance band
 TEETH = {
     'l_dc_sweep_diode': [(r'IS=1e-14', 'IS=1e-13')], 'l_dc_sweep_isrc_diode': [(r'IS=1e-14', 'IS=1e-13')],

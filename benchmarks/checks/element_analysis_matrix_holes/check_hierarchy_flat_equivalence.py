@@ -135,7 +135,7 @@ R1_b o2 0 1k
 .end
 """,
 }
-GAP = {'sub_instance_name_waveform_tran'}
+GAP = set()
 
 def main():
     for t in (RS, NG):

@@ -20,8 +20,7 @@ use rustspice_solver::{AdaptiveSparseSolver, LinearSolverKind, ParameterGradSpec
 
 #[test]
 fn test_wheatstone_bridge_and_cranelift_jit_exactness() {
-    let netlist = r#"
-Wheatstone Bridge Golden Test
+    let netlist = r#"Wheatstone Bridge Golden Test
 V1 1 0 DC 10.0
 R1 1 2 1000.0
 R2 2 0 3000.0
@@ -51,8 +50,7 @@ Rbridge 2 3 500.0
 
 #[test]
 fn test_subcircuit_expansion_and_dc_op() {
-    let netlist = r#"
-Hierarchical Voltage Divider Subcircuit Test
+    let netlist = r#"Hierarchical Voltage Divider Subcircuit Test
 .subckt vdiv in out gnd
 Rtop in out 1k
 Rbot out gnd 1k
@@ -78,8 +76,7 @@ X2 n_mid n_out 0 vdiv
 
 #[test]
 fn test_nonlinear_diode_rectifier_accuracy() {
-    let netlist = r#"
-Diode Forward Bias Golden Verification
+    let netlist = r#"Diode Forward Bias Golden Verification
 .model D1N4148 D(IS=2.52e-9 N=1.752)
 V1 1 0 DC 3.3
 R1 1 2 1000.0
@@ -105,8 +102,7 @@ D1 2 0 D1N4148
 #[test]
 fn test_discrete_adjoint_sensitivity_vs_central_finite_difference() {
     // 1. Nonlinear Diode + Resistor Circuit Adjoint Sensitivity
-    let diode_netlist = r#"
-Nonlinear Diode Sensitivity Verification
+    let diode_netlist = r#"Nonlinear Diode Sensitivity Verification
 .model DMOD D(IS=1e-14 N=1.08)
 V1 1 0 DC 2.5
 R1 1 2 1500.0
@@ -162,8 +158,7 @@ D1 2 0 DMOD
     }
 
     // 2. Nonlinear MOSFET Common-Source Amplifier Adjoint Sensitivity
-    let mos_netlist = r#"
-MOSFET Common-Source Amplifier Adjoint Test
+    let mos_netlist = r#"MOSFET Common-Source Amplifier Adjoint Test
 .model NMOD NMOS(LEVEL=1 VTO=0.7 KP=120u LAMBDA=0.02)
 VDD vdd 0 DC 3.3
 VG gate 0 DC 1.35
@@ -220,8 +215,7 @@ M1 out gate 0 0 NMOD W=20u L=1u
 
 #[test]
 fn test_transient_rc_step_and_constant_h_lu_caching() {
-    let netlist = r#"
-RC Step Response Transient Test
+    let netlist = r#"RC Step Response Transient Test
 V1 1 0 PULSE(0.0 5.0 0.0 1p 1p 10u 20u)
 R1 1 2 1000.0
 C1 2 0 1n
@@ -231,13 +225,16 @@ C1 2 0 1n
     let mut sim = Simulator::from_spice(netlist).unwrap();
     let tran = sim.run_transient(10e-9, 5e-6).unwrap();
 
-    // With Constant-h LU factor caching on a linear RC circuit:
-    // Step 0 (t=0) + Step 1 (BDF-1) + Step 2 (Trap) = at most 3 LU factorizations for 500 steps!
+    // With Constant-h LU factor caching on a linear RC circuit only the step sizes of the restarts at the two
+    // PULSE corners (t = 0, 1 ps: backward Euler, BDF-2, then the trapezoid growing back to tstep) need their
+    // own factorisation; the ~500 steps at tstep reuse one.
     assert!(
-        tran.lu_factorizations <= 3,
-        "Expected constant-h LU caching (<= 3 factorizations), got {}",
-        tran.lu_factorizations
+        tran.lu_factorizations <= 24,
+        "Expected constant-h LU caching (<= 24 factorizations), got {} for {} steps",
+        tran.lu_factorizations,
+        tran.accepted_steps
     );
+    assert!(tran.accepted_steps >= 500);
 
     // At t = 5 us = 5 * tau (tau = R*C = 1 us), V(2) should be 5 * (1 - exp(-5)) = 4.96631 V
     let v_final = sim
@@ -252,8 +249,7 @@ C1 2 0 1n
 
 #[test]
 fn test_multi_backend_heterogeneous_consistency() {
-    let netlist = r#"
-Multi-Backend Consistency Test
+    let netlist = r#"Multi-Backend Consistency Test
 .model NMOD NMOS(LEVEL=1 VTO=0.7 KP=120u LAMBDA=0.02)
 .model DMOD D(IS=1e-14 N=1.05)
 VDD vdd 0 DC 3.3

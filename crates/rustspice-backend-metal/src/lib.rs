@@ -394,7 +394,7 @@ impl ComputeBackend for MetalUmaBackend {
                 &mut jacobian.values,
                 rhs,
             );
-            let extra_gmin = state.gmin - 1e-12;
+            let extra_gmin = state.gmin - state.gmin_nominal;
             if extra_gmin.abs() > 0.0 {
                 jacobian.add_diagonal_gmin(state.num_nodes, extra_gmin);
             }
@@ -410,7 +410,7 @@ impl ComputeBackend for MetalUmaBackend {
                     jacobian.values[diag] += 1e-12;
                 }
             }
-            let extra_gmin = state.gmin - 1e-12;
+            let extra_gmin = state.gmin - state.gmin_nominal;
             if extra_gmin.abs() > 0.0 {
                 jacobian.add_diagonal_gmin(state.num_nodes, extra_gmin);
             }

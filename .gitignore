@@ -1,5 +1,6 @@
 /target/
 /.work/
+/bench-artifacts/
 **/*.rs.bk
 *.swp
 *.swo

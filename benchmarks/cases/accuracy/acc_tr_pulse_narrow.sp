@@ -3,9 +3,7 @@ Pulse narrower than the time step
 * bench.group: accuracy
 * bench.title: 5 V / 100 ps pulse into an RC (tau = 10 ns) sampled every 10 ns: the output peak (55 mV from the injected charge, 20 mV at the first grid sample after the pulse) must not be lost
 * bench.probes: v(out)
-* bench.tol.norm: 5e-2
-* bench.known_gap: fixed-step-accuracy
-* bench.gap.note: The 100 ps pulse falls between grid points and is never seen (PULSE is sampled only at grid points): v(out) stays identically 0 V while the true response peaks at 54.7 mV at 100.12 ns (20.4 mV at the 110 ns grid row); harness norm error 0.37 of that 54.7 mV swing (1.0 of the grid-sampled swing), ngspice as-is resolves the peak and is at 8.9e-3
+* bench.tol.norm: 1e-2
 * bench.oracle: tran_lti
 * bench.tags: linear, tran, timing_edge, lost_pulse
 * bench.est_rss_mib: 16

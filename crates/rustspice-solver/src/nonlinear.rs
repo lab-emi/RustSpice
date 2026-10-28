@@ -248,8 +248,8 @@ impl NonlinearSolver {
                 let ar = r.abs();
                 max_res = max_res.max(ar);
                 let scale = self.residual_scale[i] + self.rhs[i].abs();
-                // `!(ar <= tol)` also fails on a NaN residual
-                if !(ar <= self.options.abstol + self.options.res_reltol * scale) {
+                let tol = self.options.abstol + self.options.res_reltol * scale;
+                if ar > tol || ar.is_nan() {
                     res_ok = false;
                 }
             }
@@ -377,6 +377,34 @@ impl NonlinearSolver {
     /// then `Source Stepping`. Used by `.op`, by the transient initial solution (sources at
     /// `t = 0`) and as the per-point recovery of `.dc` sweeps.
     pub fn solve_op_at_current_sources(
+        &mut self,
+        topo: &mut CompiledTopology,
+        backend: &dyn ComputeBackend,
+        linear_solver: &mut AdaptiveSparseSolver,
+    ) -> SimResult<DcOpResult> {
+        if !topo.soa.nodeset_nodes.is_empty() {
+            // `.nodeset`: solve with the nodes held at their guesses, then release them and continue from there
+            topo.soa.set_nodeset_clamps(true);
+            let guided = self.solve_op_unguided(topo, backend, linear_solver);
+            topo.soa.set_nodeset_clamps(false);
+            if let Ok(g) = guided {
+                let mut x = g.solution;
+                Self::sync_device_voltages(topo, &x);
+                if let Ok((iters, res)) = self.solve_in_place(topo, backend, linear_solver, &mut x)
+                {
+                    return Ok(DcOpResult {
+                        solution: x,
+                        iterations: g.iterations + iters,
+                        max_residual: res,
+                    });
+                }
+            }
+        }
+        self.solve_op_unguided(topo, backend, linear_solver)
+    }
+
+    /// [`Self::solve_op_at_current_sources`] without `.nodeset` guidance.
+    fn solve_op_unguided(
         &mut self,
         topo: &mut CompiledTopology,
         backend: &dyn ComputeBackend,
@@ -611,19 +639,8 @@ impl NonlinearSolver {
         })
     }
 
-    /// Executes a `.dc` parameter/source sweep using a **Secant Trajectory Predictor**
-    /// and constant-Jacobian LU reuse for linear circuits.
-    #[allow(clippy::too_many_arguments)]
-    pub fn solve_dc_sweep(
-        &mut self,
-        topo: &mut CompiledTopology,
-        backend: &dyn ComputeBackend,
-        linear_solver: &mut AdaptiveSparseSolver,
-        source_name: &str,
-        start: f64,
-        stop: f64,
-        step: f64,
-    ) -> SimResult<DcSweepResult> {
+    /// Values of a `.dc` sweep `start, start + step, ...` up to `stop`, budget-checked before allocation.
+    pub fn sweep_grid(&self, start: f64, stop: f64, step: f64, dim: usize) -> SimResult<Vec<f64>> {
         if step == 0.0 {
             return Err(SimError::TopologyError(
                 "DC sweep step cannot be zero".to_string(),
@@ -634,12 +651,6 @@ impl NonlinearSolver {
                 "DC sweep bounds must be finite (start = {start}, stop = {stop}, step = {step})"
             )));
         }
-        topo.soa.is_transient = false;
-        topo.soa.update_sources_at_time(None);
-
-        let dim = topo.soa.mna_dim;
-        self.ensure_dim(dim);
-
         // Budget check BEFORE any allocation: the point count is known in closed form.
         self.limits.check_points(
             "dc_sweep_points",
@@ -647,7 +658,6 @@ impl NonlinearSolver {
             dim,
         )?;
         let point_cap = self.limits.point_cap(dim);
-
         // Integer-counted sweep grid: the point count is derived once from |stop - start| / |step| instead
         // of from the accumulated value, whose rounding drift exceeded the old `stop + 1e-12 * step` guard
         // after ~100 additions and silently dropped the last point (`.dc V1 0 5 1m` wrote 5000 of 5001
@@ -682,6 +692,28 @@ impl NonlinearSolver {
                 cur = next;
             }
         }
+        Ok(sweep_values)
+    }
+
+    /// Executes a `.dc` parameter/source sweep using a **Secant Trajectory Predictor**
+    /// and constant-Jacobian LU reuse for linear circuits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn solve_dc_sweep(
+        &mut self,
+        topo: &mut CompiledTopology,
+        backend: &dyn ComputeBackend,
+        linear_solver: &mut AdaptiveSparseSolver,
+        source_name: &str,
+        start: f64,
+        stop: f64,
+        step: f64,
+    ) -> SimResult<DcSweepResult> {
+        topo.soa.is_transient = false;
+        topo.soa.update_sources_at_time(None);
+
+        let dim = topo.soa.mna_dim;
+        self.ensure_dim(dim);
+        let sweep_values = self.sweep_grid(start, stop, step, dim)?;
 
         let orig_vsrc_waveforms = topo.soa.vsrc_waveforms.clone();
         let orig_isrc_waveforms = topo.soa.isrc_waveforms.clone();

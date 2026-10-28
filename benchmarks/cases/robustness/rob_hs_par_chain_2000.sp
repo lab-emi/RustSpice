@@ -4,11 +4,9 @@ case: 2000 chained .param p_i={p_(i-1)+1}
 * bench.title: 2000 chained .param p_i={p_(i-1)+1}
 * bench.probes: v(1), v(2), i(v1)
 * bench.expect: match
-* bench.known_gap: unsupported-syntax-loud
-* bench.gap.note: .param p1={p0+1}-style chains are not evaluated: the use R2 {p1999} is refused ("Invalid resistance value"); a plain .param x=1k and a one-token alias {a} do work
 * bench.tags: hostile, param, scale, resource
 * bench.est_rss_mib: 64
-* bench.note: closed form: p_i = 1000 + i, R2 = 2999 ohm, v(2) = 5*2999/3999 = 3.7497 V (ngspice solves it, verified with tight options) Exact value: v(2) = 5*2999/3999 = 3.749687 V. The same chain written number-first ({1+p0}) is silent instead of loud (RustSpice R2 = 1 ohm, exit 0): see rob_hs_par_chain_numfirst_2000.
+* bench.note: closed form: p_i = 1000 + i, R2 = 2999 ohm, v(2) = 5*2999/3999 = 3.7497 V (ngspice solves it, verified with tight options) Exact value: v(2) = 5*2999/3999 = 3.749687 V. The same chain written number-first ({1+p0}) is silent instead of loud (RustSpice R2 = 1 ohm, exit 0): see rob_hs_par_chain_numfirst_2000. [2026-10-28: gap closed; the RustSpice results quoted above predate the fix.]
 .param p0=1k
 .param p1={p0+1}
 .param p2={p1+1}

@@ -3,8 +3,6 @@
 * bench.group: capability
 * bench.title: .param rk=3k inside the body of .subckt DIV is used by R1 {rk}
 * bench.probes: v(out)
-* bench.known_gap: unsupported-syntax-loud
-* bench.gap.note: loud parse error: Invalid resistance value `{rk}` (.param inside .subckt not recorded); the loud outcome is incidental to the resistor consumer: with a V source as consumer the same card runs silently (see cap_lang_param_inside_subckt_src)
 * bench.tags: linear, op, param, subckt
 * bench.note: ngspice-47 computes v(out) = 8 V * 1k/(3k+1k) = 2 V (hand-checked)
 .subckt DIV in out

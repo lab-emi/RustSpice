@@ -8,8 +8,6 @@ Trapezoid ringing of i(v1) after the slope kinks of a slow PULSE ramp, tstep = 1
 * bench.floor: 1e-7
 * bench.expect: match
 * bench.oracle: tran_lti
-* bench.known_gap: fixed-step-accuracy
-* bench.gap.note: at each slope kink of the ramp (1, 2, 4 and 5 us) the stiff mode is not damped by the trapezoid rule and i(v1) alternates between about -1.96 uA and -0.08 uA instead of the smooth -1 uA / 0 (half the swing off); v(out) is only 1e-3 of swing off because the 1 pF capacitor stores almost nothing
 * bench.tags: linear, tran, coarse_step, ringing, branch_current
 * bench.est_rss_mib: 16
 * bench.note: ideal ramp current i(v1) = -C dv/dt = -1 uA on the rising edge, +1 uA on the falling edge; converged ngspice (tmax 0.5 ns so the 1 ns kink transients are resolved) and oracle tran_lti agree; ngspice as-is is smooth (2.2e-2 of swing off, which is the kink-instant interpolation of its LTE-chosen rows) and the tolerance 5e-2 sits above that level; flip test (same deck): tstep = 1 ns (= tau) passes at 2.1e-2, tstep = 10 ns still fails at 0.33, tstep = 100 ns fails at 0.55

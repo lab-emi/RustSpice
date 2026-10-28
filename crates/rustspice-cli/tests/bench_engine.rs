@@ -812,7 +812,7 @@ fn non_utf8_decks_reach_both_tools_byte_exact() {
 * bench.group: robustness
 * bench.probes: v(1), v(2)
 * bench.known_gap: unsupported-syntax-loud
-* bench.gap.note: refuses non-UTF-8 text
+* bench.gap.note: refused non-UTF-8 text until 2026-10-28
 * comment \xb5 \xe9
 V1 1 0 5
 R1 1 2 1k
@@ -824,9 +824,11 @@ R2 2 0 1k
         return;
     };
     let c = case(&v, "latin1");
+    // bytes that are not UTF-8 in the title and in comments carry no circuit semantics: both tools simulate, so the
+    // recorded gap is reported closed (a non-pass, whose deck is kept)
     assert_eq!(c["ngspice_status"], "ok", "{c:#?}");
-    assert_eq!(c["rustspice"]["class"], "loud_error");
-    assert_eq!(c["status"], "known_gap_confirmed", "{c:#?}");
+    assert_eq!(c["rustspice"]["class"], "ok");
+    assert_eq!(c["status"], "gap_closed", "{c:#?}");
     assert_eq!(
         std::fs::read(art.join("latin1").join("deck.sp")).unwrap(),
         deck
@@ -1323,8 +1325,8 @@ fn timing_mode_on_a_custom_corpus_with_an_include_leaves_the_corpus_untouched() 
     let dir = scratch("timing_inc");
     let cases = dir.join("cases");
     std::fs::create_dir_all(cases.join("lib")).unwrap();
-    // a nested include chain through a sub-directory; the model is never used, so rustspice (which ignores
-    // `.include`) and ngspice (which needs the files) must agree
+    // a nested include chain through a sub-directory (the decoy `outer.lib` next to the deck must not be the one
+    // `lib/outer.lib` includes); both tools read the chain and agree
     put(
         &cases,
         "perf_inc.sp",
@@ -1493,20 +1495,20 @@ fn a_huge_refusal_message_is_clipped_in_the_report() {
     let dir = scratch("huge_msg");
     let cases = dir.join("cases");
     std::fs::create_dir_all(&cases).unwrap();
+    // the refusal names the 100 kB parameter: the report must clip it
     let deck = format!(
-        "Deeply nested expression as a resistance
+        "Undefined 100 kB parameter name as a resistance
 * bench.id: huge_msg
 * bench.group: robustness
 * bench.expect: either
 * bench.timing: no
 V1 in 0 DC 5
-R1 in out {{{}1{}}}
+R1 in out {{{}}}
 R2 out 0 1k
 .op
 .end
 ",
-        "(".repeat(50_000),
-        ")".repeat(50_000)
+        "p".repeat(100_000)
     );
     put(&cases, "huge_msg.sp", &deck);
     clean_outputs(&cases);

@@ -5,8 +5,6 @@
 * bench.probes: v(n1), v(n3), v(n5)
 * bench.tol.norm: 3.5e-2
 * bench.series.tstep: 20p 5p 2.5p 1.25p 0.625p
-* bench.known_gap: fixed-step-accuracy
-* bench.gap.note: 20 ps member only (4x the nominal step), plain second-order trapezoid truncation and not a missing breakpoint (the PULSE corners 0.2/0.3/2.3/2.4 ns all lie on the 20 ps grid): v(n5) is off by 0.197 of the swing vs ngspice as-is 0.041 (4.8x), v(n3) 0.146 vs 0.031 (4.7x), worst probe 0.197 vs 0.066 (3.0x); ngspice as-is itself exceeds tol.norm 3.5e-2 here (v(n1) 0.066, v(n5) 0.041), so this is a weak gap; from the nominal 5 ps down RustSpice is as accurate as ngspice (1.9e-2 vs 2.7e-2) and converges 2nd order (3.5e-4 at 0.625 ps)
 * bench.size: 5
 * bench.tags: nonlinear, tran, mos, cmos, series
 * bench.est_rss_mib: 16

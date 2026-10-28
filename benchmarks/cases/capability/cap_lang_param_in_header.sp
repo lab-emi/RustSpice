@@ -3,8 +3,6 @@ Parameter in a subcircuit header
 * bench.group: capability
 * bench.title: .subckt DIV in out PARAMS: rv=1k uses the default when X1 gives no override
 * bench.probes: v(out)
-* bench.known_gap: unsupported-syntax-loud
-* bench.gap.note: loud parse error: PARAMS: tokens are read as ports ("expects 4 ports, got 2")
 * bench.tags: linear, op, param, subckt
 * bench.note: ngspice-47 computes v(out) = 6 V * 1k/(1k+1k) = 3 V with the default rv = 1k (hand-checked)
 .subckt DIV in out PARAMS: rv=1k

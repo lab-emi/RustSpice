@@ -4,8 +4,6 @@ Two capacitively coupled RC ladders (crosstalk)
 * bench.title: Aggressor and victim RC ladders (8 sections each) coupled by 50 fF per section, 50 ps edge
 * bench.probes: v(a8), v(v8), v(v0)
 * bench.tol.norm: 5e-3
-* bench.known_gap: fixed-step-accuracy
-* bench.gap.note: Plain second-order trapezoid truncation on the derivative-like victim near-end noise v(v0) (swing 21 mV), not a missing breakpoint (the PULSE corners 0.1/0.15/5.15/5.2 ns all lie on the 10 ps grid): v(v0) is off by 1.75e-2 of its swing, worst at 160 ps just after the 150 ps corner; ngspice as-is is 2.0e-3 and the other probes are within 1.1e-3
 * bench.oracle: tran_lti
 * bench.tags: linear, tran, crosstalk, coupled
 * bench.est_rss_mib: 16

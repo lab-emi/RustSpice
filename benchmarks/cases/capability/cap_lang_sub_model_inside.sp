@@ -3,8 +3,6 @@ Model defined inside a subcircuit
 * bench.group: capability
 * bench.title: .model DM D(IS=1e-12) inside .subckt applies to the diode in that subcircuit
 * bench.probes: v(out)
-* bench.known_gap: silent-ignore-directive
-* bench.gap.note: .model inside .subckt is dropped; the diode silently uses default parameters (0.693 V instead of 0.574 V)
 * bench.tags: nonlinear, op, subckt, model_scope
 .subckt CLAMP in out
 R1 in out 1k

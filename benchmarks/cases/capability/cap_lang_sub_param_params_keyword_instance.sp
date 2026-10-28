@@ -3,8 +3,6 @@ Instance parameters introduced by PARAMS:
 * bench.group: capability
 * bench.title: X1 in out DIV PARAMS: rv=3k (the PARAMS: keyword on the instance line)
 * bench.probes: v(out)
-* bench.known_gap: unsupported-syntax-loud
-* bench.gap.note: loud parse error: X1 ... DIV PARAMS: rv=3k: "Unknown subcircuit `rv=3k`"
 * bench.tags: linear, op, subckt, param
 * bench.note: ngspice-47 computes v(out) = 8 V * 1k/(3k+1k) = 2 V with the override rv = 3k (the 1k default would give 4 V; hand-checked)
 .subckt DIV in out PARAMS: rv=1k

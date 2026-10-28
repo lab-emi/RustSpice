@@ -3,8 +3,6 @@ Subcircuit defined inside another subcircuit
 * bench.group: capability
 * bench.title: .subckt INNER defined inside .subckt OUTER and used only there
 * bench.probes: v(out)
-* bench.known_gap: unsupported-syntax-loud
-* bench.gap.note: loud parse error: .subckt inside .subckt: "Unknown subcircuit `inner`"
 * bench.tags: linear, op, subckt, hierarchy
 * bench.note: ngspice-47 computes v(out) = 8 V * 1k/(1k+1k) = 4 V (hand-checked)
 .subckt OUTER in out

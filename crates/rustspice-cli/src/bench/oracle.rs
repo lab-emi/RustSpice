@@ -45,7 +45,7 @@
 //!   (`theta = 2 asinh(sqrt(rs/rsh)/2)`). The deck text is not read: the oracle describes the INTENDED circuit, so a deck
 //!   that does not implement it disagrees with it. Probes `v(n<k>)` (0 <= k <= n) and `i(v1)`; `.op` only.
 //! * `tran_lti` - dense MNA `A x + E x' = b(t)` for linear `R C L V I G` (no mutual inductors), sources `DC`, `PULSE`
-//!   (explicit 7 arguments, non-zero rise/fall), `SIN` (vo va freq [td [theta [0]]]), `PWL`. The integrator is the
+//!   (explicit 7 arguments, non-zero rise/fall), `SIN(vo va freq [td [theta [0]]])`, `PWL`. The integrator is the
 //!   3-stage Radau IIA collocation method (order 5, L-stable, stiffly accurate) in the stage-value formulation, run on a
 //!   grid whose segment boundaries are the exact source breakpoints, with dense output (the cubic collocation polynomial; quadratic through
 //!   the stage values in the first step after a kink; exact state at grid points) at the requested times. The step is halved until two consecutive refinements agree to `1e-8` of the probe swing

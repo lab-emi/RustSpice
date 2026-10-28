@@ -4,8 +4,6 @@ RC with a step larger than the time constant
 * bench.title: RC (tau = 1 us) with tstep = 3 us (3 tau): trapezoid alternates sign on a stiff step, backward-Euler decays monotonically
 * bench.probes: v(out)
 * bench.tol.norm: 5e-2
-* bench.known_gap: fixed-step-accuracy
-* bench.gap.note: Trapezoid takes the 1 V step at tstep = 3 tau as 0.6 V then alternates around the exact decay (0.35 of swing); ngspice (breakpoint + LTE) is within 1.7e-3
 * bench.oracle: tran_lti
 * bench.tags: linear, tran, coarse_step
 * bench.est_rss_mib: 16

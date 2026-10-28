@@ -4,8 +4,6 @@ RC with a small TMAX requested on the .tran card
 * bench.title: RC (tau = 100 ns) driven by a 1 us pulse with 1 ns edges; .tran 0.5u 4u 0 10n asks for internal steps <= 10 ns
 * bench.probes: v(out)
 * bench.tol.norm: 5e-3
-* bench.known_gap: fixed-step-accuracy
-* bench.gap.note: RustSpice steps at the 0.5 us print step (9 rows) over the 1 ns edges and its error is 0.248 of swing; .tran TMAX is ignored too (output bit-identical for tmax 10n, 1n, absent, 2u) but is not what decides the error
 * bench.ref.tmax: 2n
 * bench.tags: linear, tran, tmax, timing_edge, silent_risk
 * bench.est_rss_mib: 16

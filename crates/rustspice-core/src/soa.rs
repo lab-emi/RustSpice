@@ -118,6 +118,9 @@ pub struct DeviceSoaBuffer {
     pub num_nodes: usize,
     pub mna_dim: usize,
     pub gmin: f64,
+    /// Junction `gmin` of the deck (`.options gmin`, default 1e-12 S); `gmin` rises above it only during gmin
+    /// stepping, and the excess is stamped as a shunt on every node.
+    pub gmin_nominal: f64,
     pub temp_vt: f64,
     pub is_transient: bool,
     pub transient_g_scale: f64,
@@ -156,6 +159,8 @@ pub struct DeviceSoaBuffer {
     pub cap_i_prev: AlignedVec<f64>,
     pub cap_cond_buf_idx: Vec<u32>,
     pub cap_rhs_buf_idx: Vec<u32>,
+    /// Element `ic=` voltage (NaN when absent); applied only by a `.tran ... uic` start.
+    pub cap_ic: Vec<f64>,
 
     // --- Inductors (SoA) ---
     pub ind_names: Vec<String>,
@@ -171,6 +176,19 @@ pub struct DeviceSoaBuffer {
     pub ind_cond_buf_idx: Vec<u32>,
     pub ind_branch_buf_idx: Vec<u32>,
     pub ind_rhs_buf_idx: Vec<u32>,
+    /// Element `ic=` current (NaN when absent); applied only by a `.tran ... uic` start.
+    pub ind_ic: Vec<f64>,
+
+    // --- `.ic` node clamps (Norton equivalents, active only while the transient start point is solved) ---
+    pub ic_nodes: Vec<usize>,
+    pub ic_values: Vec<f64>,
+    pub ic_cond_buf_idx: Vec<u32>,
+    pub ic_rhs_buf_idx: Vec<u32>,
+    // --- `.nodeset` node clamps (same form, active only during the first phase of an operating point) ---
+    pub nodeset_nodes: Vec<usize>,
+    pub nodeset_values: Vec<f64>,
+    pub nodeset_cond_buf_idx: Vec<u32>,
+    pub nodeset_rhs_buf_idx: Vec<u32>,
 
     // --- Independent Voltage Sources (SoA) ---
     pub vsrc_names: Vec<String>,
@@ -401,6 +419,36 @@ impl DeviceSoaBuffer {
         )))
     }
 
+    /// Conductance of the `.ic` node clamps while they are active (a 1 nano-ohm Norton source: the clamped node
+    /// sits within `I / 1e9` volts of its value for any circuit current `I`).
+    pub const IC_CLAMP_CONDUCTANCE: f64 = 1e9;
+
+    /// Activates (`true`) or removes (`false`) the `.nodeset` node clamps.
+    pub fn set_nodeset_clamps(&mut self, active: bool) {
+        let g = if active {
+            Self::IC_CLAMP_CONDUCTANCE
+        } else {
+            0.0
+        };
+        for i in 0..self.nodeset_nodes.len() {
+            self.cond_buf[self.nodeset_cond_buf_idx[i] as usize] = g;
+            self.rhs_buf[self.nodeset_rhs_buf_idx[i] as usize] = g * self.nodeset_values[i];
+        }
+    }
+
+    /// Activates (`true`) or removes (`false`) the `.ic` node clamps.
+    pub fn set_ic_clamps(&mut self, active: bool) {
+        let g = if active {
+            Self::IC_CLAMP_CONDUCTANCE
+        } else {
+            0.0
+        };
+        for i in 0..self.ic_nodes.len() {
+            self.cond_buf[self.ic_cond_buf_idx[i] as usize] = g;
+            self.rhs_buf[self.ic_rhs_buf_idx[i] as usize] = g * self.ic_values[i];
+        }
+    }
+
     /// Detects KCL-inconsistent DC cutsets: any connected component of DC-conductive branches
     /// (`R`, `V`, `L`, `D`, MOSFET drain-source channel, VCCS output) not containing ground (`0`)
     /// into which independent current sources inject a non-zero net DC current.
@@ -604,6 +652,55 @@ pub fn find_dc_current_cutset(soa: &DeviceSoaBuffer) -> Option<(Vec<usize>, f64)
     None
 }
 
+/// Temperatures (kelvin) of one device: its own and the nominal one of its model.
+fn device_temperatures(
+    netlist: &Netlist,
+    name: &str,
+    temp: Option<f64>,
+    dtemp: Option<f64>,
+    model_tnom: Option<f64>,
+) -> SimResult<(f64, f64)> {
+    use crate::temperature::{DEFAULT_TEMP_C, KELVIN};
+    let circuit = netlist.temp.unwrap_or(DEFAULT_TEMP_C);
+    let t = temp.unwrap_or(circuit) + dtemp.unwrap_or(0.0) + KELVIN;
+    let tnom = model_tnom.or(netlist.tnom).unwrap_or(DEFAULT_TEMP_C) + KELVIN;
+    if !(t > 0.0 && t.is_finite() && tnom > 0.0 && tnom.is_finite()) {
+        return Err(SimError::TopologyError(format!(
+            "`{name}`: device temperature {:.2} K / nominal {:.2} K is not above absolute zero",
+            t, tnom
+        )));
+    }
+    Ok((t, tnom))
+}
+
+/// Diode parameters at the device temperature: `(IS, N_eff, CJO, VJ)` per unit area, where `N_eff * Vt(circuit)`
+/// equals `N * Vt(device)` (the kernels share one thermal voltage).
+fn diode_at_temperature(
+    netlist: &Netlist,
+    d: &crate::netlist::DiodeInstance,
+    m: &crate::netlist::DiodeModelParams,
+) -> SimResult<(f64, f64, f64, f64)> {
+    use crate::temperature as tk;
+    let (t, tnom) = device_temperatures(netlist, &d.name, d.temp, d.dtemp, m.tnom)?;
+    let t_circuit = netlist.temp.unwrap_or(tk::DEFAULT_TEMP_C) + tk::KELVIN;
+    let is = tk::diode_saturation_current(
+        m.is,
+        m.n,
+        m.eg.unwrap_or(1.11),
+        m.xti.unwrap_or(3.0),
+        t,
+        tnom,
+    );
+    let n_eff = if t == t_circuit {
+        m.n
+    } else {
+        m.n * (t / t_circuit)
+    };
+    let cjo = tk::junction_capacitance(m.cjo, m.m, m.vj, t, tnom);
+    let vj = tk::junction_potential(m.vj, t, tnom);
+    Ok((is, n_eff, cjo, vj))
+}
+
 /// Compiles a parsed [`Netlist`] into a 64-byte aligned [`DeviceSoaBuffer`] and a conflict-free
 /// [`CscGatherTable`] + [`CscMatrix`].
 pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
@@ -613,7 +710,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     // Synthesize MOSFET gate-source / gate-drain / gate-bulk overlap capacitors when Cgso/Cgdo/Cgbo > 0
     for mos in &netlist.mosfets {
         if let Some(m) = netlist.mosfet_models.get(&mos.model) {
-            let w = mos.w.unwrap_or(m.w_default);
+            let w = mos.w.unwrap_or(m.w_default) * mos.m;
             if m.cgso > 0.0 {
                 netlist_expanded
                     .capacitors
@@ -654,13 +751,14 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     for d in &netlist.diodes {
         if let Some(m) = netlist.diode_models.get(&d.model) {
             if m.cjo > 0.0 {
+                let (_, _, cjo, _) = diode_at_temperature(netlist, d, m)?;
                 netlist_expanded
                     .capacitors
                     .push(crate::netlist::CapacitorInstance {
                         name: format!("c_j_{}", d.name),
                         n_pos: d.n_anode,
                         n_neg: d.n_cathode,
-                        capacitance: m.cjo * d.area,
+                        capacitance: cjo * d.area,
                         ic: None,
                     });
             }
@@ -677,8 +775,12 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     let mut soa = DeviceSoaBuffer {
         num_nodes,
         mna_dim,
-        gmin: 1e-12,
-        temp_vt: 0.025864917007155805, // Exact ngspice-47 k*T/q at 300.15 K (27 C)
+        gmin: netlist.gmin.unwrap_or(1e-12),
+        gmin_nominal: netlist.gmin.unwrap_or(1e-12),
+        // k T / q at the circuit temperature (exactly the ngspice-47 value 0.025864917007155805 at 27 C)
+        temp_vt: crate::temperature::thermal_voltage(
+            netlist.temp.unwrap_or(crate::temperature::DEFAULT_TEMP_C) + crate::temperature::KELVIN,
+        ),
         is_transient: false,
         transient_g_scale: 0.0,
         node_names: netlist.node_names.clone(),
@@ -772,6 +874,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         soa.cap_i_prev.push(0.0);
         soa.cap_cond_buf_idx.push(cond_idx);
         soa.cap_rhs_buf_idx.push(rhs_idx);
+        soa.cap_ic.push(c.ic.unwrap_or(f64::NAN));
 
         add_2pin_conductance(c.n_pos, c.n_neg, cond_idx, false, &mut matrix_stamps);
         if c.n_pos > 0 {
@@ -836,6 +939,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         soa.ind_branch_buf_idx.push(br_inc_idx);
         soa.ind_cond_buf_idx.push(req_cond_idx);
         soa.ind_rhs_buf_idx.push(rhs_idx);
+        soa.ind_ic.push(ind.ic.unwrap_or(f64::NAN));
 
         if ind.n_pos > 0 {
             let p = ind.n_pos - 1;
@@ -887,11 +991,12 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         soa.diode_names.push(d.name.clone());
         soa.diode_anode.push(d.n_anode);
         soa.diode_cathode.push(d.n_cathode);
-        soa.diode_is.push(m.is * d.area);
-        soa.diode_n.push(m.n);
+        let (is_t, n_eff, cjo_t, vj_t) = diode_at_temperature(&netlist_expanded, d, &m)?;
+        soa.diode_is.push(is_t * d.area);
+        soa.diode_n.push(n_eff);
         soa.diode_area.push(d.area);
-        soa.diode_cjo.push(m.cjo * d.area);
-        soa.diode_vj.push(m.vj);
+        soa.diode_cjo.push(cjo_t * d.area);
+        soa.diode_vj.push(vj_t);
         soa.diode_m.push(m.m);
         soa.diode_tt.push(m.tt);
         soa.diode_vd.push(0.0);
@@ -952,12 +1057,21 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         soa.mos_bulk.push(mos.n_bulk);
         soa.mos_polarity.push(m.mos_type.sign());
         soa.mos_level.push(m.level);
-        soa.mos_kp.push(m.kp);
-        soa.mos_w.push(mos.w.unwrap_or(m.w_default));
+        let (t, tnom) = device_temperatures(netlist, &mos.name, mos.temp, mos.dtemp, m.tnom)?;
+        let (kp_t, vto_t, phi_t) =
+            crate::temperature::level1_at(m.kp, m.vto, m.phi, m.gamma, m.mos_type.sign(), t, tnom);
+        if phi_t <= 0.0 {
+            return Err(SimError::TopologyError(format!(
+                "MOSFET `{}`: surface potential PHI={phi_t:.4} V at {:.2} K is not positive",
+                mos.name, t
+            )));
+        }
+        soa.mos_kp.push(kp_t);
+        soa.mos_w.push(mos.w.unwrap_or(m.w_default) * mos.m);
         soa.mos_l.push(mos.l.unwrap_or(m.l_default));
-        soa.mos_vto.push(m.vto);
+        soa.mos_vto.push(vto_t);
         soa.mos_gamma.push(m.gamma);
-        soa.mos_phi.push(m.phi);
+        soa.mos_phi.push(phi_t);
         soa.mos_lambda.push(m.lambda);
         soa.mos_vgs.push(0.0);
         soa.mos_vds.push(0.0);
@@ -1052,6 +1166,50 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         }
     }
 
+    // 9. `.ic` node clamps: a conductance to ground plus a Norton current, both zero until the transient start
+    //    point is solved (`set_ic_clamps`), so they never touch `.op`, `.dc` or the transient steps.
+    let mut ic_entries: Vec<(usize, f64)> = netlist
+        .initial_conditions
+        .iter()
+        .filter(|(&node, _)| node > 0 && node <= num_nodes)
+        .map(|(&node, &v)| (node, v))
+        .collect();
+    ic_entries.sort_by_key(|&(node, _)| node);
+    for (node, v) in ic_entries {
+        let cond_idx = soa.cond_buf.len() as u32;
+        soa.cond_buf.push(0.0);
+        let rhs_idx = soa.rhs_buf.len() as u32;
+        soa.rhs_buf.push(0.0);
+        soa.ic_nodes.push(node);
+        soa.ic_values.push(v);
+        soa.ic_cond_buf_idx.push(cond_idx);
+        soa.ic_rhs_buf_idx.push(rhs_idx);
+        matrix_stamps.push((node - 1, node - 1, cond_idx, 1.0, false));
+        rhs_stamps.push((node - 1, rhs_idx, 1.0));
+    }
+
+    // 10. `.nodeset` node clamps: the same Norton form, active only while the first phase of an operating point
+    //     is solved (`set_nodeset_clamps`); the second phase starts from that solution without them.
+    let mut nodeset_entries: Vec<(usize, f64)> = netlist
+        .nodesets
+        .iter()
+        .filter(|(&node, _)| node > 0 && node <= num_nodes)
+        .map(|(&node, &v)| (node, v))
+        .collect();
+    nodeset_entries.sort_by_key(|&(node, _)| node);
+    for (node, v) in nodeset_entries {
+        let cond_idx = soa.cond_buf.len() as u32;
+        soa.cond_buf.push(0.0);
+        let rhs_idx = soa.rhs_buf.len() as u32;
+        soa.rhs_buf.push(0.0);
+        soa.nodeset_nodes.push(node);
+        soa.nodeset_values.push(v);
+        soa.nodeset_cond_buf_idx.push(cond_idx);
+        soa.nodeset_rhs_buf_idx.push(rhs_idx);
+        matrix_stamps.push((node - 1, node - 1, cond_idx, 1.0, false));
+        rhs_stamps.push((node - 1, rhs_idx, 1.0));
+    }
+
     // Build structural CSC Matrix from all coordinate triplets
     let coords: Vec<(usize, usize)> = matrix_stamps.iter().map(|&(r, c, ..)| (r, c)).collect();
     let jacobian = CscMatrix::<f64>::from_pattern(mna_dim, mna_dim, &coords);
@@ -1124,7 +1282,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         if !has_dc {
             let diag = jacobian.diag_idx[d];
             if diag < nnz {
-                static_linear_csc_values[diag] += soa.gmin;
+                static_linear_csc_values[diag] += 1e-12;
                 dc_floating_diag_idx.push(diag);
             }
         }

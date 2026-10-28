@@ -4,8 +4,6 @@ case: 2000 chained .param p_i={1+p_(i-1)}, number first
 * bench.title: 2000 chained .param p_i={1+p_(i-1)} (each expression starts with a number)
 * bench.probes: v(1), v(2), i(v1)
 * bench.expect: match
-* bench.known_gap: expr-truncation
-* bench.gap.note: every .param p_i={1+p_(i-1)} is truncated to its leading number 1, so R2 {p1999} = 1 ohm and v(2) = 4.995 mV with exit 0 and no message, where ngspice gives R2 = 2999 ohm and v(2) = 3.7497 V
 * bench.tags: hostile, param, scale, resource, silent_risk
 * bench.est_rss_mib: 64
 * bench.note: closed form: p_i = 1000 + i, R2 = p1999 = 2999 ohm, v(2) = 5*2999/3999 = 3.749687 V, i(v1) = -5/3999 = -1.250313 mA (ngspice-47 tight and an exact rational solve agree). Silent twin of rob_hs_par_chain_2000: the same chain written identifier-first ({p0+1}) is refused loudly, written number-first only the leading number survives; a single link `.param p1={1+p0}` already gives R2 = 1 ohm instead of 1001 ohm, while the alias `{p0}` is read correctly (verified).

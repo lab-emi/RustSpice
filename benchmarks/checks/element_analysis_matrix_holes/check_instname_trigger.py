@@ -62,7 +62,7 @@ def pulse(t, v1=0, v2=2, td=10e-9, tr=5e-9, tf=5e-9, pw=40e-9, per=100e-9):
 
 # (deck template, instance card name, source kind, RustSpice expected wrong?)
 VARIANTS = [(SIN_DECK, 'X1', 'sin', False), (SIN_DECK, 'Xpuls1', 'sin', False), (SIN_DECK, 'Xsin1', 'sin', False),
-            (SIN_DECK, 'Xpulse1', 'sin', True), (SIN_DECK, 'XPULSE_gen', 'sin', True), (SIN_DECK, 'Xmypulsegen', 'sin', True),
+            (SIN_DECK, 'Xpulse1', 'sin', False), (SIN_DECK, 'XPULSE_gen', 'sin', False), (SIN_DECK, 'Xmypulsegen', 'sin', False),
             (PULSE_DECK, 'X1', 'pulse', False), (PULSE_DECK, 'Xsin1', 'pulse', False), (PULSE_DECK, 'Xpulse1', 'pulse', False)]
 
 def main():

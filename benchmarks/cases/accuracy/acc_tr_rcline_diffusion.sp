@@ -4,8 +4,6 @@ Distributed RC diffusion line (200 sections) step response
 * bench.title: Distributed RC line, 200 sections of 5 ohm / 10 fF, 3.3 V step, tstep 10 ps (near-end nodes are 200x stiffer than the step)
 * bench.probes: v(n2), v(n20), v(n100), v(n200)
 * bench.tol.norm: 5e-3
-* bench.known_gap: fixed-step-accuracy
-* bench.gap.note: BDF1 first step + trapezoid, no LTE: the near-end nodes of the 200x-stiff line are off by 9.3e-2 of the swing (0.31 V of 3.3 V at v(n20)) at 10 ps against ngspice as-is 1.4e-3, non-monotonically in the step (v(n20) 9.9e-2, 4.1e-2, 9.3e-2, 3.9e-2 at 40, 20, 10, 5 ps: edge/ringing effects, not smooth truncation) and RustSpice gets below tol.norm 5e-3 only at 0.5 ps (v(n2) 5.6e-3 at 1 ps, 12 % over); from 10 ps down every PULSE corner is on the grid, so no breakpoint is missing
 * bench.ref.tmax: 0.1p
 * bench.oracle: tran_lti
 * bench.series.tstep: 40p 20p 10p 5p 2.5p 1p 0.5p

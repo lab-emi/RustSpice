@@ -4,8 +4,6 @@ subckt defined inside another .subckt
 * bench.title: .subckt defined inside another .subckt
 * bench.probes: v(1), i(v1)
 * bench.expect: match
-* bench.known_gap: unsupported-syntax-loud
-* bench.gap.note: a .subckt defined inside another .subckt is refused: "Unknown subcircuit inner"
 * bench.tags: subckt, parser, capability
 * bench.est_rss_mib: 64
 * bench.note: legal in ngspice: the inner definition is local to outer, i(v1) = -5 mA = -5 V/1k (verified)

@@ -3,8 +3,6 @@ Global node declared with .global
 * bench.group: capability
 * bench.title: .global vdd makes 'vdd' visible inside .subckt without being a port
 * bench.probes: v(out), v(vdd)
-* bench.known_gap: silent-ignore-directive
-* bench.gap.note: .global ignored: vdd inside the subcircuit is a local node, so out stays 0 V instead of 3.75 V
 * bench.tags: linear, op, subckt, global
 .global vdd
 .subckt PULL out

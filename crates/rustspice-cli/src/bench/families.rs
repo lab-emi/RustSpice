@@ -9,8 +9,8 @@
 //! The size lists below are *increments*: `Small` returns the small list, `Medium` returns small + medium, `Large`
 //! returns small + medium + large (sizes de-duplicated, ascending). A size is the problem size of the family (MNA
 //! unknowns for the circuit families, deck lines for `parse_stress_*`); the id of a deck is `fam_<family>_<size>`.
-//! Generator memory (Rule 9, measured): `Small` < 4 MiB, `Medium` < 64 MiB (test-enforced), `Large` 93 decks (94 once the
-//! `mos_array_tran_fast` slug is registered) / 154 MiB of deck text, 188 MiB peak RSS, 1.9 s in a debug build (the 1e6-stage
+//! Generator memory (Rule 9, measured): `Small` < 4 MiB, `Medium` < 64 MiB (test-enforced), `Large` 94 decks
+//! / 154 MiB of deck text, 188 MiB peak RSS, 1.9 s in a debug build (the 1e6-stage
 //! ladder alone is 55 MiB); no search, no recursion, no unbounded loop.
 //!
 //! | family (id prefix)            | small          | medium                | large                     |
@@ -26,7 +26,7 @@
 //! | `cmos_chain_op` / `_tran`     | 5              | 5, 50, 100, 150       | 200, 300, 400, 2000       |
 //! | `mos_array_op` (g)             | 5              | 10, 20, 30            | 50, 71                    |
 //! | `mos_array_tran` (g)          | 20             | 10, 30                | 50, 71                    |
-//! | `mos_array_tran_fast` (g)     | 5 (only once the registry has [`FAST_EDGE_SLUG`]) | - | -         |
+//! | `mos_array_tran_fast` (g)     | 5              | -                     | -                         |
 //! | `sram6t_op` / `_tran` (n x n) | 8              | 16, 24                | 32, 48                    |
 //! | `star_hub` (k leaves)         | 100            | 100, 1000, 1800       | 2000                      |
 //! | `parse_stress_{res,diode,subckt}` (lines) | 1000 | 1000, 10000, 100000 | 1000000               |
@@ -898,7 +898,6 @@ fn mos_array_body(g: u64, tran: bool, fast: bool) -> String {
 /// * `.tran` at g = 71: no result within 90 s on the faer tier (g = 50 about 29 s; ngspice-KLU 1.9 s and 4.6 s); counts
 ///   as a timeout at the default case timeout (performance gap).
 ///
-/// The fast-edge decks (`mos_array_tran_fast`) fail for a different reason, see [`FAST_EDGE_SLUG`].
 fn mos_array_gap(meta: &mut Meta, g: u64, tran: bool) {
     let (slug, note) = match (tran, g) {
         (true, 71) => ("faer-nonlinear-slow", "RustSpice gives no result within 90 s (g=50 takes ~29 s, ngspice-KLU 1.9 s at g=50 and 4.6 s at g=71; SPARSE 109 s): the faer tier is far slower than ngspice-KLU on nonlinear systems; counts as a timeout at the default case timeout"),
@@ -906,16 +905,6 @@ fn mos_array_gap(meta: &mut Meta, g: u64, tran: bool) {
     };
     meta.known_gap = Some(slug);
     meta.gap_note = Some(note.into());
-}
-
-/// Slug of the fast-edge decks: after fixing the unrolled static-pivot LU (`unrolled-lu-tran-divergence`), the transient
-/// Newton converges and completes on `UnrolledSymbolic`, leaving only the fixed-step accuracy gap (`norm_err 0.142 > tol 0.02`
-/// at the 20 ps step on the 20 ps output edges, where default ngspice is itself 8 % off).
-pub const FAST_EDGE_SLUG: &str = "fixed-step-accuracy";
-
-/// Whether `slug` is in the known-gap registry of the engine (decks with an unregistered slug are not run).
-fn registered(slug: &str) -> bool {
-    super::meta::KNOWN_GAP_SLUGS.contains(&slug)
 }
 
 fn gen_mos_array_op(g: u64, _seed: u64) -> GeneratedDeck {
@@ -998,8 +987,8 @@ fn gen_mos_array_tran_variant(g: u64, fast: bool) -> GeneratedDeck {
         // (measured with ngspice-47; the as-is run is 11 % off), far inside `tol_norm` = 2 %.
         meta.refmode = Some("reltol=1e-3 abstol=1e-12 vntol=1e-6".to_string());
         meta.ref_tmax = Some("2p");
-        meta.known_gap = Some(FAST_EDGE_SLUG);
-        meta.gap_note = Some("with a fixed 20 ps step on the 20 ps output edges (5 fF load), the waveform deviates from the converged reference by 0.142 of swing (3.4 ps 50 %-crossing shift) against tol.norm 2e-2; default ngspice at the same nominal step is 0.080 of swing off".into());
+        // Formerly `fixed-step-accuracy` (0.142 of swing at the fixed 20 ps step on the 20 ps output edges); the
+        // adaptive, breakpoint-aware integrator follows the edges (5.5e-3 of swing at g = 5).
     } else if g <= 30 {
         // default ngspice tolerances with a small tmax: the tight reference (reltol 1e-6) does not finish within 100 s on
         // these decks (it is also needless: tmax 5 ps and 2 ps agree to 0.06 percent of swing at g = 20)
@@ -1540,9 +1529,6 @@ const FAMILIES: &[Fam] = &[
 /// Sizes generated for `family` at `scale` (cumulative, ascending, de-duplicated).
 pub fn sizes(family: &str, scale: Scale) -> Vec<u64> {
     let mut v: Vec<u64> = Vec::new();
-    if family == "mos_array_tran_fast" && !registered(FAST_EDGE_SLUG) {
-        return v;
-    }
     if let Some(f) = FAMILIES.iter().find(|f| f.name == family) {
         v.extend_from_slice(f.small);
         if scale >= Scale::Medium {

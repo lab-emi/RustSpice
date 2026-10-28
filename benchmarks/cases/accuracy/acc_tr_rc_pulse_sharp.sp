@@ -4,8 +4,6 @@ RC response to a pulse with 1 ps edges
 * bench.title: RC (tau = 10 ns) driven by a PULSE with 1 ps edges on the 1 ns step grid (10 steps per tau)
 * bench.probes: v(out)
 * bench.tol.norm: 5e-3
-* bench.known_gap: fixed-step-accuracy
-* bench.gap.note: No breakpoint at the 1 ps edge at t = 10 ns: the trapezoid spreads the edge over the 1 ns step and the response is 0.0475 of swing off (ngspice default 4.6e-4)
 * bench.oracle: tran_lti
 * bench.tags: linear, tran, timing_edge
 * bench.est_rss_mib: 16

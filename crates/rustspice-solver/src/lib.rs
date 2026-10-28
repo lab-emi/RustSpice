@@ -18,4 +18,4 @@ pub use adjoint::{AdjointGradientResult, AdjointSensitivityEngine, ParameterGrad
 pub use linear::{AdaptiveSparseSolver, LinearSolverKind};
 pub use nonlinear::{DcOpResult, DcSweepResult, NonlinearSolver, NrOptions};
 pub use simulator::Simulator;
-pub use transient::{IntegrationMethod, TranOptions, TranResult, TransientSolver};
+pub use transient::{IntegrationMethod, TranOptions, TranResult, TranSpec, TransientSolver};

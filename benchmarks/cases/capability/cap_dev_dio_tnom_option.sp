@@ -5,10 +5,8 @@ Diode I-V with .options tnom=50 (simulated at default 27 C)
 * bench.probes: i(v1)
 * bench.tol.abs: 1e-15
 * bench.expect: match
-* bench.known_gap: silent-ignore-temperature
-* bench.gap.note: .options tnom=50 ignored: ngspice rescales IS from 50 C to 27 C
 * bench.tags: diode, dc, temperature
-* bench.note: evidence: RustSpice output is bit-identical with and without .options tnom=50; textbook IS rescaling from 50 C to 27 C equals tight ngspice to 1e-5 relative (0.214 mA vs RustSpice 5.67 mA at 0.7 V, a factor 26)
+* bench.note: evidence: RustSpice output is bit-identical with and without .options tnom=50; textbook IS rescaling from 50 C to 27 C equals tight ngspice to 1e-5 relative (0.214 mA vs RustSpice 5.67 mA at 0.7 V, a factor 26) [2026-10-28: gap closed; the RustSpice results quoted above predate the fix.]
 V1 a 0 0
 D1 a 0 DM
 

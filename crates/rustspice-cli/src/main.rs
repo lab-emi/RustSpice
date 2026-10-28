@@ -19,7 +19,7 @@ use rustspice_ir::{
     build_diode_ir, build_mosfet_ekv_ir, build_mosfet_level1_ir, emit_cuda_ptx_kernel,
     emit_cuda_tile_kernel, emit_msl_df64_kernel, emit_rust_scalar_fn, emit_wgsl_df64_kernel,
 };
-use rustspice_solver::{ParameterGradSpec, Simulator};
+use rustspice_solver::{ParameterGradSpec, Simulator, TranSpec};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -352,10 +352,9 @@ fn run_deck_inner(
     strict: bool,
     limits: &ResourceLimits,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let src = fs::read_to_string(netlist)?;
     let backend_arc = select_backend(backend)?;
     let t0 = Instant::now();
-    let parsed = rustspice_core::parse_netlist_with_limits(&src, limits)?;
+    let parsed = rustspice_core::parse_netlist_file(netlist, limits)?;
     stats.parse_us = Some(t0.elapsed().as_secs_f64() * 1e6);
     let n_warnings = report_diagnostics(&parsed.diagnostics);
     for r in &parsed.resistors {
@@ -430,9 +429,16 @@ fn run_deck_inner(
                 start,
                 stop,
                 step,
+                outer,
             } => {
                 let t_run = Instant::now();
-                let res = sim.run_dc_sweep(&source_name, start, stop, step)?;
+                let inner = rustspice_core::DcSweep {
+                    name: source_name.clone(),
+                    start,
+                    stop,
+                    step,
+                };
+                let res = sim.run_dc_analysis(&inner, outer.as_ref())?;
                 let run_us = t_run.elapsed().as_secs_f64() * 1e6;
                 println!(
                     "[DC Sweep] {} points on `{}` ({} total NR iterations, {:.1} us)",
@@ -451,16 +457,31 @@ fn run_deck_inner(
                 total_pts += n;
                 kinds.push("dc");
                 if raw.is_some() {
-                    // ngspice names the sweep vector `v(v-sweep)` / `i(i-sweep)` after the source type
-                    let k = if source_name.to_ascii_lowercase().starts_with('i') {
-                        "i"
+                    // ngspice names the sweep vector after the swept quantity: `v(v-sweep)` / `i(i-sweep)` for a
+                    // source, `res-sweep` for a resistor, `temp-sweep` for the temperature
+                    let lower = source_name.to_ascii_lowercase();
+                    let axis = if lower == "temp" {
+                        bench::rawfile::Var {
+                            name: "temp-sweep".to_string(),
+                            kind: "temp-sweep".to_string(),
+                        }
+                    } else if lower.starts_with('r') {
+                        bench::rawfile::Var {
+                            name: "res-sweep".to_string(),
+                            kind: "res-sweep".to_string(),
+                        }
+                    } else if lower.starts_with('i') {
+                        bench::rawfile::Var {
+                            name: "i(i-sweep)".to_string(),
+                            kind: "current".to_string(),
+                        }
                     } else {
-                        "v"
+                        bench::rawfile::Var {
+                            name: "v(v-sweep)".to_string(),
+                            kind: "voltage".to_string(),
+                        }
                     };
-                    let mut vars = vec![bench::rawfile::Var {
-                        name: format!("{k}({k}-sweep)"),
-                        kind: if k == "i" { "current" } else { "voltage" }.to_string(),
-                    }];
+                    let mut vars = vec![axis];
                     vars.extend(raw_vars(&labels));
                     plots.push(RawPlotOut {
                         plotname: "DC transfer characteristic",
@@ -470,14 +491,28 @@ fn run_deck_inner(
                     });
                 }
             }
-            AnalysisCmd::Tran { tstep, tstop, .. } => {
+            AnalysisCmd::Tran {
+                tstep,
+                tstop,
+                tstart,
+                tmax,
+                uic,
+            } => {
                 let t_run = Instant::now();
-                let res = sim.run_transient(tstep, tstop)?;
+                let res = sim.run_transient_spec(&TranSpec {
+                    tstep,
+                    tstop,
+                    tstart,
+                    tmax,
+                    uic,
+                })?;
                 let run_us = t_run.elapsed().as_secs_f64() * 1e6;
                 println!(
-                    "[Transient] {} time points up to {:.3e}s ({} NR iters, {} LU factorizations, {:.1} us)",
+                    "[Transient] {} time points up to {:.3e}s ({} steps, {} rejected, {} NR iters, {} LU factorizations, {:.1} us)",
                     res.time_points.len(),
                     tstop,
+                    res.accepted_steps,
+                    res.rejected_steps,
                     res.total_nr_iterations,
                     res.lu_factorizations,
                     run_us

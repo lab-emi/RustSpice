@@ -4,8 +4,6 @@ RC response to a PULSE whose edges are not on the step grid
 * bench.title: RC (tau = 1 ns) driven by a PULSE with td/tr/tf/pw off the 1 ns step grid
 * bench.probes: v(out)
 * bench.tol.norm: 1e-2
-* bench.known_gap: fixed-step-accuracy
-* bench.gap.note: No breakpoints: the PULSE edges at 0.37/0.9/3.2/3.61 ns fall between grid points and are sampled on the 2/1/0.5 ns grid, response off by 0.31, 0.22 and 0.072 of swing against ngspice as-is 1.1e-2, 1.1e-2 and 9.8e-3 (RustSpice 7-30x worse; ngspice as-is is itself at tol.norm 1e-2 at these coarse steps); first-order convergence, 2.0e-3 at 0.1 ns and 6.9e-4 at 0.05 ns
 * bench.oracle: tran_lti
 * bench.series.tstep: 2n 1n 0.5n 0.1n 0.05n
 * bench.tags: linear, tran, timing_edge, series
