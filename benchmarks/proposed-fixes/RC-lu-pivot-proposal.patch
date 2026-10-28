@@ -1,0 +1,693 @@
+--- a/crates/rustspice-backend-cpu/src/jit.rs
++++ b/crates/rustspice-backend-cpu/src/jit.rs
+@@ -14,6 +14,20 @@
+ use rustc_hash::FxHashMap;
+ use rustspice_core::{CscMatrix, SimError, SimResult};
+ 
++/// Relative threshold of the static pivot choice: a pivot `a_rk` is acceptable only if
++/// `|a_rk| >= PIVOT_REL_TOL * max_i |a_ik|` over the candidate rows of the active column, which
++/// bounds the compile-time multipliers by `1 / PIVOT_REL_TOL`.
++pub const PIVOT_REL_TOL: f64 = 0.1;
++
++/// The structural diagonal `a_kk` is kept as pivot whenever `|a_kk| >= DIAG_PREF_TOL * max_i |a_ik|`
++/// (and it passes [`PIVOT_REL_TOL`]), ahead of the minimum-degree choice.
++pub const DIAG_PREF_TOL: f64 = 0.5;
++
++/// Upper bound on the symbolic LU micro-operations. The pivot search aborts as soon as its
++/// elimination work exceeds it, instead of running the symbolic factorization to completion on a
++/// matrix whose unrolled stream would be rejected afterwards.
++pub const MAX_SYMBOLIC_OPS: usize = 500_000;
++
+ /// Micro-operation in the pre-compiled symbolic LU factorization stream.
+ #[derive(Clone, Copy, Debug)]
+ pub enum SymbolicLuOp {
+@@ -78,14 +92,17 @@
+                 let row = initial_csc.row_idx[idx];
+                 let val = initial_csc.values[idx];
+                 sim_rows[row].insert(col, val);
+-                if val.abs() > 0.0 {
+-                    col_rows.push(row);
+-                }
++                // Register every structural entry, also those that are zero in this matrix (the
++                // diagonal of a branch equation, capacitor and inductor companion slots): fill-in
++                // can make them non-zero, and a column whose only candidate is such an entry
++                // would otherwise look empty and fail with a bogus `SingularMatrix`.
++                col_rows.push(row);
+             }
+         }
+ 
+         let mut row_perm: Vec<usize> = vec![usize::MAX; n];
+         let mut used = vec![false; n];
++        let mut elimination_ops = 0usize;
+ 
+         // Pre-pair grounded voltage-source singleton branches `(p, br)`:
+         // When row `br` has only 1 entry at column `p` and column `br` has only 1 entry at row `p`,
+@@ -131,22 +148,39 @@
+                 return Err(SimError::SingularMatrix { index: k });
+             }
+ 
+-            let threshold = 1e-3 * max_col_val;
++            let threshold = PIVOT_REL_TOL * max_col_val;
+             let mut best_orig_row = usize::MAX;
+             let mut best_deg = usize::MAX;
+             let mut best_val = -1.0_f64;
+ 
+-            for &r_orig in &col_to_rows[k] {
+-                if used[r_orig] {
+-                    continue;
++            // MNA node rows become (block) diagonally dominant once the companion conductances
++            // (`C/h`, `2C/h`) are added to the node diagonals, but the matrix handed to this
++            // routine is the DC Jacobian at x = 0 in which they are still absent. The pivot order
++            // is frozen, so it must stay valid for those larger diagonals: when the structural
++            // diagonal is (nearly) the largest entry of its column keep it. A lower-degree
++            // off-diagonal row is safe only while |a_kk| <= |a_rk| and costs a factor
++            // |a_kk| / |a_rk| per elimination stage once the diagonal grows (6e20 pivot growth on
++            // a 16x16 RC mesh at h = RC / 10). Branch equations of voltage sources and inductors
++            // (unit entries, no diagonal) never qualify and keep the minimum-degree choice below.
++            if !used[k] {
++                let v = sim_rows[k].get(&k).copied().unwrap_or(0.0).abs();
++                if v > 0.0 && v >= threshold && v >= DIAG_PREF_TOL * max_col_val {
++                    best_orig_row = k;
+                 }
+-                let v = sim_rows[r_orig].get(&k).copied().unwrap_or(0.0).abs();
+-                if v >= threshold {
+-                    let deg = sim_rows[r_orig].len();
+-                    if deg < best_deg || (deg == best_deg && v > best_val) {
+-                        best_deg = deg;
+-                        best_val = v;
+-                        best_orig_row = r_orig;
++            }
++            if best_orig_row == usize::MAX {
++                for &r_orig in &col_to_rows[k] {
++                    if used[r_orig] {
++                        continue;
++                    }
++                    let v = sim_rows[r_orig].get(&k).copied().unwrap_or(0.0).abs();
++                    if v >= threshold {
++                        let deg = sim_rows[r_orig].len();
++                        if deg < best_deg || (deg == best_deg && v > best_val) {
++                            best_deg = deg;
++                            best_val = v;
++                            best_orig_row = r_orig;
++                        }
+                     }
+                 }
+             }
+@@ -174,6 +208,12 @@
+                     if lik.abs() == 0.0 {
+                         continue;
+                     }
++                    elimination_ops += 1 + piv_upper.len();
++                    if elimination_ops > MAX_SYMBOLIC_OPS {
++                        return Err(SimError::TopologyError(format!(
++                            "symbolic LU exceeds the {MAX_SYMBOLIC_OPS} micro-operation budget"
++                        )));
++                    }
+                     let mult = lik / piv_val;
+                     sim_rows[r_orig].remove(&k);
+                     for &(c, ukj) in &piv_upper {
+@@ -380,6 +420,39 @@
+         Ok(())
+     }
+ 
++    /// Returns `true` if the factors in `lu_buf` are numerically trustworthy for the matrix with
++    /// values `a_values` they were computed from.
++    ///
++    /// The pivot order is frozen at compile time and never revisited, so the numeric values may
++    /// have drifted (companion conductances, device state changes) to where it is unstable. The
++    /// test is the threshold-pivoting condition on every multiplier `|l_ik| <= max_multiplier`
++    /// plus a bound `|u_ij|, |u_kk| <= max_growth * max|A|` on the accumulated growth. NaN and
++    /// infinities fail every comparison.
++    pub fn factors_are_stable(
++        &self,
++        lu_buf: &[f64],
++        a_values: &[f64],
++        max_multiplier: f64,
++        max_growth: f64,
++    ) -> bool {
++        let amax = a_values.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
++        if !amax.is_finite() {
++            return false;
++        }
++        let u_limit = max_growth * amax.max(f64::MIN_POSITIVE);
++        self.l_terms
++            .iter()
++            .all(|t| lu_buf[t.lu_idx as usize].abs() <= max_multiplier)
++            && self
++                .u_terms
++                .iter()
++                .all(|t| lu_buf[t.lu_idx as usize].abs() <= u_limit)
++            && self
++                .diag_lu_idx
++                .iter()
++                .all(|&d| lu_buf[d as usize].abs() * u_limit >= 1.0)
++    }
++
+     /// Solves $A x = b$ using the pre-factored `lu_buf`.
+     #[inline]
+     pub fn solve(&self, lu_buf: &[f64], rhs: &[f64], x: &mut [f64]) {
+--- a/crates/rustspice-solver/src/linear.rs
++++ b/crates/rustspice-solver/src/linear.rs
+@@ -21,10 +21,257 @@
+     UnrolledSymbolic,
+     /// Supernodal sparse LU with AMD ordering (`faer`).
+     FaerSupernodal,
++    /// Dense LU with partial pivoting: what an unrolled solver of a small matrix falls back to
++    /// when its frozen pivot order turns out to be numerically unstable.
++    DenseLu,
+     /// Preconditioned Conjugate Gradient (`PCG`) iterative solver.
+     PreconditionedCg,
+ }
+ 
++/// Largest dimension for which the fallback of an unstable unrolled LU is a dense LU with
++/// partial pivoting rather than the sparse `faer` factorization (whose per-call set-up dominates
++/// at this size).
++const DENSE_FALLBACK_MAX_DIM: usize = 48;
++
++/// Row-major dense LU with partial pivoting, `P A = L U`.
++struct DenseLu {
++    n: usize,
++    a: Vec<f64>,
++    perm: Vec<usize>,
++    y: Vec<f64>,
++}
++
++impl DenseLu {
++    fn new(n: usize) -> Self {
++        Self {
++            n,
++            a: vec![0.0; n * n],
++            perm: (0..n).collect(),
++            y: vec![0.0; n],
++        }
++    }
++
++    /// Factors `csc`; `false` if it is singular or holds non-finite values.
++    fn factor(&mut self, csc: &CscMatrix<f64>) -> bool {
++        let n = self.n;
++        self.a.fill(0.0);
++        for c in 0..n {
++            for idx in csc.col_ptr[c]..csc.col_ptr[c + 1] {
++                self.a[csc.row_idx[idx] * n + c] = csc.values[idx];
++            }
++        }
++        for (i, p) in self.perm.iter_mut().enumerate() {
++            *p = i;
++        }
++        for k in 0..n {
++            let mut p = k;
++            let mut pmax = self.a[k * n + k].abs();
++            for i in (k + 1)..n {
++                let v = self.a[i * n + k].abs();
++                if v > pmax {
++                    pmax = v;
++                    p = i;
++                }
++            }
++            if !(pmax > 0.0) || !pmax.is_finite() {
++                return false;
++            }
++            if p != k {
++                for j in 0..n {
++                    self.a.swap(k * n + j, p * n + j);
++                }
++                self.perm.swap(k, p);
++            }
++            let inv = 1.0 / self.a[k * n + k];
++            for i in (k + 1)..n {
++                let l = self.a[i * n + k] * inv;
++                self.a[i * n + k] = l;
++                if l != 0.0 {
++                    for j in (k + 1)..n {
++                        let u = self.a[k * n + j];
++                        self.a[i * n + j] -= l * u;
++                    }
++                }
++            }
++        }
++        true
++    }
++
++    fn solve(&mut self, b: &[f64], x: &mut [f64]) {
++        let n = self.n;
++        for i in 0..n {
++            let mut acc = b[self.perm[i]];
++            for j in 0..i {
++                acc -= self.a[i * n + j] * self.y[j];
++            }
++            self.y[i] = acc;
++        }
++        for i in (0..n).rev() {
++            let mut acc = self.y[i];
++            for j in (i + 1)..n {
++                acc -= self.a[i * n + j] * x[j];
++            }
++            x[i] = acc / self.a[i * n + i];
++        }
++    }
++}
++
++/// Matrices smaller than this are factored in their natural order (their fill is bounded).
++const ORDERING_MIN_DIM: usize = 32;
++/// Work budget (sum of squared degrees) of the minimum-degree ordering; beyond it the natural
++/// order is kept and the symbolic LU's own operation budget decides between the tiers.
++const ORDERING_WORK_BUDGET: usize = 20_000_000;
++
++/// Deterministic greedy minimum-degree ordering of the pattern of `A + A^T`.
++/// Returns `order[new] = old`, or `None` when the work budget is exhausted.
++fn min_degree_order(csc: &CscMatrix<f64>, work_budget: usize) -> Option<Vec<usize>> {
++    use std::cmp::Reverse;
++    use std::collections::BinaryHeap;
++
++    let n = csc.nrows;
++    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
++    for c in 0..n {
++        for idx in csc.col_ptr[c]..csc.col_ptr[c + 1] {
++            let r = csc.row_idx[idx];
++            if r != c {
++                adj[c].push(r);
++                adj[r].push(c);
++            }
++        }
++    }
++    for a in &mut adj {
++        a.sort_unstable();
++        a.dedup();
++    }
++    let mut alive = vec![true; n];
++    let mut heap: BinaryHeap<Reverse<(usize, usize)>> =
++        (0..n).map(|v| Reverse((adj[v].len(), v))).collect();
++    let mut order = Vec::with_capacity(n);
++    let mut work = 0usize;
++    let mut merged: Vec<usize> = Vec::new();
++    while let Some(Reverse((deg, v))) = heap.pop() {
++        if !alive[v] || adj[v].len() != deg {
++            continue;
++        }
++        alive[v] = false;
++        order.push(v);
++        let nb = std::mem::take(&mut adj[v]);
++        work += nb.len() * nb.len() + nb.len();
++        if work > work_budget {
++            return None;
++        }
++        for &u in &nb {
++            // adj[u] <- (adj[u] U nb) \ {u, v}, both lists sorted
++            merged.clear();
++            let (mut i, mut j) = (0usize, 0usize);
++            let a = &adj[u];
++            while i < a.len() || j < nb.len() {
++                let next = if j >= nb.len() || (i < a.len() && a[i] < nb[j]) {
++                    i += 1;
++                    a[i - 1]
++                } else if i >= a.len() || nb[j] < a[i] {
++                    j += 1;
++                    nb[j - 1]
++                } else {
++                    i += 1;
++                    j += 1;
++                    a[i - 1]
++                };
++                if next != u && next != v {
++                    merged.push(next);
++                }
++            }
++            adj[u].clear();
++            adj[u].extend_from_slice(&merged);
++        }
++        for &u in &nb {
++            heap.push(Reverse((adj[u].len(), u)));
++        }
++    }
++    Some(order)
++}
++
++/// Symmetric permutation `M = Q A Q^T` (`M[i][j] = A[q[i]][q[j]]`) under which the unrolled LU
++/// is compiled, with the gather / scatter workspaces that keep it invisible to callers.
++struct SymmetricOrdering {
++    /// `q[new] = old`.
++    q: Vec<usize>,
++    /// Maps the index of every non-zero of `A` to its slot in `M`.
++    nnz_map: Vec<usize>,
++    vals: Vec<f64>,
++    rhs: Vec<f64>,
++    sol: Vec<f64>,
++}
++
++impl SymmetricOrdering {
++    /// Orders `csc` and returns the ordering together with the permuted matrix, or `None` if the
++    /// natural order is kept.
++    fn build(csc: &CscMatrix<f64>) -> Option<(Self, CscMatrix<f64>)> {
++        let n = csc.nrows;
++        if n < ORDERING_MIN_DIM {
++            return None;
++        }
++        let q = min_degree_order(csc, ORDERING_WORK_BUDGET)?;
++        if q.iter().enumerate().all(|(i, &v)| i == v) {
++            return None;
++        }
++        let mut inv = vec![0usize; n];
++        for (new, &old) in q.iter().enumerate() {
++            inv[old] = new;
++        }
++        let mut coords = Vec::with_capacity(csc.nnz());
++        for c in 0..n {
++            for idx in csc.col_ptr[c]..csc.col_ptr[c + 1] {
++                coords.push((inv[csc.row_idx[idx]], inv[c]));
++            }
++        }
++        let mut m = CscMatrix::<f64>::from_pattern(n, n, &coords);
++        let mut nnz_map = Vec::with_capacity(csc.nnz());
++        for c in 0..n {
++            for idx in csc.col_ptr[c]..csc.col_ptr[c + 1] {
++                let k = m.find_value_index(inv[csc.row_idx[idx]], inv[c])?;
++                nnz_map.push(k);
++                m.values[k] = csc.values[idx];
++            }
++        }
++        let vals = m.values.clone();
++        Some((
++            Self {
++                q,
++                nnz_map,
++                vals,
++                rhs: vec![0.0; n],
++                sol: vec![0.0; n],
++            },
++            m,
++        ))
++    }
++
++    /// Fills `vals` (values of `M`) and `rhs` (`Q b`) from the caller's `csc` and `b`.
++    #[inline]
++    fn gather(&mut self, csc_values: &[f64], b: &[f64]) {
++        for (i, &k) in self.nnz_map.iter().enumerate() {
++            self.vals[k] = csc_values[i];
++        }
++        self.gather_rhs(b);
++    }
++
++    #[inline]
++    fn gather_rhs(&mut self, b: &[f64]) {
++        for (i, &old) in self.q.iter().enumerate() {
++            self.rhs[i] = b[old];
++        }
++    }
++
++    /// `x = Q^T sol`.
++    #[inline]
++    fn scatter(&self, x: &mut [f64]) {
++        for (i, &old) in self.q.iter().enumerate() {
++            x[old] = self.sol[i];
++        }
++    }
++}
++
+ /// Adaptive sparse linear solver maintaining pre-allocated workspaces (`lu_buf`, `work_vec`)
+ /// so that hot-loop Newton-Raphson and Transient solves incur **zero heap allocations**.
+ pub struct AdaptiveSparseSolver {
+@@ -35,35 +282,45 @@
+     work_vec: Vec<f64>,
+     faer_lu: Option<faer::sparse::linalg::solvers::Lu<usize, f64>>,
+     has_valid_factors: bool,
++    /// Tier this solver was compiled for if it later left it because the frozen pivot order
++    /// became numerically unstable.
++    pub demoted_from: Option<LinearSolverKind>,
++    /// `true` if the cached factorization lives in `faer_lu` rather than in `lu_buf`.
++    factors_in_faer: bool,
++    /// `true` if the cached factorization outside `lu_buf` lives in `dense` rather than `faer_lu`.
++    factors_dense: bool,
++    dense: Option<DenseLu>,
++    consecutive_unstable: u32,
++    /// Fill-reducing symmetric permutation under which `jit_solver` was compiled.
++    ordering: Option<SymmetricOrdering>,
+ }
+ 
+ impl AdaptiveSparseSolver {
+     /// Maximum symbolic operation count before switching from `UnrolledSymbolicLu` to `FaerSupernodal`.
+-    pub const MAX_UNROLLED_OPS: usize = 500_000;
++    pub const MAX_UNROLLED_OPS: usize = rustspice_backend_cpu::jit::MAX_SYMBOLIC_OPS;
+ 
+     /// Pre-compiles the linear solver strategy from an initial assembled Jacobian `initial_csc`.
+     pub fn compile(initial_csc: &CscMatrix<f64>) -> SimResult<Self> {
+         let dim = initial_csc.nrows;
+         // Attempt symbolic compilation for Tier 1 (Cranelift JIT / Unrolled Symbolic LU)
+         if dim <= 15_000 {
+-            if let Ok(jit) = CraneliftTopologyJit::compile(initial_csc) {
+-                if jit.symbolic.factor_ops.len() <= Self::MAX_UNROLLED_OPS {
+-                    let kind = if jit.has_native_jit() {
+-                        LinearSolverKind::CraneliftJit
+-                    } else {
+-                        LinearSolverKind::UnrolledSymbolic
+-                    };
+-                    let lu_nnz = jit.symbolic.lu_nnz;
+-                    return Ok(Self {
+-                        dim,
+-                        kind,
+-                        jit_solver: Some(jit),
+-                        lu_buf: vec![0.0; lu_nnz],
+-                        work_vec: vec![0.0; dim],
+-                        faer_lu: None,
+-                        has_valid_factors: false,
+-                    });
+-                }
++            if let Some((jit, ordering)) = Self::build_unrolled(initial_csc) {
++                let lu_nnz = jit.symbolic.lu_nnz;
++                return Ok(Self {
++                    dim,
++                    kind: Self::unrolled_kind(&jit),
++                    jit_solver: Some(jit),
++                    lu_buf: vec![0.0; lu_nnz],
++                    work_vec: vec![0.0; dim],
++                    faer_lu: None,
++                    has_valid_factors: false,
++                    demoted_from: None,
++                    factors_in_faer: false,
++                    factors_dense: false,
++                    dense: None,
++                    consecutive_unstable: 0,
++                    ordering,
++                });
+             }
+         }
+ 
+@@ -75,9 +332,95 @@
+             work_vec: vec![0.0; dim],
+             faer_lu: None,
+             has_valid_factors: false,
++            demoted_from: None,
++            factors_in_faer: false,
++            factors_dense: false,
++            dense: None,
++            consecutive_unstable: 0,
++            ordering: None,
+         })
+     }
+ 
++    /// Compiles the unrolled LU (under a fill-reducing ordering for larger matrices) from the
++    /// numeric values of `csc`, if it fits the operation budget.
++    fn build_unrolled(
++        csc: &CscMatrix<f64>,
++    ) -> Option<(CraneliftTopologyJit, Option<SymmetricOrdering>)> {
++        let (ordering, permuted) = match SymmetricOrdering::build(csc) {
++            Some((o, m)) => (Some(o), Some(m)),
++            None => (None, None),
++        };
++        let jit = CraneliftTopologyJit::compile(permuted.as_ref().unwrap_or(csc)).ok()?;
++        (jit.symbolic.factor_ops.len() <= Self::MAX_UNROLLED_OPS).then_some((jit, ordering))
++    }
++
++    fn unrolled_kind(jit: &CraneliftTopologyJit) -> LinearSolverKind {
++        if jit.has_native_jit() {
++            LinearSolverKind::CraneliftJit
++        } else {
++            LinearSolverKind::UnrolledSymbolic
++        }
++    }
++
++    /// Factors `csc` with the unrolled LU and solves; `false` if that failed or the frozen pivot
++    /// order is numerically unstable for the current values (`x` is then undefined).
++    fn try_unrolled(&mut self, csc: &CscMatrix<f64>, rhs: &[f64], x: &mut [f64]) -> bool {
++        let Some(ref jit) = self.jit_solver else {
++            return false;
++        };
++        match self.ordering.as_mut() {
++            None => {
++                jit.factor_and_solve(&csc.values, &mut self.lu_buf, rhs, x)
++                    .is_ok()
++                    && jit.symbolic.factors_are_stable(
++                        &self.lu_buf,
++                        &csc.values,
++                        Self::MAX_LU_MULTIPLIER,
++                        Self::MAX_LU_GROWTH,
++                    )
++            }
++            Some(o) => {
++                o.gather(&csc.values, rhs);
++                let ok = jit
++                    .factor_and_solve(&o.vals, &mut self.lu_buf, &o.rhs, &mut o.sol)
++                    .is_ok()
++                    && jit.symbolic.factors_are_stable(
++                        &self.lu_buf,
++                        &o.vals,
++                        Self::MAX_LU_MULTIPLIER,
++                        Self::MAX_LU_GROWTH,
++                    );
++                if ok {
++                    o.scatter(x);
++                }
++                ok
++            }
++        }
++    }
++
++    /// Largest elimination multiplier `|l_ik|` accepted from the frozen pivot order. Compile-time
++    /// multipliers are bounded by `1 / PIVOT_REL_TOL = 10`; the margin absorbs value drift.
++    pub const MAX_LU_MULTIPLIER: f64 = 1.0e4;
++    /// Largest accepted ratio of any `U` entry to `max |A|`.
++    pub const MAX_LU_GROWTH: f64 = 1.0e6;
++    /// Consecutive unstable unrolled factorizations after which the unrolled tier is abandoned.
++    pub const MAX_CONSECUTIVE_UNSTABLE: u32 = 8;
++
++    /// Permanently replaces the unrolled tier by the pivoting `faer` tier and drops its factors.
++    fn demote_to_faer(&mut self) {
++        if self.jit_solver.take().is_some() {
++            self.demoted_from = Some(self.kind);
++        }
++        self.lu_buf = Vec::new();
++        self.ordering = None;
++        self.kind = if self.dim <= DENSE_FALLBACK_MAX_DIM {
++            LinearSolverKind::DenseLu
++        } else {
++            LinearSolverKind::FaerSupernodal
++        };
++        self.has_valid_factors = false;
++    }
++
+     /// Returns `true` if a valid LU factorization is currently cached in the solver.
+     #[inline]
+     pub fn has_valid_factorization(&self) -> bool {
+@@ -98,20 +441,42 @@
+         rhs: &[f64],
+         x: &mut [f64],
+     ) -> SimResult<()> {
+-        if let Some(ref jit) = self.jit_solver {
+-            if jit
+-                .factor_and_solve(&csc.values, &mut self.lu_buf, rhs, x)
+-                .is_ok()
+-            {
++        let unrolled_attempted = self.jit_solver.is_some();
++        if unrolled_attempted {
++            if self.try_unrolled(csc, rhs, x) {
+                 self.has_valid_factors = true;
++                self.factors_in_faer = false;
++                self.consecutive_unstable = 0;
+                 return Ok(());
+             }
++            self.consecutive_unstable += 1;
++            // The frozen pivot order failed or is unstable for the current values (typically a
++            // device changed state since the order was chosen at x = 0).
++            // Still unstable: factor this matrix on the pivoting tier below; persistent
++            // instability leaves the unrolled tier for good.
++            if self.consecutive_unstable >= Self::MAX_CONSECUTIVE_UNSTABLE {
++                self.demote_to_faer();
++            }
+         }
+ 
+-        // Tier 2: Supernodal sparse LU via `faer`
+-        self.factorize_faer(csc)?;
+-        self.solve_faer(rhs, x);
++        // Tier 2: pivoting fallback. Small matrices that came from the unrolled tier use a dense
++        // LU; everything else the supernodal sparse LU via `faer`.
++        self.has_valid_factors = false;
++        let was_unrolled = unrolled_attempted || self.demoted_from.is_some();
++        if was_unrolled && self.dim <= DENSE_FALLBACK_MAX_DIM {
++            let dense = self.dense.get_or_insert_with(|| DenseLu::new(csc.nrows));
++            if !dense.factor(csc) {
++                return Err(SimError::SingularMatrix { index: 0 });
++            }
++            dense.solve(rhs, x);
++            self.factors_dense = true;
++        } else {
++            self.factorize_faer(csc)?;
++            self.solve_faer(rhs, x);
++            self.factors_dense = false;
++        }
+         self.has_valid_factors = true;
++        self.factors_in_faer = true;
+         Ok(())
+     }
+ 
+@@ -127,9 +492,24 @@
+                 "No cached LU factorization available".to_string(),
+             ));
+         }
+-        if let Some(ref jit) = self.jit_solver {
+-            jit.symbolic.solve(&self.lu_buf, rhs, x);
+-            return Ok(());
++        if !self.factors_in_faer {
++            if let Some(ref jit) = self.jit_solver {
++                match self.ordering.as_mut() {
++                    None => jit.symbolic.solve(&self.lu_buf, rhs, x),
++                    Some(o) => {
++                        o.gather_rhs(rhs);
++                        jit.symbolic.solve(&self.lu_buf, &o.rhs, &mut o.sol);
++                        o.scatter(x);
++                    }
++                }
++                return Ok(());
++            }
++        }
++        if self.factors_dense {
++            if let Some(ref mut d) = self.dense {
++                d.solve(rhs, x);
++                return Ok(());
++            }
+         }
+         if self.faer_lu.is_some() {
+             self.solve_faer(rhs, x);
+@@ -150,9 +530,24 @@
+         lambda: &mut [f64],
+     ) -> SimResult<()> {
+         if let Some(ref jit) = self.jit_solver {
+-            if self.has_valid_factors {
+-                jit.symbolic
+-                    .solve_transpose(&self.lu_buf, rhs, lambda, &mut self.work_vec);
++            if self.has_valid_factors && !self.factors_in_faer {
++                match self.ordering.as_mut() {
++                    None => {
++                        jit.symbolic
++                            .solve_transpose(&self.lu_buf, rhs, lambda, &mut self.work_vec)
++                    }
++                    Some(o) => {
++                        // (Q A Q^T)^T (Q lambda) = Q b
++                        o.gather_rhs(rhs);
++                        jit.symbolic.solve_transpose(
++                            &self.lu_buf,
++                            &o.rhs,
++                            &mut o.sol,
++                            &mut self.work_vec,
++                        );
++                        o.scatter(lambda);
++                    }
++                }
+                 return Ok(());
+             }
+         }
+--- a/crates/rustspice-cli/src/main.rs
++++ b/crates/rustspice-cli/src/main.rs
+@@ -397,6 +397,14 @@
+             }
+         }
+     }
++    if let Some(from) = sim.linear_solver.demoted_from {
++        // The unrolled LU's frozen pivot order became unstable and the pivoting tier took over.
++        stats.solver_kind = Some(format!("{:?}>{:?}", from, sim.linear_solver.kind));
++        eprintln!(
++            "note: {:?} pivot order became numerically unstable; continued with {:?}",
++            from, sim.linear_solver.kind
++        );
++    }
+     if !kinds.is_empty() {
+         stats.analysis = Some(kinds.join("+"));
+         stats.analysis_us = Some(total_us);

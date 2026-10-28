@@ -119,6 +119,23 @@ impl CscMatrix<f64> {
         }
     }
 
+    /// Computes entrywise-absolute product $y_i \leftarrow \sum_j |A_{ij}| \cdot |x_j|$
+    /// for scale-aware KCL residual convergence testing.
+    pub fn spmv_abs(&self, x: &[f64], y: &mut [f64]) {
+        y.fill(0.0);
+        for (col, &xj) in x.iter().enumerate().take(self.ncols) {
+            let xj_abs = xj.abs();
+            if xj_abs == 0.0 {
+                continue;
+            }
+            let start = self.col_ptr[col];
+            let end = self.col_ptr[col + 1];
+            for idx in start..end {
+                y[self.row_idx[idx]] += self.values[idx].abs() * xj_abs;
+            }
+        }
+    }
+
     /// Computes transposed Sparse Matrix-Vector product $y \leftarrow A^T x$.
     pub fn spmv_transpose(&self, x: &[f64], y: &mut [f64]) {
         for (col, y_col) in y.iter_mut().enumerate().take(self.ncols) {

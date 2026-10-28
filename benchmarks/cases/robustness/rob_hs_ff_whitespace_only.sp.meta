@@ -1,0 +1,7 @@
+* bench.id: rob_hs_ff_whitespace_only
+* bench.group: robustness
+* bench.title: a file with only blanks, tabs and a CRLF
+* bench.expect: loud_error
+* bench.tags: hostile, file, encoding, whitespace
+* bench.est_rss_mib: 64
+* bench.note: no circuit: a refusal is the correct behaviour; ngspice-47 prints 'Warning: Empty netlist!' and exits 0 without writing a rawfile

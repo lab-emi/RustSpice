@@ -1,0 +1,528 @@
+diff --git a/crates/rustspice-backend-cpu/src/simd.rs b/crates/rustspice-backend-cpu/src/simd.rs
+--- a/crates/rustspice-backend-cpu/src/simd.rs
++++ b/crates/rustspice-backend-cpu/src/simd.rs
+@@ -105,6 +105,7 @@
+         if n_diodes == 0 {
+             return;
+         }
++        let mut any_limited = false;
+ 
+         let vt_base = state.temp_vt;
+         let gmin = state.gmin;
+@@ -124,8 +125,14 @@
+             } else {
+                 vd_raw
+             };
++            // `pnjlim` altered the linearisation point, or the exponent saturates (`arg > 80`, a
++            // numerical guard, not physics): neither iterate may be accepted as converged.
++            if vd != vd_raw || vd > 80.0 * n_vt {
++                any_limited = true;
++            }
+             state.diode_vd[i] = vd;
+         }
++        state.limiter_active |= any_limited;
+ 
+         // Dispatch diode physics equation evaluation through pulp::Arch SIMD vectorization
+         let vd_slice = state.diode_vd.as_slice();
+@@ -366,6 +373,7 @@
+         }
+ 
+         // Evaluate nonlinear semiconductor devices via SIMD
++        state.limiter_active = false;
+         self.eval_diodes(state, voltages);
+         self.eval_mosfets(state, voltages);
+ 
+diff --git a/crates/rustspice-cli/src/main.rs b/crates/rustspice-cli/src/main.rs
+--- a/crates/rustspice-cli/src/main.rs
++++ b/crates/rustspice-cli/src/main.rs
+@@ -264,6 +264,15 @@
+     let t0 = Instant::now();
+     let parsed = rustspice_core::parse_netlist(&src)?;
+     stats.parse_us = Some(t0.elapsed().as_secs_f64() * 1e6);
++    for r in &parsed.resistors {
++        if rustspice_core::soa::resistance_is_floored(r.resistance) {
++            eprintln!(
++                "warning: resistor {} has zero resistance; it is stamped as {:e} ohm",
++                r.name,
++                rustspice_core::soa::ZERO_OHM_SUBSTITUTE
++            );
++        }
++    }
+     let t1 = Instant::now();
+     let mut sim = Simulator::from_netlist(parsed, backend_arc)?;
+     let compile_us = t1.elapsed().as_secs_f64() * 1e6;
+diff --git a/crates/rustspice-core/src/soa.rs b/crates/rustspice-core/src/soa.rs
+--- a/crates/rustspice-core/src/soa.rs
++++ b/crates/rustspice-core/src/soa.rs
+@@ -121,6 +121,11 @@
+     pub temp_vt: f64,
+     pub is_transient: bool,
+     pub transient_g_scale: f64,
++    /// Set by `evaluate_devices` when a junction/FET step limiter changed the voltage a device
++    /// was linearised at (so the companion model is NOT the model of the current iterate).
++    pub limiter_active: bool,
++    /// Circuit node names by 1-based node id (`node_names[0]` is ground); used for diagnostics only.
++    pub node_names: Vec<String>,
+ 
+     // --- Resistors (SoA) ---
+     pub res_names: Vec<String>,
+@@ -327,7 +332,7 @@
+             if name.eq_ignore_ascii_case(device_name) && (p_lower == "r" || p_lower == "resistance")
+             {
+                 self.res_resistance[i] = value;
+-                let g = 1.0 / value.max(1e-18);
++                let g = resistor_conductance(value);
+                 self.res_conductance[i] = g;
+                 self.cond_buf[self.res_cond_buf_idx[i] as usize] = g;
+                 self.linear_dirty = true;
+@@ -375,6 +380,31 @@
+     }
+ }
+ 
++/// Resistance stamped for a resistor written with value `R = 0` (an ideal short, whose conductance is
++/// infinite). 1 micro-ohm keeps the stamped conductance within 1e6 S, so that the LU factorisation of
++/// a zero-ohm link in series with a 1 kohm load is exact to ~5e-8 (with 1e-12 ohm, the floor `ngspice`
++/// applies, the same circuit is ~2 % off from round-off). Reported by the CLI as a warning.
++pub const ZERO_OHM_SUBSTITUTE: f64 = 1e-6;
++
++/// `true` if a resistor of value `r` is not stamped as written (only an exact zero is).
++#[inline]
++pub fn resistance_is_floored(r: f64) -> bool {
++    r == 0.0
++}
++
++/// Conductance stamped for a resistor of value `r` ohm. Negative resistances are legal (negative
++/// conductance, exactly as written); positive ones keep the historical 1e-18 ohm lower bound.
++#[inline]
++pub fn resistor_conductance(r: f64) -> f64 {
++    if r == 0.0 {
++        1.0 / ZERO_OHM_SUBSTITUTE
++    } else if r < 0.0 {
++        1.0 / r
++    } else {
++        1.0 / r.max(1e-18)
++    }
++}
++
+ /// Compiles a parsed [`Netlist`] into a 64-byte aligned [`DeviceSoaBuffer`] and a conflict-free
+ /// [`CscGatherTable`] + [`CscMatrix`].
+ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
+@@ -452,6 +482,7 @@
+         temp_vt: 0.025864917007155805, // Exact ngspice-47 k*T/q at 300.15 K (27 C)
+         is_transient: false,
+         transient_g_scale: 0.0,
++        node_names: netlist.node_names.clone(),
+         ..Default::default()
+     };
+ 
+@@ -486,7 +517,7 @@
+ 
+     // 1. Resistors (static linear)
+     for r in &netlist_expanded.resistors {
+-        let g = 1.0 / r.resistance.max(1e-18);
++        let g = resistor_conductance(r.resistance);
+         let buf_idx = soa.cond_buf.len() as u32;
+         soa.cond_buf.push(g);
+         soa.res_names.push(r.name.clone());
+diff --git a/crates/rustspice-solver/src/nonlinear.rs b/crates/rustspice-solver/src/nonlinear.rs
+--- a/crates/rustspice-solver/src/nonlinear.rs
++++ b/crates/rustspice-solver/src/nonlinear.rs
+@@ -152,7 +152,11 @@
+ 
+             // Early convergence check: if previous step Δx was within voltage tolerance
+             // AND current exact KCL residual is within abstol, x is already converged!
+-            if iter > 1 && prev_step_converged && max_res <= self.options.abstol {
++            // A step limiter (`pnjlim`) or a model clamp (diode exponent saturation) that changed the
++            // linearisation point makes `max_res` the residual of the ALTERED companion model, not of
++            // the circuit: never accept such an iterate as converged.
++            let limited = topo.soa.limiter_active;
++            if iter > 1 && prev_step_converged && max_res <= self.options.abstol && !limited {
+                 return Ok((iter - 1, max_res));
+             }
+ 
+@@ -179,7 +183,18 @@
+             };
+ 
+             if !used_shamanskii {
+-                linear_solver.factorize_and_solve(&topo.jacobian, &self.rhs, &mut self.next_x)?;
++                // Residual form: x+ = x + J^-1 (b - J x). Identical to solving J x+ = b in exact
++                // arithmetic, but LU round-off then perturbs only the (small) correction instead of the
++                // iterate itself, so Newton can reach the residual floor instead of cycling at the
++                // factorisation's noise level.
++                linear_solver.factorize_and_solve(
++                    &topo.jacobian,
++                    &self.residual_vec,
++                    &mut self.delta_x,
++                )?;
++                for (i, &xi) in x.iter().enumerate().take(dim) {
++                    self.next_x[i] = xi + self.delta_x[i];
++                }
+             }
+ 
+             // Check voltage/branch step convergence & project unbounded saturation tangent jumps onto rails
+@@ -210,7 +225,11 @@
+             prev_step_converged = step_ok;
+             last_step_max = max_step;
+ 
+-            if step_ok && max_res <= self.options.abstol && max_step <= self.options.vntol {
++            if step_ok
++                && max_res <= self.options.abstol
++                && max_step <= self.options.vntol
++                && !limited
++            {
+                 return Ok((iter, max_res));
+             }
+         }
+@@ -231,7 +250,20 @@
+     ) -> SimResult<DcOpResult> {
+         topo.soa.is_transient = false;
+         topo.soa.update_sources_at_time(None);
++        Self::check_dc_solvable(&topo.soa)?;
++        self.solve_op_at_current_sources(topo, backend, linear_solver)
++    }
+ 
++    /// DC operating point of the circuit with its independent sources at their CURRENT values
++    /// (`vsrc_values` / `isrc_values`) and capacitors open: Newton from zero, then `Gmin Stepping`,
++    /// then `Source Stepping`. Used by `.op`, by the transient initial solution (sources at
++    /// `t = 0`) and as the per-point recovery of `.dc` sweeps.
++    pub fn solve_op_at_current_sources(
++        &mut self,
++        topo: &mut CompiledTopology,
++        backend: &dyn ComputeBackend,
++        linear_solver: &mut AdaptiveSparseSolver,
++    ) -> SimResult<DcOpResult> {
+         let dim = topo.soa.mna_dim;
+         let mut x = vec![0.0_f64; dim];
+         Self::sync_device_voltages(topo, &x);
+@@ -260,6 +292,110 @@
+         self.solve_with_source_stepping(topo, backend, linear_solver)
+     }
+ 
++    /// Detects a DC problem that has NO solution because of KCL: a connected island of elements that
++    /// carry DC current (R, L, V, diode, MOS channel) and does not contain ground, yet receives a net
++    /// non-zero current from independent current sources (e.g. a node touched only by a current
++    /// source and capacitors). `gmin` would regularise such a circuit into `I / gmin` volts.
++    /// Returns `(island nodes, net injected current)`; islands touched by a VCCS output are skipped.
++    pub fn find_dc_current_cutset(soa: &rustspice_core::DeviceSoaBuffer) -> Option<(Vec<usize>, f64)> {
++        let n = soa.num_nodes + 1;
++        let mut parent: Vec<usize> = (0..n).collect();
++        fn find(parent: &mut [usize], mut a: usize) -> usize {
++            while parent[a] != a {
++                parent[a] = parent[parent[a]];
++                a = parent[a];
++            }
++            a
++        }
++        let union = |a: usize, b: usize, parent: &mut Vec<usize>| {
++            let (ra, rb) = (find(parent, a), find(parent, b));
++            if ra != rb {
++                parent[ra] = rb;
++            }
++        };
++        for i in 0..soa.res_names.len() {
++            union(soa.res_n_pos[i], soa.res_n_neg[i], &mut parent);
++        }
++        for i in 0..soa.ind_names.len() {
++            union(soa.ind_n_pos[i], soa.ind_n_neg[i], &mut parent);
++        }
++        for i in 0..soa.vsrc_names.len() {
++            union(soa.vsrc_n_pos[i], soa.vsrc_n_neg[i], &mut parent);
++        }
++        for i in 0..soa.diode_names.len() {
++            union(soa.diode_anode[i], soa.diode_cathode[i], &mut parent);
++        }
++        for i in 0..soa.mos_names.len() {
++            union(soa.mos_drain[i], soa.mos_source[i], &mut parent);
++        }
++        let mut injected = vec![0.0_f64; n];
++        let mut magnitude = vec![0.0_f64; n];
++        let mut indeterminate = vec![false; n];
++        for i in 0..soa.isrc_names.len() {
++            let (p, q, v) = (soa.isrc_n_pos[i], soa.isrc_n_neg[i], soa.isrc_values[i]);
++            let (rp, rq) = (find(&mut parent, p), find(&mut parent, q));
++            // current flows n+ -> n- THROUGH the source: it leaves n+ and enters n-
++            injected[rp] -= v;
++            injected[rq] += v;
++            magnitude[rp] += v.abs();
++            magnitude[rq] += v.abs();
++        }
++        for i in 0..soa.vccs_names.len() {
++            let (rp, rq) = (find(&mut parent, soa.vccs_n_pos[i]), find(&mut parent, soa.vccs_n_neg[i]));
++            indeterminate[rp] = true;
++            indeterminate[rq] = true;
++        }
++        let ground = find(&mut parent, 0);
++        for root in 0..n {
++            if root == ground || indeterminate[root] || magnitude[root] == 0.0 {
++                continue;
++            }
++            if find(&mut parent, root) != root {
++                continue;
++            }
++            if injected[root].abs() > 1e-9 * magnitude[root] {
++                let nodes: Vec<usize> = (1..n).filter(|&k| find(&mut parent, k) == root).collect();
++                return Some((nodes, injected[root]));
++            }
++        }
++        None
++    }
++
++    /// Refuses a DC problem that has no solution (see [`Self::find_dc_current_cutset`]).
++    pub fn check_dc_solvable(soa: &rustspice_core::DeviceSoaBuffer) -> SimResult<()> {
++        Self::check_dc_solvable_with_ic(soa, None)
++    }
++
++    /// As [`Self::check_dc_solvable`], but an island whose every node has an `.ic` value is accepted
++    /// (the user supplied its start state, so no DC solution is needed there).
++    pub fn check_dc_solvable_with_ic(
++        soa: &rustspice_core::DeviceSoaBuffer,
++        ic: Option<&rustc_hash::FxHashMap<usize, f64>>,
++    ) -> SimResult<()> {
++        if let Some((nodes, inj)) = Self::find_dc_current_cutset(soa) {
++            if let Some(ic) = ic {
++                if nodes.iter().all(|k| ic.contains_key(k)) {
++                    return Ok(());
++                }
++            }
++            let names: Vec<&str> = nodes
++                .iter()
++                .take(4)
++                .map(|&k| soa.node_names.get(k).map(String::as_str).unwrap_or("?"))
++                .collect();
++            return Err(SimError::TopologyError(format!(
++                "no DC solution: node(s) {}{} have no DC path to ground and receive a net {:.6e} A from independent current sources (KCL cannot be satisfied)",
++                names.join(", "),
++                if nodes.len() > 4 { ", ..." } else { "" },
++                inj
++            )));
++        }
++        Ok(())
++    }
++
++    /// Dynamic `gmin` stepping: solve with a large shunt conductance on every node (the circuit is then
++    /// almost linear), and relax it towards the nominal `gmin`, each stage starting from the previous
++    /// solution. A stage that fails to converge is retried with a smaller reduction of `gmin`.
+     fn solve_with_gmin_stepping(
+         &mut self,
+         topo: &mut CompiledTopology,
+@@ -272,20 +408,47 @@
+         let mut x = vec![0.0_f64; dim];
+         Self::sync_device_voltages(topo, &x);
+ 
+-        let gmin_schedule = [1e-2, 1e-4, 1e-6, 1e-8, 1e-10, orig_gmin];
+-        let mut total_iters = 0usize;
+-        let mut last_res = 0.0;
+-
+-        for &gmin_val in &gmin_schedule {
+-            topo.soa.gmin = gmin_val;
++        // first stage: gmin = 1e-2 S must converge on its own
++        let mut g = 1e-2_f64;
++        topo.soa.gmin = g;
++        let (mut total_iters, mut last_res) =
++            match self.solve_in_place(topo, backend, linear_solver, &mut x) {
++                Ok(v) => v,
++                Err(e) => {
++                    topo.soa.gmin = orig_gmin;
++                    return Err(e);
++                }
++            };
++        // geometric reduction per stage (1e-2 = the classic decade-pair schedule); shrunk on failure
++        let mut ratio = 1e-2_f64;
++        let mut x_good = x.clone();
++        let mut stages = 0usize;
++        while g > orig_gmin {
++            stages += 1;
++            if stages > Self::MAX_HOMOTOPY_STAGES {
++                topo.soa.gmin = orig_gmin;
++                return Err(SimError::ConvergenceFailure {
++                    iterations: total_iters,
++                    residual: f64::NAN,
++                });
++            }
++            let next = (g * ratio).max(orig_gmin);
++            topo.soa.gmin = next;
++            x.copy_from_slice(&x_good);
++            Self::sync_device_voltages(topo, &x);
+             match self.solve_in_place(topo, backend, linear_solver, &mut x) {
+                 Ok((it, r)) => {
+                     total_iters += it;
+                     last_res = r;
++                    g = next;
++                    x_good.copy_from_slice(&x);
+                 }
+                 Err(e) => {
+-                    topo.soa.gmin = orig_gmin;
+-                    return Err(e);
++                    ratio = ratio.sqrt();
++                    if ratio > 0.9 {
++                        topo.soa.gmin = orig_gmin;
++                        return Err(e);
++                    }
+                 }
+             }
+         }
+@@ -298,46 +461,79 @@
+         })
+     }
+ 
++    /// Hard cap on homotopy stages (each stage is one bounded Newton solve).
++    const MAX_HOMOTOPY_STAGES: usize = 200;
++
++    /// Source stepping: ramp every independent source from 0 to its value; a failing step is retried
++    /// with half the increment.
+     fn solve_with_source_stepping(
+         &mut self,
+         topo: &mut CompiledTopology,
+         backend: &dyn ComputeBackend,
+         linear_solver: &mut AdaptiveSparseSolver,
+     ) -> SimResult<DcOpResult> {
+-        let orig_v: Vec<f64> = topo
+-            .soa
+-            .vsrc_waveforms
+-            .iter()
+-            .map(|w| w.dc_value())
+-            .collect();
+-        let orig_i: Vec<f64> = topo
+-            .soa
+-            .isrc_waveforms
+-            .iter()
+-            .map(|w| w.dc_value())
+-            .collect();
++        // Scale the source values the caller set up (DC values for `.op`, `t = 0` values for the
++        // transient start, the current sweep value for `.dc` recovery).
++        let orig_v: Vec<f64> = topo.soa.vsrc_values.iter().copied().collect();
++        let orig_i: Vec<f64> = topo.soa.isrc_values.iter().copied().collect();
+ 
+         let dim = topo.soa.mna_dim;
+         let mut x = vec![0.0_f64; dim];
+         Self::sync_device_voltages(topo, &x);
++        let mut x_good = x.clone();
+ 
+         let mut total_iters = 0usize;
+         let mut last_res = 0.0;
+-        let steps = 10;
+-
+-        for s in 1..=steps {
+-            let scale = (s as f64) / (steps as f64);
++        let mut s_good = 0.0_f64;
++        let mut ds = 0.1_f64;
++        let mut stages = 0usize;
++        let mut failure: Option<SimError> = None;
++
++        while s_good < 1.0 - 1e-12 {
++            stages += 1;
++            if stages > Self::MAX_HOMOTOPY_STAGES {
++                failure = Some(SimError::ConvergenceFailure {
++                    iterations: total_iters,
++                    residual: f64::NAN,
++                });
++                break;
++            }
++            let s = if s_good + ds > 1.0 - 1e-9 { 1.0 } else { s_good + ds };
+             for (idx, &v) in orig_v.iter().enumerate() {
+-                topo.soa.vsrc_values[idx] = v * scale;
++                topo.soa.vsrc_values[idx] = v * s;
+             }
+             for (idx, &c) in orig_i.iter().enumerate() {
+-                topo.soa.isrc_values[idx] = c * scale;
++                topo.soa.isrc_values[idx] = c * s;
++            }
++            x.copy_from_slice(&x_good);
++            Self::sync_device_voltages(topo, &x);
++            match self.solve_in_place(topo, backend, linear_solver, &mut x) {
++                Ok((it, r)) => {
++                    total_iters += it;
++                    last_res = r;
++                    s_good = s;
++                    x_good.copy_from_slice(&x);
++                }
++                Err(e) => {
++                    ds *= 0.5;
++                    if ds < 1e-4 {
++                        failure = Some(e);
++                        break;
++                    }
++                }
+             }
+-            let (it, r) = self.solve_in_place(topo, backend, linear_solver, &mut x)?;
+-            total_iters += it;
+-            last_res = r;
+         }
+ 
++        // restore the caller's source values (also on failure)
++        for (idx, &v) in orig_v.iter().enumerate() {
++            topo.soa.vsrc_values[idx] = v;
++        }
++        for (idx, &c) in orig_i.iter().enumerate() {
++            topo.soa.isrc_values[idx] = c;
++        }
++        if let Some(e) = failure {
++            return Err(e);
++        }
+         Ok(DcOpResult {
+             solution: x,
+             iterations: total_iters,
+@@ -387,9 +583,20 @@
+         let mut total_iterations = 0usize;
+ 
+         let is_linear = topo.soa.is_linear();
++        let sweeps_current_source = topo
++            .soa
++            .isrc_names
++            .iter()
++            .any(|n| n.eq_ignore_ascii_case(source_name));
++        if !sweeps_current_source {
++            Self::check_dc_solvable(&topo.soa)?;
++        }
+ 
+         for (step_idx, &val) in sweep_values.iter().enumerate() {
+             topo.soa.set_source_dc_value(source_name, val)?;
++            if sweeps_current_source {
++                Self::check_dc_solvable(&topo.soa)?;
++            }
+ 
+             if is_linear && step_idx > 0 && linear_solver.has_valid_factorization() {
+                 // Linear DC Sweep Fast-Path: Jacobian is invariant, only RHS source changed!
+@@ -409,7 +616,22 @@
+                 Self::sync_device_voltages(topo, &x);
+             }
+ 
+-            let (iters, _) = self.solve_in_place(topo, backend, linear_solver, &mut x)?;
++            let iters = match self.solve_in_place(topo, backend, linear_solver, &mut x) {
++                Ok((iters, _)) => iters,
++                Err(e) => {
++                    // Per-point recovery (as for `.op`): restart from zero with gmin / source stepping.
++                    if !self.options.enable_homotopy {
++                        return Err(e);
++                    }
++                    match self.solve_op_at_current_sources(topo, backend, linear_solver) {
++                        Ok(r) => {
++                            x.copy_from_slice(&r.solution);
++                            r.iterations
++                        }
++                        Err(_) => return Err(e),
++                    }
++                }
++            };
+             total_iterations += iters;
+ 
+             prev2_x.copy_from_slice(&prev_x);
+diff --git a/crates/rustspice-solver/src/transient.rs b/crates/rustspice-solver/src/transient.rs
+--- a/crates/rustspice-solver/src/transient.rs
++++ b/crates/rustspice-solver/src/transient.rs
+@@ -82,10 +82,11 @@
+         // 1. Compute initial transient operating point at t = 0.0
+         topo.soa.is_transient = false;
+         topo.soa.update_sources_at_time(Some(0.0));
+-        let mut x = vec![0.0_f64; dim];
+-        NonlinearSolver::sync_device_voltages(topo, &x);
+-        let (op_iters, _) =
+-            nonlinear_solver.solve_in_place(topo, backend, linear_solver, &mut x)?;
++        NonlinearSolver::check_dc_solvable_with_ic(&topo.soa, Some(initial_conditions))?;
++        // Initial solution: Newton, then gmin stepping, then source stepping (as for `.op`)
++        let op = nonlinear_solver.solve_op_at_current_sources(topo, backend, linear_solver)?;
++        let op_iters = op.iterations;
++        let mut x = op.solution;
+         for (&node_id, &ic_val) in initial_conditions {
+             if node_id > 0 && node_id - 1 < dim {
+                 x[node_id - 1] = ic_val;

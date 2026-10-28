@@ -1,0 +1,5 @@
+* divider subcircuit for cap_lang_inc_subckt (include target)
+.subckt DIV in out
+R1 in out 3k
+R2 out 0 1k
+.ends DIV

@@ -1,0 +1,2 @@
+* second level include target of cap_lang_inc_nested
+.model DNEST D(IS=2e-13 N=1.2)

@@ -1,0 +1,7 @@
+* bench.id: rob_hs_ff_empty_file
+* bench.group: robustness
+* bench.title: a zero-byte file
+* bench.expect: loud_error
+* bench.tags: hostile, file, encoding, empty, ngspice_crash
+* bench.est_rss_mib: 64
+* bench.note: no circuit at all: the only correct behaviour is a refusal; ngspice-47 itself segfaults on an empty file (retried once by the engine, a deterministic crash is an ngspice_error)

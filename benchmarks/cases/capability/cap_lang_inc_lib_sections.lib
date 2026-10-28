@@ -1,0 +1,10 @@
+* corner library for cap_lang_inc_lib_section (include target)
+.lib TT
+.model DCORNER D(IS=1e-14 N=1)
+.endl TT
+.lib FF
+.model DCORNER D(IS=1e-12 N=1.3)
+.endl FF
+.lib SS
+.model DCORNER D(IS=1e-16 N=1)
+.endl SS

@@ -76,6 +76,33 @@ pub fn fetlim(vnew: f64, vold: f64, vto: f64) -> f64 {
     }
 }
 
+/// Maximum Shockley diode exponent argument $V_D / (N V_T)$ evaluated with exact `f64::exp()`.
+///
+/// IEEE-754 `f64::exp(x)` overflows at $x \approx 709.78$. Choosing `600.0` ($\exp(600) \approx
+/// 3.773\times 10^{260}$) keeps every diode up to $\sim 15.5\text{ V}$ forward bias (at $N=1$,
+/// $T=300.15\text{ K}$) on the exact exponential curve while leaving $\sim 50$ decades of headroom
+/// below `f64::MAX` for $I_S \exp(\cdot)$ and $g_d = (I_S / N V_T) \exp(\cdot)$ during intermediate
+/// Newton steps. Above `DIODE_EXP_ARG_MAX`, a $C^1$ linear continuation $\exp(x_{\max})(1 + x - x_{\max})$
+/// prevents `NaN`/`Inf` in the Jacobian; the nonlinear solver rejects any converged point that
+/// still lies in the linear-continuation region (`SimError::DeviceRangeExceeded`).
+pub const DIODE_EXP_ARG_MAX: f64 = 600.0;
+const DIODE_EXP_SLOPE_MAX: f64 = 3.773_020_300_929_939_7e260; // 600.0_f64.exp()
+
+#[inline]
+pub fn diode_exp(arg: f64) -> (f64, f64, bool) {
+    if arg <= DIODE_EXP_ARG_MAX {
+        let e = arg.exp();
+        (e, e, false)
+    } else {
+        let excess = arg - DIODE_EXP_ARG_MAX;
+        (
+            DIODE_EXP_SLOPE_MAX * (1.0 + excess),
+            DIODE_EXP_SLOPE_MAX,
+            true,
+        )
+    }
+}
+
 /// High-throughput CPU backend utilizing `pulp` SIMD runtime dispatch (`AVX-512` / `AVX2` / `NEON`)
 /// and `rayon` multi-threading for large device arrays.
 #[derive(Clone, Debug)]
@@ -100,16 +127,17 @@ impl CpuSimdBackend {
     }
 
     #[inline]
-    fn eval_diodes(&self, state: &mut DeviceSoaBuffer, voltages: &[f64]) {
+    fn eval_diodes(&self, state: &mut DeviceSoaBuffer, voltages: &[f64]) -> bool {
         let n_diodes = state.diode_names.len();
         if n_diodes == 0 {
-            return;
+            return false;
         }
 
         let vt_base = state.temp_vt;
         let gmin = state.gmin;
         let use_limit = self.use_step_limiting;
         let sqrt2 = std::f64::consts::SQRT_2;
+        let mut any_limited = false;
 
         // Gather terminal voltage differences in a tight SIMD-friendly loop
         for i in 0..n_diodes {
@@ -124,6 +152,10 @@ impl CpuSimdBackend {
             } else {
                 vd_raw
             };
+            let arg = vd / n_vt;
+            if (vd - vd_raw).abs() > 1e-14 || arg > DIODE_EXP_ARG_MAX {
+                any_limited = true;
+            }
             state.diode_vd[i] = vd;
         }
 
@@ -145,13 +177,13 @@ impl CpuSimdBackend {
                 let n_vt = n * vt_base;
                 let inv_n_vt = 1.0 / n_vt;
 
-                let (id, gd, evd_m1, evd) = if vd >= -3.0 * n_vt {
-                    let arg = (vd * inv_n_vt).clamp(-80.0, 80.0);
-                    let ev = arg.exp();
+                let (id, gd, evd_m1, d_evd) = if vd >= -3.0 * n_vt {
+                    let arg = vd * inv_n_vt;
+                    let (ev, d_ev, _) = diode_exp(arg);
                     let ev_m1 = ev - 1.0;
                     let cur = is.mul_add(ev_m1, gmin * vd);
-                    let cond = (is * inv_n_vt).mul_add(ev, gmin);
-                    (cur, cond, ev_m1, ev)
+                    let cond = (is * inv_n_vt).mul_add(d_ev, gmin);
+                    (cur, cond, ev_m1, d_ev)
                 } else {
                     let arg = 3.0 * n_vt / (vd * std::f64::consts::E);
                     let arg3 = arg * arg * arg;
@@ -164,7 +196,7 @@ impl CpuSimdBackend {
                 gd_slice[i] = gd;
                 ieq_slice[i] = id - gd * vd;
                 did_dis_slice[i] = evd_m1;
-                did_dn_slice[i] = -is * evd * vd * inv_n_vt / n;
+                did_dn_slice[i] = -is * d_evd * vd * inv_n_vt / n;
             }
         });
 
@@ -172,6 +204,7 @@ impl CpuSimdBackend {
             state.cond_buf[state.diode_cond_buf_idx[i] as usize] = state.diode_gd[i];
             state.rhs_buf[state.diode_rhs_buf_idx[i] as usize] = state.diode_ieq[i];
         }
+        any_limited
     }
 
     #[inline]
@@ -204,26 +237,28 @@ impl CpuSimdBackend {
 
                 let kp = state.mos_kp[i];
                 let w = state.mos_w[i];
-                let l = state.mos_l[i].max(1e-12);
+                let l = state.mos_l[i];
                 let inv_l = 1.0 / l;
                 let w_over_l = w * inv_l;
                 let beta = kp * w_over_l;
                 let lambda = state.mos_lambda[i];
                 let gamma = state.mos_gamma[i];
-                let phi = state.mos_phi[i].max(0.1);
+                let phi = state.mos_phi[i].max(0.0);
                 // Threshold voltage in polarized coordinates (`pol * vto`, matching SPICE3f5)
                 let vt0 = pol * state.mos_vto[i];
 
                 let (von, d_von_d_vbs) = if gamma > 0.0 {
                     let sqrt_phi = phi.sqrt();
                     if vbs <= 0.0 {
-                        let sarg = (phi - vbs).sqrt();
+                        let sarg = (phi - vbs).max(1e-30).sqrt();
                         (vt0 + gamma * (sarg - sqrt_phi), -gamma / (2.0 * sarg))
-                    } else {
+                    } else if sqrt_phi > 0.0 {
                         (
                             vt0 - gamma * vbs / (2.0 * sqrt_phi),
                             -gamma / (2.0 * sqrt_phi),
                         )
+                    } else {
+                        (vt0, 0.0)
                     }
                 } else {
                     (vt0, 0.0)
@@ -366,8 +401,9 @@ impl ComputeBackend for CpuSimdBackend {
         }
 
         // Evaluate nonlinear semiconductor devices via SIMD
-        self.eval_diodes(state, voltages);
+        let diodes_limited = self.eval_diodes(state, voltages);
         self.eval_mosfets(state, voltages);
+        state.limiter_active = diodes_limited;
 
         Ok(())
     }
@@ -387,6 +423,10 @@ impl ComputeBackend for CpuSimdBackend {
                 &mut jacobian.values,
                 rhs,
             );
+            let extra_gmin = state.gmin - 1e-12;
+            if extra_gmin.abs() > 0.0 {
+                jacobian.add_diagonal_gmin(state.num_nodes, extra_gmin);
+            }
         } else {
             // Full gather across all devices + diagonal Gmin
             if jacobian.values.len() >= 16_384 {
@@ -411,7 +451,15 @@ impl ComputeBackend for CpuSimdBackend {
                     rhs,
                 );
             }
-            jacobian.add_diagonal_gmin(state.num_nodes, state.gmin);
+            for &diag in &state.dc_floating_diag_idx {
+                if diag < jacobian.values.len() {
+                    jacobian.values[diag] += 1e-12;
+                }
+            }
+            let extra_gmin = state.gmin - 1e-12;
+            if extra_gmin.abs() > 0.0 {
+                jacobian.add_diagonal_gmin(state.num_nodes, extra_gmin);
+            }
 
             if jacobian.values.len() >= 16_384 {
                 rhs.fill(0.0);

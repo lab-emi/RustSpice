@@ -1,0 +1,1193 @@
+diff -ruN -x target -x '*.orig' orig/crates/rustspice-cli/src/main.rs RustSpice/crates/rustspice-cli/src/main.rs
+--- a/crates/rustspice-cli/src/main.rs	2026-10-27 18:10:25.510227232 +0100
++++ b/crates/rustspice-cli/src/main.rs	2026-10-27 21:15:45.374763268 +0100
+@@ -14,7 +14,7 @@
+ use rustspice_backend_cuda_tile::{CudaTileBackend, TileShape};
+ use rustspice_backend_metal::MetalUmaBackend;
+ use rustspice_backend_wasm::WasmWebGpuBackend;
+-use rustspice_core::{AnalysisCmd, ComputeBackend};
++use rustspice_core::{AnalysisCmd, ComputeBackend, ResourceLimits};
+ use rustspice_ir::{
+     build_diode_ir, build_mosfet_ekv_ir, build_mosfet_level1_ir, emit_cuda_ptx_kernel,
+     emit_cuda_tile_kernel, emit_msl_df64_kernel, emit_rust_scalar_fn, emit_wgsl_df64_kernel,
+@@ -47,6 +47,21 @@
+         /// Write a JSON timing/status summary (unavailable numbers are null)
+         #[arg(long)]
+         stats: Option<PathBuf>,
++        /// Maximum stored `.dc` / `.tran` points per analysis [default: 50000000]
++        #[arg(long)]
++        max_points: Option<u64>,
++        /// Maximum MiB held by the stored result of one analysis [default: 1024]
++        #[arg(long)]
++        max_result_mib: Option<u64>,
++        /// Maximum `.subckt` instantiation depth [default: 1000]
++        #[arg(long)]
++        max_subckt_depth: Option<usize>,
++        /// Maximum cards visited while flattening subcircuits [default: 2000000]
++        #[arg(long)]
++        max_expanded_cards: Option<usize>,
++        /// Maximum MiB of flattened netlist text [default: 256]
++        #[arg(long)]
++        max_expanded_mib: Option<usize>,
+     },
+     /// Compute Discrete Adjoint parameter sensitivities at the DC operating point
+     Adjoint {
+@@ -89,8 +104,35 @@
+             backend,
+             raw,
+             stats,
++            max_points,
++            max_result_mib,
++            max_subckt_depth,
++            max_expanded_cards,
++            max_expanded_mib,
+         } => {
+-            run_deck(&netlist, &backend, raw.as_deref(), stats.as_deref())?;
++            let mut limits = ResourceLimits::default();
++            if let Some(v) = max_points {
++                limits.max_points = v;
++            }
++            if let Some(v) = max_result_mib {
++                limits.max_result_bytes = v.saturating_mul(1 << 20);
++            }
++            if let Some(v) = max_subckt_depth {
++                limits.max_subckt_depth = v;
++            }
++            if let Some(v) = max_expanded_cards {
++                limits.max_expanded_cards = v;
++            }
++            if let Some(v) = max_expanded_mib {
++                limits.max_expanded_bytes = v.saturating_mul(1 << 20);
++            }
++            run_deck(
++                &netlist,
++                &backend,
++                raw.as_deref(),
++                stats.as_deref(),
++                &limits,
++            )?;
+         }
+         Commands::Adjoint {
+             netlist,
+@@ -231,13 +273,14 @@
+     backend: &str,
+     raw: Option<&std::path::Path>,
+     stats_path: Option<&std::path::Path>,
++    limits: &ResourceLimits,
+ ) -> Result<(), Box<dyn std::error::Error>> {
+     if let Some(r) = raw {
+         // never leave a stale or partial rawfile behind a failed run
+         let _ = fs::remove_file(r);
+     }
+     let mut stats = RunStats::default();
+-    let result = run_deck_inner(netlist, backend, raw, &mut stats);
++    let result = run_deck_inner(netlist, backend, raw, &mut stats, limits);
+     stats.peak_rss_kib = peak_rss_kib();
+     stats.status = Some(match &result {
+         Ok(()) => "ok".to_string(),
+@@ -258,14 +301,16 @@
+     backend: &str,
+     raw: Option<&std::path::Path>,
+     stats: &mut RunStats,
++    limits: &ResourceLimits,
+ ) -> Result<(), Box<dyn std::error::Error>> {
+     let src = fs::read_to_string(netlist)?;
+     let backend_arc = select_backend(backend);
+     let t0 = Instant::now();
+-    let parsed = rustspice_core::parse_netlist(&src)?;
++    let parsed = rustspice_core::parse_netlist_with_limits(&src, limits)?;
+     stats.parse_us = Some(t0.elapsed().as_secs_f64() * 1e6);
+     let t1 = Instant::now();
+     let mut sim = Simulator::from_netlist(parsed, backend_arc)?;
++    sim.set_limits(*limits);
+     let compile_us = t1.elapsed().as_secs_f64() * 1e6;
+     stats.compile_us = Some(compile_us);
+     stats.solver_kind = Some(format!("{:?}", sim.linear_solver.kind));
+diff -ruN -x target -x '*.orig' orig/crates/rustspice-core/src/error.rs RustSpice/crates/rustspice-core/src/error.rs
+--- a/crates/rustspice-core/src/error.rs	2026-10-27 11:23:30.295113343 +0100
++++ b/crates/rustspice-core/src/error.rs	2026-10-27 20:32:56.923346933 +0100
+@@ -25,6 +25,20 @@
+ 
+     #[error("OSDI / Verilog-A model error: {0}")]
+     OsdiError(String),
++
++    /// A work or memory budget (see [`crate::limits::ResourceLimits`]) was exceeded; raised BEFORE the
++    /// allocation or work it protects.
++    #[error("Resource limit exceeded ({resource}): requested {requested}, limit {limit}. {hint}")]
++    ResourceLimit {
++        resource: &'static str,
++        requested: String,
++        limit: String,
++        hint: String,
++    },
++
++    /// A linear solve produced an infinite or NaN unknown (overflow): the result is not representable.
++    #[error("Non-finite value (overflow or NaN) in MNA unknown {unknown}: the solution is not representable in f64")]
++    NonFiniteSolution { unknown: usize },
+ }
+ 
+ /// Standard result alias returning [`SimError`].
+diff -ruN -x target -x '*.orig' orig/crates/rustspice-core/src/lib.rs RustSpice/crates/rustspice-core/src/lib.rs
+--- a/crates/rustspice-core/src/lib.rs	2026-10-27 11:23:30.295142881 +0100
++++ b/crates/rustspice-core/src/lib.rs	2026-10-27 21:15:45.391763498 +0100
+@@ -4,6 +4,7 @@
+ 
+ pub mod backend;
+ pub mod error;
++pub mod limits;
+ pub mod netlist;
+ pub mod osdi;
+ pub mod precision;
+@@ -12,9 +13,10 @@
+ 
+ pub use backend::ComputeBackend;
+ pub use error::{SimError, SimResult};
++pub use limits::ResourceLimits;
+ pub use netlist::{
+-    parse_netlist, parse_spice_number, AnalysisCmd, CircuitBuilder, DiodeModelParams,
+-    MosfetModelParams, MosfetType, Netlist, SourceWaveform,
++    parse_netlist, parse_netlist_with_limits, parse_spice_number, AnalysisCmd, CircuitBuilder,
++    DiodeModelParams, MosfetModelParams, MosfetType, Netlist, SourceWaveform,
+ };
+ pub use osdi::{OsdiDescriptor, OsdiLibrary, OsdiModelInstance};
+ pub use precision::{Df64, Dual};
+diff -ruN -x target -x '*.orig' orig/crates/rustspice-core/src/limits.rs RustSpice/crates/rustspice-core/src/limits.rs
+--- a/crates/rustspice-core/src/limits.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/crates/rustspice-core/src/limits.rs	2026-10-27 21:15:45.391763498 +0100
+@@ -0,0 +1,90 @@
++//! Hard resource budgets for parsing, hierarchy expansion and result storage.
++//!
++//! Every budget is checked BEFORE the allocation or the work it protects and fails with a structured
++//! [`SimError::ResourceLimit`] (clean exit code 1) instead of an allocator abort, a stack overflow or an
++//! OOM kill. All defaults are finite; the `rustspice run` flags `--max-*` override them.
++
++use serde::{Deserialize, Serialize};
++
++use crate::error::{SimError, SimResult};
++
++/// Default maximum `.subckt` instantiation depth (the expander is iterative, so this bounds
++/// the O(depth^2) flattened-name text and the work, not the call stack).
++pub const DEFAULT_MAX_SUBCKT_DEPTH: usize = 1000;
++/// Default maximum number of cards visited while flattening hierarchy (instance cards + element cards).
++pub const DEFAULT_MAX_EXPANDED_CARDS: usize = 2_000_000;
++/// Default maximum total text of the flattened netlist in bytes.
++pub const DEFAULT_MAX_EXPANDED_BYTES: usize = 256 << 20;
++/// Default maximum number of stored sweep / time points (independent of the circuit size).
++pub const DEFAULT_MAX_POINTS: u64 = 50_000_000;
++/// Default maximum bytes of the stored analysis result (`points x bytes_per_point(dim)`).
++pub const DEFAULT_MAX_RESULT_BYTES: u64 = 1 << 30;
++
++/// Explicit, configurable work and memory budgets (AGENTS.md Rule 9).
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ResourceLimits {
++    /// Maximum `X` instantiation depth.
++    pub max_subckt_depth: usize,
++    /// Maximum cards visited during hierarchy flattening.
++    pub max_expanded_cards: usize,
++    /// Maximum bytes of flattened card text.
++    pub max_expanded_bytes: usize,
++    /// Maximum stored `.dc` / `.tran` points.
++    pub max_points: u64,
++    /// Maximum bytes held by the stored result of one analysis.
++    pub max_result_bytes: u64,
++}
++
++impl Default for ResourceLimits {
++    fn default() -> Self {
++        Self {
++            max_subckt_depth: DEFAULT_MAX_SUBCKT_DEPTH,
++            max_expanded_cards: DEFAULT_MAX_EXPANDED_CARDS,
++            max_expanded_bytes: DEFAULT_MAX_EXPANDED_BYTES,
++            max_points: DEFAULT_MAX_POINTS,
++            max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
++        }
++    }
++}
++
++impl ResourceLimits {
++    /// Heap bytes retained per stored point of an MNA system with `dim` unknowns: the axis value (8),
++    /// the row `Vec` header (24) and the row allocation (`8 * dim` + 16 allocator overhead).
++    #[inline]
++    pub fn bytes_per_point(dim: usize) -> u64 {
++        48 + 8 * dim as u64
++    }
++
++    /// The largest point count that satisfies both `max_points` and `max_result_bytes` for `dim` unknowns.
++    #[inline]
++    pub fn point_cap(&self, dim: usize) -> u64 {
++        self.max_points
++            .min(self.max_result_bytes / Self::bytes_per_point(dim))
++    }
++
++    /// Fails unless `requested` points (given as `f64` so that `1e300` and `+inf` are representable;
++    /// NaN is refused as well) fit [`Self::point_cap`] for `dim` unknowns.
++    pub fn check_points(
++        &self,
++        analysis: &'static str,
++        requested: f64,
++        dim: usize,
++    ) -> SimResult<()> {
++        let cap = self.point_cap(dim);
++        if requested <= cap as f64 {
++            return Ok(());
++        }
++        let bytes = requested * Self::bytes_per_point(dim) as f64;
++        Err(SimError::ResourceLimit {
++            resource: analysis,
++            requested: format!("{requested:.6e} points ({bytes:.3e} bytes at dim {dim})"),
++            limit: format!(
++                "{cap} points (max_points = {}, max_result_bytes = {})",
++                self.max_points, self.max_result_bytes
++            ),
++            hint:
++                "enlarge the step, shorten the analysis, or raise --max-points / --max-result-mib"
++                    .to_string(),
++        })
++    }
++}
+diff -ruN -x target -x '*.orig' orig/crates/rustspice-core/src/netlist.rs RustSpice/crates/rustspice-core/src/netlist.rs
+--- a/crates/rustspice-core/src/netlist.rs	2026-10-27 11:23:30.295270977 +0100
++++ b/crates/rustspice-core/src/netlist.rs	2026-10-27 21:17:48.214457517 +0100
+@@ -1,9 +1,10 @@
+ //! High-speed zero-copy SPICE netlist parser and programmatic [`CircuitBuilder`] API.
+ 
+-use rustc_hash::FxHashMap;
++use rustc_hash::{FxHashMap, FxHashSet};
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::error::{SimError, SimResult};
++use crate::limits::ResourceLimits;
+ 
+ /// Parses a SPICE numeric literal with engineering unit suffixes (`f`, `p`, `n`, `u`, `m`,
+ /// `mil`, `k`, `meg`, `g`, `t`).
+@@ -419,6 +420,79 @@
+     pub fn mna_dimension(&self) -> usize {
+         self.num_nodes() + self.v_sources.len() + self.inductors.len()
+     }
++
++    /// Fails if a source amplitude / frequency or an analysis bound is infinite or NaN.
++    ///
++    /// A literal such as `1e999` parses to `+inf` (it overflows `f64`). For an independent source amplitude
++    /// (`DC`, `PULSE v1 v2`, `SIN vo va freq`) or a `.dc` / `.tran` bound no finite answer exists (the former
++    /// behaviour was NaN output rows or an endless run with exit status 0), while ngspice itself fails on
++    /// these. Device values (`R`, `C`, `L`, `G`, ...) and the timing fields of `PULSE` / `SIN` are NOT
++    /// checked: an infinite resistance is a valid open circuit (both tools agree), and a non-finite
++    /// RESULT is caught by the solver (`SimError::NonFiniteSolution`).
++    pub fn validate_finite(&self) -> SimResult<()> {
++        fn bad(fields: &[(&'static str, f64)]) -> Option<(&'static str, f64)> {
++            fields.iter().copied().find(|(_, v)| !v.is_finite())
++        }
++        fn waveform_fields(w: &SourceWaveform) -> [(&'static str, f64); 4] {
++            const PAD: (&str, f64) = ("", 0.0);
++            match *w {
++                SourceWaveform::Dc(v) => [("dc value", v), PAD, PAD, PAD],
++                SourceWaveform::Pulse { dc_val, v1, v2, .. } => [
++                    ("PULSE dc value", dc_val),
++                    ("PULSE v1", v1),
++                    ("PULSE v2", v2),
++                    PAD,
++                ],
++                SourceWaveform::Sin {
++                    dc_val,
++                    vo,
++                    va,
++                    freq,
++                    ..
++                } => [
++                    ("SIN dc value", dc_val),
++                    ("SIN vo", vo),
++                    ("SIN va", va),
++                    ("SIN frequency", freq),
++                ],
++            }
++        }
++        let fail = |name: &str, field: &str, v: f64| {
++            Err(SimError::TopologyError(format!(
++                "non-finite value ({v}) for {field} of `{name}`: a numeric literal that overflows f64 (e.g. 1e999) is not a valid source amplitude or analysis bound"
++            )))
++        };
++        for src in &self.v_sources {
++            if let Some((f, v)) = bad(&waveform_fields(&src.waveform)) {
++                return fail(&src.name, f, v);
++            }
++        }
++        for src in &self.i_sources {
++            if let Some((f, v)) = bad(&waveform_fields(&src.waveform)) {
++                return fail(&src.name, f, v);
++            }
++        }
++        for a in &self.analyses {
++            match a {
++                AnalysisCmd::Op => {}
++                AnalysisCmd::Dc {
++                    start, stop, step, ..
++                } => {
++                    if let Some((f, v)) =
++                        bad(&[("start", *start), ("stop", *stop), ("step", *step)])
++                    {
++                        return fail(".dc", f, v);
++                    }
++                }
++                AnalysisCmd::Tran { tstep, tstop, .. } => {
++                    if let Some((f, v)) = bad(&[("tstep", *tstep), ("tstop", *tstop)]) {
++                        return fail(".tran", f, v);
++                    }
++                }
++            }
++        }
++        Ok(())
++    }
+ }
+ 
+ /// Fluent Rust builder for programmatic circuit construction.
+@@ -572,8 +646,15 @@
+     lines: Vec<(usize, String)>,
+ }
+ 
+-/// Parses a complete SPICE netlist string into a [`Netlist`] AST with zero unnecessary allocations.
++/// Parses a complete SPICE netlist string into a [`Netlist`] AST with zero unnecessary allocations,
++/// under the default [`ResourceLimits`].
+ pub fn parse_netlist(src: &str) -> SimResult<Netlist> {
++    parse_netlist_with_limits(src, &ResourceLimits::default())
++}
++
++/// Like [`parse_netlist`] with explicit hierarchy-expansion budgets (`max_subckt_depth`,
++/// `max_expanded_cards`, `max_expanded_bytes`).
++pub fn parse_netlist_with_limits(src: &str, limits: &ResourceLimits) -> SimResult<Netlist> {
+     let mut logical_lines: Vec<(usize, String)> = Vec::new();
+     let mut title = String::from("Untitled SPICE Deck");
+     let mut seen_title = false;
+@@ -673,8 +754,8 @@
+         }
+     }
+ 
+-    // Expand subcircuits (`X...`) recursively
+-    let expanded_lines = expand_subcircuits(&top_lines, &subckts, "", &FxHashMap::default())?;
++    // Expand subcircuits (`X...`) with an explicit stack: bounded by `limits`, never by the call stack
++    let expanded_lines = expand_subcircuits(&top_lines, &subckts, limits)?;
+ 
+     // Second pass: parse all elements and analysis cards
+     for (line_no, line) in expanded_lines {
+@@ -684,18 +765,80 @@
+     if netlist.analyses.is_empty() {
+         netlist.analyses.push(AnalysisCmd::Op);
+     }
++    netlist.validate_finite()?;
+ 
+     Ok(netlist)
+ }
+ 
++/// One level of the explicit hierarchy stack used by [`expand_subcircuits`].
++struct ExpandFrame<'a> {
++    /// Lower-case subcircuit name (empty for the top level).
++    name: &'a str,
++    lines: &'a [(usize, String)],
++    next: usize,
++    prefix: String,
++    port_map: FxHashMap<String, String>,
++}
++
++fn expansion_limit(
++    resource: &'static str,
++    requested: String,
++    limit: String,
++    hint: &str,
++) -> SimError {
++    SimError::ResourceLimit {
++        resource,
++        requested,
++        limit,
++        hint: hint.to_string(),
++    }
++}
++
++/// Flattens `X` instances depth-first with an explicit stack (same card order as plain recursion).
++///
++/// * a subcircuit instantiating itself, directly or through other subcircuits, is refused with the cycle
++///   spelled out (without a parameter language such an expansion can never terminate);
++/// * `limits.max_subckt_depth`, `limits.max_expanded_cards` (instance + element cards visited) and
++///   `limits.max_expanded_bytes` (flattened text) are enforced while expanding.
+ fn expand_subcircuits(
+-    lines: &[(usize, String)],
++    top_lines: &[(usize, String)],
+     subckts: &FxHashMap<String, SubcktDef>,
+-    prefix: &str,
+-    port_map: &FxHashMap<String, String>,
++    limits: &ResourceLimits,
+ ) -> SimResult<Vec<(usize, String)>> {
+-    let mut out = Vec::with_capacity(lines.len());
+-    for (line_no, line) in lines {
++    let mut out: Vec<(usize, String)> = Vec::with_capacity(top_lines.len());
++    let mut cards = 0usize;
++    let mut bytes = 0usize;
++    let mut active: FxHashSet<&str> = FxHashSet::default();
++    let mut stack: Vec<ExpandFrame> = vec![ExpandFrame {
++        name: "",
++        lines: top_lines,
++        next: 0,
++        prefix: String::new(),
++        port_map: FxHashMap::default(),
++    }];
++
++    while let Some(frame) = stack.last_mut() {
++        let lines: &[(usize, String)] = frame.lines;
++        let Some((line_no, line)) = lines.get(frame.next) else {
++            if let Some(done) = stack.pop() {
++                active.remove(done.name);
++            }
++            continue;
++        };
++        frame.next += 1;
++        cards += 1;
++        if cards > limits.max_expanded_cards {
++            return Err(expansion_limit(
++                "expanded_cards",
++                format!(
++                    "more than {} flattened cards (stopped at line {line_no}, depth {})",
++                    limits.max_expanded_cards,
++                    stack.len() - 1
++                ),
++                format!("{} cards (max_expanded_cards)", limits.max_expanded_cards),
++                "the hierarchy flattens to more cards than the budget; reduce the fan-out or raise --max-expanded-cards",
++            ));
++        }
+         let first_char = line.as_bytes()[0].to_ascii_uppercase();
+         if first_char == b'X' {
+             let toks: Vec<&str> = line.split_whitespace().collect();
+@@ -707,10 +850,13 @@
+             }
+             let inst_name = toks[0];
+             let sub_name = toks.last().unwrap().to_ascii_lowercase();
+-            let sub = subckts.get(&sub_name).ok_or_else(|| SimError::ParseError {
+-                line: *line_no,
+-                message: format!("Unknown subcircuit `{sub_name}`"),
+-            })?;
++            let (sub_key, sub) =
++                subckts
++                    .get_key_value(&sub_name)
++                    .ok_or_else(|| SimError::ParseError {
++                        line: *line_no,
++                        message: format!("Unknown subcircuit `{sub_name}`"),
++                    })?;
+             let actual_nodes = &toks[1..toks.len() - 1];
+             if actual_nodes.len() != sub.ports.len() {
+                 return Err(SimError::ParseError {
+@@ -722,23 +868,70 @@
+                     ),
+                 });
+             }
+-            let new_prefix = if prefix.is_empty() {
++            let new_prefix = if frame.prefix.is_empty() {
+                 inst_name.to_string()
+             } else {
+-                format!("{prefix}.{inst_name}")
++                format!("{}.{inst_name}", frame.prefix)
+             };
+             let mut child_map = FxHashMap::default();
+             for (formal, actual) in sub.ports.iter().zip(actual_nodes.iter()) {
+-                let mapped_actual = map_subckt_node(actual, prefix, port_map);
++                let mapped_actual = map_subckt_node(actual, &frame.prefix, &frame.port_map);
+                 child_map.insert(formal.to_ascii_lowercase(), mapped_actual);
+             }
+-            let child_expanded = expand_subcircuits(&sub.lines, subckts, &new_prefix, &child_map)?;
+-            out.extend(child_expanded);
+-        } else if prefix.is_empty() {
+-            out.push((*line_no, line.clone()));
++
++            if active.contains(sub_key.as_str()) {
++                let first = stack
++                    .iter()
++                    .position(|f| f.name == sub_key.as_str())
++                    .unwrap_or(0);
++                let mut chain: Vec<&str> = stack[first..].iter().map(|f| f.name).collect();
++                chain.push(sub_key.as_str());
++                return Err(SimError::ParseError {
++                    line: *line_no,
++                    message: format!(
++                        "Recursive subcircuit instantiation `{}` (instance `{inst_name}`): the expansion would never terminate",
++                        chain.join(" -> ")
++                    ),
++                });
++            }
++            let child_depth = stack.len();
++            if child_depth > limits.max_subckt_depth {
++                return Err(expansion_limit(
++                    "subckt_depth",
++                    format!(
++                        "instantiation depth {child_depth} (instance `{inst_name}` of `{sub_name}`, line {line_no}) exceeds the limit"
++                    ),
++                    format!("{} levels (max_subckt_depth)", limits.max_subckt_depth),
++                    "flatten the hierarchy or raise --max-subckt-depth",
++                ));
++            }
++            active.insert(sub_key.as_str());
++            stack.push(ExpandFrame {
++                name: sub_key.as_str(),
++                lines: sub.lines.as_slice(),
++                next: 0,
++                prefix: new_prefix,
++                port_map: child_map,
++            });
+         } else {
+-            let rewritten = rewrite_subckt_line(line, prefix, port_map);
+-            out.push((*line_no, rewritten));
++            let text = if frame.prefix.is_empty() {
++                line.clone()
++            } else {
++                rewrite_subckt_line(line, &frame.prefix, &frame.port_map)
++            };
++            bytes += text.len();
++            if bytes > limits.max_expanded_bytes {
++                return Err(expansion_limit(
++                    "expanded_bytes",
++                    format!(
++                        "more than {} bytes of flattened netlist text (stopped at line {line_no})",
++                        limits.max_expanded_bytes
++                    ),
++                    format!("{} bytes (max_expanded_bytes)", limits.max_expanded_bytes),
++                    "flattened instance names grow with the nesting depth; reduce depth or raise --max-expanded-mib",
++                ));
++            }
++            out.push((*line_no, text));
+         }
+     }
+     Ok(out)
+diff -ruN -x target -x '*.orig' orig/crates/rustspice-core/tests/resource_budget.rs RustSpice/crates/rustspice-core/tests/resource_budget.rs
+--- a/crates/rustspice-core/tests/resource_budget.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/crates/rustspice-core/tests/resource_budget.rs	2026-10-27 21:15:45.416763835 +0100
+@@ -0,0 +1,209 @@
++//! Hierarchy-expansion budgets and non-finite literal validation (AGENTS.md Rule 9).
++//! Oracles are closed forms (card counts of a fan-out tree, the flattened-name grammar), not the parser.
++
++use rustspice_core::{parse_netlist, parse_netlist_with_limits, ResourceLimits, SimError};
++
++/// `levels`-deep fan-out-10 tree: `l0` holds one resistor, `lk` instantiates `l(k-1)` ten times.
++fn fanout_deck(levels: usize) -> String {
++    let mut s = String::from("fanout tree\n.subckt l0 a b\nR1 a b 1k\n.ends\n");
++    for k in 1..=levels {
++        s.push_str(&format!(".subckt l{k} a b\n"));
++        for j in 0..10 {
++            s.push_str(&format!("X{j} a b l{}\n", k - 1));
++        }
++        s.push_str(".ends\n");
++    }
++    s.push_str(&format!("V1 1 0 1\nXt 1 0 l{levels}\n.op\n.end\n"));
++    s
++}
++
++/// Cards visited while flattening [`fanout_deck`]: 4 top-level cards (`V1`, `Xt`, `.op`, `.end`) plus the
++/// bodies of 10^0 + ... instances: sum_{j=1}^{levels} 10^j X cards plus 10^levels resistor cards.
++fn fanout_cards(levels: u32) -> usize {
++    let x: usize = (1..=levels).map(|j| 10usize.pow(j)).sum();
++    4 + x + 10usize.pow(levels)
++}
++
++fn chain_deck(depth: usize) -> String {
++    let mut s = String::from("chain\n");
++    for k in 0..depth {
++        s.push_str(&format!(
++            ".subckt s{k} a b\nX1 a m s{}\nR1 m b 1\n.ends\n",
++            k + 1
++        ));
++    }
++    s.push_str(&format!(".subckt s{depth} a b\nR1 a b 1\n.ends\n"));
++    s.push_str("V1 1 0 1\nXt 1 0 s0\n.op\n.end\n");
++    s
++}
++
++fn limit_resource(e: &SimError) -> &'static str {
++    match e {
++        SimError::ResourceLimit { resource, .. } => resource,
++        other => panic!("expected ResourceLimit, got {other:?}"),
++    }
++}
++
++#[test]
++fn flattened_card_budget_boundary_matches_closed_form() {
++    for levels in 1..=3u32 {
++        let deck = fanout_deck(levels as usize);
++        let need = fanout_cards(levels);
++        let mut lim = ResourceLimits::default();
++        lim.max_expanded_cards = need;
++        let nl = parse_netlist_with_limits(&deck, &lim).expect("exact budget must pass");
++        assert_eq!(nl.resistors.len(), 10usize.pow(levels));
++        lim.max_expanded_cards = need - 1;
++        let e = parse_netlist_with_limits(&deck, &lim).expect_err("one card less must be refused");
++        assert_eq!(limit_resource(&e), "expanded_cards");
++    }
++}
++
++#[test]
++fn expansion_bomb_is_refused_by_default_budget_and_stays_small() {
++    // 10^9 resistors (the bench deck rob_hs_sub_expansion_bomb_1e9 has 9 levels); 7 levels already exceed 2e6
++    let deck = fanout_deck(7);
++    let e = parse_netlist(&deck).expect_err("1.1e7 cards must exceed the default budget");
++    assert_eq!(limit_resource(&e), "expanded_cards");
++}
++
++#[test]
++fn depth_budget_boundary() {
++    let mut lim = ResourceLimits::default();
++    lim.max_subckt_depth = 20;
++    // chain of N subckts instantiated from the top: instantiation depth of the innermost is N + 1
++    let ok = parse_netlist_with_limits(&chain_deck(19), &lim).expect("depth 20 fits");
++    assert_eq!(ok.resistors.len(), 20);
++    let e = parse_netlist_with_limits(&chain_deck(20), &lim).expect_err("depth 21 must be refused");
++    assert_eq!(limit_resource(&e), "subckt_depth");
++}
++
++#[test]
++fn deep_chain_does_not_use_the_call_stack() {
++    // 5000 levels with a raised budget: the former recursive expander overflowed the 8 MiB stack at ~15000
++    // levels (and a 2 MiB test thread much earlier); the explicit stack has no such limit.
++    let mut lim = ResourceLimits::default();
++    lim.max_subckt_depth = 5000;
++    let nl = std::thread::Builder::new()
++        .stack_size(256 * 1024)
++        .spawn(move || {
++            parse_netlist_with_limits(&chain_deck(4000), &lim).map(|n| n.resistors.len())
++        })
++        .unwrap()
++        .join()
++        .expect("no stack overflow on a 256 KiB stack");
++    assert_eq!(nl.unwrap(), 4001);
++}
++
++#[test]
++fn flattened_text_budget() {
++    let mut lim = ResourceLimits::default();
++    lim.max_expanded_bytes = 500;
++    let e = parse_netlist_with_limits(&fanout_deck(2), &lim)
++        .expect_err("100 resistors exceed 500 bytes");
++    assert_eq!(limit_resource(&e), "expanded_bytes");
++}
++
++#[test]
++fn direct_and_mutual_recursion_are_refused_with_the_cycle() {
++    let direct =
++        "t\n.subckt loop a b\nR1 a b 1k\nX1 a b loop\n.ends\nV1 1 0 1\nX9 1 0 loop\n.op\n.end\n";
++    match parse_netlist(direct).expect_err("direct recursion") {
++        SimError::ParseError { message, .. } => {
++            assert!(message.contains("loop -> loop"), "{message}")
++        }
++        e => panic!("{e:?}"),
++    }
++    let mutual = "t\n.subckt ping a b\nX1 a b pong\n.ends\n.subckt pong a b\nX1 a b ping\n.ends\nV1 1 0 1\nX9 1 0 ping\n.op\n.end\n";
++    match parse_netlist(mutual).expect_err("mutual recursion") {
++        SimError::ParseError { message, .. } => {
++            assert!(message.contains("ping -> pong -> ping"), "{message}")
++        }
++        e => panic!("{e:?}"),
++    }
++}
++
++#[test]
++fn unreferenced_recursive_definition_is_accepted() {
++    let deck =
++        "t\n.subckt loop a b\nR1 a b 1k\nX1 a b loop\n.ends\nV1 1 0 1\nR2 1 0 1k\n.op\n.end\n";
++    assert_eq!(parse_netlist(deck).unwrap().resistors.len(), 1);
++}
++
++#[test]
++fn same_subckt_twice_in_sequence_is_not_a_cycle() {
++    // diamond: top instantiates `leaf` directly twice and through `mid` once; no cycle
++    let deck =
++        "t\n.subckt leaf a b\nR1 a b 1k\n.ends\n.subckt mid a b\nX1 a b leaf\nX2 a b leaf\n.ends\n\
++                V1 1 0 1\nXa 1 0 leaf\nXb 1 0 leaf\nXc 1 0 mid\n.op\n.end\n";
++    let nl = parse_netlist(deck).unwrap();
++    let names: Vec<&str> = nl.resistors.iter().map(|r| r.name.as_str()).collect();
++    // depth-first, definition order, `<card>_<instance path>` (the grammar of rewrite_subckt_line)
++    assert_eq!(names, ["R1_Xa", "R1_Xb", "R1_Xc.X1", "R1_Xc.X2"]);
++}
++
++#[test]
++fn flattened_names_and_node_mapping_are_hierarchical() {
++    let deck = "t\n.subckt inner a b\nR1 a m 1k\nR2 m b 2k\n.ends\n.subckt outer p q\nX1 p n1 inner\nR3 n1 q 3k\n.ends\n\
++                V1 in 0 1\nXo in out outer\nR4 out 0 4k\n.op\n.end\n";
++    let nl = parse_netlist(deck).unwrap();
++    let r: Vec<(&str, &str, &str)> = nl
++        .resistors
++        .iter()
++        .map(|r| {
++            (
++                r.name.as_str(),
++                nl.node_names[r.n_pos].as_str(),
++                nl.node_names[r.n_neg].as_str(),
++            )
++        })
++        .collect();
++    assert_eq!(
++        r,
++        [
++            ("R1_Xo.X1", "in", "Xo.X1.m"),
++            ("R2_Xo.X1", "Xo.X1.m", "Xo.n1"),
++            ("R3_Xo", "Xo.n1", "out"),
++            ("R4", "out", "0"),
++        ]
++    );
++}
++
++#[test]
++fn non_finite_source_and_analysis_literals_are_rejected() {
++    for (deck, what) in [
++        ("t\nV1 1 0 1e999\nR1 1 0 1k\n.op\n.end\n", "dc value"),
++        (
++            "t\nV1 1 0 SIN(0 1 1e999)\nR1 1 0 1k\n.tran 1n 1u\n.end\n",
++            "SIN frequency",
++        ),
++        (
++            "t\nV1 1 0 SIN(0 1e999 1k)\nR1 1 0 1k\n.tran 1n 1u\n.end\n",
++            "SIN va",
++        ),
++        (
++            "t\nV1 1 0 PULSE(0 1e999 0 1n 1n 1 2)\nR1 1 0 1k\n.tran 1n 1u\n.end\n",
++            "PULSE v2",
++        ),
++        ("t\nV1 1 0 1\nR1 1 0 1k\n.tran 1n 1e999\n.end\n", "tstop"),
++        ("t\nV1 1 0 1\nR1 1 0 1k\n.dc V1 0 1e999 1\n.end\n", "stop"),
++    ] {
++        match parse_netlist(deck) {
++            Err(SimError::TopologyError(m)) => assert!(m.contains(what), "{what}: {m}"),
++            other => panic!("{what}: {other:?}"),
++        }
++    }
++}
++
++#[test]
++fn infinite_device_values_and_timing_fields_stay_accepted() {
++    // R = 1e999 is an open circuit in both tools (bench deck rob_hs_val_r_1e999 passes today): not rejected
++    assert!(parse_netlist("t\nV1 1 0 5\nR1 1 2 1k\nR2 2 0 1e999\n.op\n.end\n").is_ok());
++    // infinite pulse width / period is a one-shot pulse
++    assert!(parse_netlist(
++        "t\nV1 1 0 PULSE(0 1 0 1n 1n 1e999 1e999)\nR1 1 0 1k\n.tran 1n 1u\n.end\n"
++    )
++    .is_ok());
++    // finite extremes are accepted (the solver, not the parser, judges overflow)
++    assert!(parse_netlist("t\nV1 1 0 1e308\nR1 1 0 1e-3\n.op\n.end\n").is_ok());
++}
+diff -ruN -x target -x '*.orig' orig/crates/rustspice-solver/src/nonlinear.rs RustSpice/crates/rustspice-solver/src/nonlinear.rs
+--- a/crates/rustspice-solver/src/nonlinear.rs	2026-10-27 11:23:30.296378087 +0100
++++ b/crates/rustspice-solver/src/nonlinear.rs	2026-10-27 21:16:56.221025421 +0100
+@@ -5,7 +5,7 @@
+ //! - Secant Trajectory Predictor for DC Sweeps and Transient Time-Stepping
+ //! - Homotopy Continuation (`Gmin Stepping` & `Source Stepping`)
+ 
+-use rustspice_core::{CompiledTopology, ComputeBackend, SimError, SimResult};
++use rustspice_core::{CompiledTopology, ComputeBackend, ResourceLimits, SimError, SimResult};
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::linear::AdaptiveSparseSolver;
+@@ -53,6 +53,8 @@
+ /// Pre-allocated Newton-Raphson solver workspace guaranteeing zero heap allocations in the hot loop.
+ pub struct NonlinearSolver {
+     pub options: NrOptions,
++    /// Work / memory budgets enforced by `solve_dc_sweep`.
++    pub limits: ResourceLimits,
+     rhs: Vec<f64>,
+     next_x: Vec<f64>,
+     residual_vec: Vec<f64>,
+@@ -64,6 +66,7 @@
+     pub fn new(dim: usize, options: NrOptions) -> Self {
+         Self {
+             options,
++            limits: ResourceLimits::default(),
+             rhs: vec![0.0; dim],
+             next_x: vec![0.0; dim],
+             residual_vec: vec![0.0; dim],
+@@ -82,6 +85,23 @@
+         }
+     }
+ 
++    /// Fails with [`SimError::NonFiniteSolution`] if any unknown is infinite or NaN (overflow in the linear
++    /// solve); the nonlinear path already rejects non-finite Newton steps.
++    #[inline]
++    pub fn ensure_finite(x: &[f64]) -> SimResult<()> {
++        // Branch-free scan (all-ones exponent <=> inf or NaN) so the per-step cost on the linear
++        // fast paths stays at a few vector ops; the index is only searched on the failure path.
++        let mut bad = false;
++        for v in x {
++            bad |= (v.to_bits() & 0x7ff0_0000_0000_0000) == 0x7ff0_0000_0000_0000;
++        }
++        if !bad {
++            return Ok(());
++        }
++        let unknown = x.iter().position(|v| !v.is_finite()).unwrap_or(0);
++        Err(SimError::NonFiniteSolution { unknown })
++    }
++
+     /// Synchronizes internal diode junction voltages `diode_vd` with a predicted node voltage vector `x`.
+     #[inline]
+     pub fn sync_device_voltages(topo: &mut CompiledTopology, x: &[f64]) {
+@@ -108,6 +128,7 @@
+             backend.evaluate_devices(&mut topo.soa, x)?;
+             backend.stamp_jacobian(&topo.soa, &mut topo.jacobian, &mut self.rhs)?;
+             linear_solver.factorize_and_solve(&topo.jacobian, &self.rhs, x)?;
++            Self::ensure_finite(x)?;
+             return Ok((1, 0.0));
+         }
+ 
+@@ -363,12 +384,26 @@
+                 "DC sweep step cannot be zero".to_string(),
+             ));
+         }
++        if !(start.is_finite() && stop.is_finite() && step.is_finite()) {
++            return Err(SimError::TopologyError(format!(
++                "DC sweep bounds must be finite (start = {start}, stop = {stop}, step = {step})"
++            )));
++        }
+         topo.soa.is_transient = false;
+         topo.soa.update_sources_at_time(None);
+ 
+         let dim = topo.soa.mna_dim;
+         self.ensure_dim(dim);
+ 
++        // Budget check BEFORE any allocation: the point count is known in closed form
++        // (+2 covers the inclusive end point and the 1e-12 * step guard of the loop below).
++        self.limits.check_points(
++            "dc_sweep_points",
++            (stop - start).abs() / step.abs() + 2.0,
++            dim,
++        )?;
++        let point_cap = self.limits.point_cap(dim);
++
+         let mut sweep_values = Vec::new();
+         let mut cur = start;
+         let dir = if stop >= start { 1.0 } else { -1.0 };
+@@ -376,8 +411,22 @@
+         while (dir > 0.0 && cur <= stop + 1e-12 * step.abs())
+             || (dir < 0.0 && cur >= stop - 1e-12 * step.abs())
+         {
++            if sweep_values.len() as u64 >= point_cap {
++                return Err(SimError::ResourceLimit {
++                    resource: "dc_sweep_points",
++                    requested: format!("more than {point_cap} sweep points"),
++                    limit: format!("{point_cap} points (max_points / max_result_bytes)"),
++                    hint: "enlarge the step or raise --max-points / --max-result-mib".to_string(),
++                });
++            }
+             sweep_values.push(cur);
+-            cur += step_signed;
++            let next = cur + step_signed;
++            if next == cur {
++                return Err(SimError::TopologyError(format!(
++                    "DC sweep step {step:e} is below the floating-point resolution at {cur:e}: the sweep cannot advance"
++                )));
++            }
++            cur = next;
+         }
+ 
+         let mut solutions = Vec::with_capacity(sweep_values.len());
+@@ -396,6 +445,7 @@
+                 backend.evaluate_devices(&mut topo.soa, &x)?;
+                 backend.stamp_jacobian(&topo.soa, &mut topo.jacobian, &mut self.rhs)?;
+                 linear_solver.solve_cached(&self.rhs, &mut x)?;
++                Self::ensure_finite(&x)?;
+                 total_iterations += 1;
+                 solutions.push(x.clone());
+                 continue;
+diff -ruN -x target -x '*.orig' orig/crates/rustspice-solver/src/simulator.rs RustSpice/crates/rustspice-solver/src/simulator.rs
+--- a/crates/rustspice-solver/src/simulator.rs	2026-10-27 11:23:30.296417909 +0100
++++ b/crates/rustspice-solver/src/simulator.rs	2026-10-27 20:34:46.868345185 +0100
+@@ -7,7 +7,8 @@
+     BatchCircuitInput, BatchCircuitOutput, BatchCpuExecutor, CpuSimdBackend,
+ };
+ use rustspice_core::{
+-    compile_netlist, parse_netlist, CompiledTopology, ComputeBackend, Netlist, SimError, SimResult,
++    compile_netlist, parse_netlist, parse_netlist_with_limits, CompiledTopology, ComputeBackend,
++    Netlist, ResourceLimits, SimError, SimResult,
+ };
+ 
+ use crate::adjoint::{AdjointGradientResult, AdjointSensitivityEngine, ParameterGradSpec};
+@@ -44,6 +45,7 @@
+ 
+     /// Compiles a [`Netlist`] with the specified hardware [`ComputeBackend`].
+     pub fn from_netlist(netlist: Netlist, backend: Arc<dyn ComputeBackend>) -> SimResult<Self> {
++        netlist.validate_finite()?;
+         let mut topology = compile_netlist(&netlist)?;
+         let dim = topology.soa.mna_dim;
+         let mut init_rhs = vec![0.0_f64; dim];
+@@ -67,6 +69,24 @@
+         })
+     }
+ 
++    /// Parses `spice_src` under explicit [`ResourceLimits`] and applies them to the analyses.
++    pub fn from_spice_with_limits(
++        spice_src: &str,
++        backend: Arc<dyn ComputeBackend>,
++        limits: ResourceLimits,
++    ) -> SimResult<Self> {
++        let netlist = parse_netlist_with_limits(spice_src, &limits)?;
++        let mut sim = Self::from_netlist(netlist, backend)?;
++        sim.set_limits(limits);
++        Ok(sim)
++    }
++
++    /// Sets the work / memory budgets of the `.dc` and `.tran` analyses.
++    pub fn set_limits(&mut self, limits: ResourceLimits) {
++        self.nonlinear_solver.limits = limits;
++        self.transient_solver.limits = limits;
++    }
++
+     /// Solves the DC Operating Point (`.op`).
+     pub fn run_dc_op(&mut self) -> SimResult<DcOpResult> {
+         self.nonlinear_solver.solve_dc_op(
+diff -ruN -x target -x '*.orig' orig/crates/rustspice-solver/src/transient.rs RustSpice/crates/rustspice-solver/src/transient.rs
+--- a/crates/rustspice-solver/src/transient.rs	2026-10-27 11:23:30.296467109 +0100
++++ b/crates/rustspice-solver/src/transient.rs	2026-10-27 21:15:45.460764429 +0100
+@@ -1,7 +1,9 @@
+ //! Time-domain Transient Integrator (`Trapezoidal`, `BDF-1`, `BDF-2`) with Constant-$h$
+ //! LU Factorization Caching, Secant Trajectory Prediction, and Adaptive Timestep Recovery.
+ 
+-use rustspice_core::{CompiledTopology, ComputeBackend, DeviceSoaBuffer, SimError, SimResult};
++use rustspice_core::{
++    CompiledTopology, ComputeBackend, DeviceSoaBuffer, ResourceLimits, SimError, SimResult,
++};
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::linear::AdaptiveSparseSolver;
+@@ -46,6 +48,8 @@
+ /// High-speed Transient Integrator.
+ pub struct TransientSolver {
+     pub options: TranOptions,
++    /// Work / memory budgets enforced by `solve_transient`.
++    pub limits: ResourceLimits,
+     rhs_scratch: Vec<f64>,
+ }
+ 
+@@ -53,6 +57,7 @@
+     pub fn new(options: TranOptions) -> Self {
+         Self {
+             options,
++            limits: ResourceLimits::default(),
+             rhs_scratch: Vec::new(),
+         }
+     }
+@@ -69,6 +74,14 @@
+         tstop: f64,
+         initial_conditions: &rustc_hash::FxHashMap<usize, f64>,
+     ) -> SimResult<TranResult> {
++        if !(tstep.is_finite() && tstop.is_finite()) {
++            return Err(SimError::TransientFailure {
++                time: 0.0,
++                reason: format!(
++                    "tstep and tstop must be finite (tstep = {tstep}, tstop = {tstop})"
++                ),
++            });
++        }
+         if tstep <= 0.0 || tstop <= 0.0 {
+             return Err(SimError::TransientFailure {
+                 time: 0.0,
+@@ -79,6 +92,12 @@
+         let dim = topo.soa.mna_dim;
+         self.rhs_scratch.resize(dim, 0.0);
+ 
++        // Budget check BEFORE any work or allocation: `tstop / tstep` can be 1e12 or 1e300.
++        let est_points = (tstop / tstep).ceil() + 2.0;
++        self.limits
++            .check_points("transient_points", est_points, dim)?;
++        let point_cap = self.limits.point_cap(dim);
++
+         // 1. Compute initial transient operating point at t = 0.0
+         topo.soa.is_transient = false;
+         topo.soa.update_sources_at_time(Some(0.0));
+@@ -111,7 +130,8 @@
+             topo.soa.ind_v_prev[i] = vp - vn;
+         }
+ 
+-        let est_steps = ((tstop / tstep).ceil() as usize) + 2;
++        // `est_points <= point_cap` was verified above, so this reservation is bounded
++        let est_steps = est_points as usize;
+         let mut time_points = Vec::with_capacity(est_steps);
+         let mut waveforms = Vec::with_capacity(est_steps);
+         time_points.push(0.0);
+@@ -131,6 +151,16 @@
+         let mut step_index = 0usize;
+ 
+         while t < tstop - 1e-9 * tstep {
++            // sub-stepping retries can produce more points than estimated: hard cap on the stored points
++            if time_points.len() as u64 >= point_cap {
++                return Err(SimError::ResourceLimit {
++                    resource: "transient_points",
++                    requested: format!("more than {point_cap} time points (stopped at t = {t:.6e} s)"),
++                    limit: format!("{point_cap} points (max_points / max_result_bytes)"),
++                    hint: "enlarge the step, shorten the analysis, or raise --max-points / --max-result-mib"
++                        .to_string(),
++                });
++            }
+             let rem = tstop - t;
+             let h_target = if (rem - tstep).abs() <= 1e-9 * tstep {
+                 tstep
+@@ -188,6 +218,16 @@
+                 }
+ 
+                 linear_solver.solve_cached(&self.rhs_scratch, &mut x)?;
++                if let Err(SimError::NonFiniteSolution { unknown }) =
++                    NonlinearSolver::ensure_finite(&x)
++                {
++                    return Err(SimError::TransientFailure {
++                        time: t_next,
++                        reason: format!(
++                            "non-finite value (overflow or NaN) in MNA unknown {unknown}"
++                        ),
++                    });
++                }
+                 Self::commit_reactive_history(topo, &x);
+ 
+                 t = t_next;
+diff -ruN -x target -x '*.orig' orig/crates/rustspice-solver/tests/resource_budget.rs RustSpice/crates/rustspice-solver/tests/resource_budget.rs
+--- a/crates/rustspice-solver/tests/resource_budget.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/crates/rustspice-solver/tests/resource_budget.rs	2026-10-27 21:15:45.464764483 +0100
+@@ -0,0 +1,153 @@
++//! Point-count budgets of `.dc` / `.tran` and the non-finite solution guard (AGENTS.md Rule 9).
++//! Expected point counts come from the closed forms `floor(tstop/tstep)+1` and `floor((stop-start)/step)+1`.
++
++use rustspice_core::{ResourceLimits, SimError};
++use rustspice_solver::Simulator;
++
++const RC: &str = "rc\nV1 1 0 PULSE(0 5 0 1n 1n 1 2)\nR1 1 2 1k\nC1 2 0 1n\n.op\n.end\n";
++const DIV: &str = "div\nV1 1 0 5\nR1 1 2 1k\nR2 2 0 1k\n.op\n.end\n";
++
++fn sim_with(deck: &str, f: impl FnOnce(&mut ResourceLimits)) -> Simulator {
++    let mut sim = Simulator::from_spice(deck).unwrap();
++    let mut lim = ResourceLimits::default();
++    f(&mut lim);
++    sim.set_limits(lim);
++    sim
++}
++
++fn resource(e: SimError) -> &'static str {
++    match e {
++        SimError::ResourceLimit { resource, .. } => resource,
++        other => panic!("expected ResourceLimit, got {other:?}"),
++    }
++}
++
++#[test]
++fn tran_point_budget_refuses_before_allocating() {
++    // 1e12 points would be an 8 TB reservation in the former `Vec::with_capacity`; 1e300 saturated usize
++    for (tstep, tstop) in [(1e-12, 1.0), (1e-9, 1000.0), (1.0, 1e300), (1e-9, 1.0)] {
++        let mut sim = sim_with(RC, |_| {});
++        let t0 = std::time::Instant::now();
++        let e = sim.run_transient(tstep, tstop).expect_err("budget");
++        assert_eq!(resource(e), "transient_points");
++        assert!(
++            t0.elapsed().as_secs_f64() < 1.0,
++            "refusal must not do the work"
++        );
++    }
++}
++
++#[test]
++fn tran_nonfinite_or_nonpositive_bounds_are_refused() {
++    for (tstep, tstop) in [
++        (1e-9, f64::INFINITY),
++        (f64::NAN, 1.0),
++        (1e-9, f64::NAN),
++        (0.0, 1.0),
++        (1e-9, -1.0),
++    ] {
++        let mut sim = sim_with(RC, |_| {});
++        assert!(matches!(
++            sim.run_transient(tstep, tstop),
++            Err(SimError::TransientFailure { .. })
++        ));
++    }
++}
++
++#[test]
++fn tran_within_budget_returns_the_closed_form_row_count() {
++    // tstep 0.5 s, tstop 64 s (ratio exactly 128): floor(64 / 0.5) + 1 = 129 rows; the estimate is
++    // ceil(128) + 2 = 130, so max_points = 130 admits it and 129 does not (conservative by design)
++    let mut sim = sim_with(RC, |l| l.max_points = 130);
++    let r = sim.run_transient(0.5, 64.0).expect("fits");
++    assert_eq!(r.time_points.len(), 129);
++    assert_eq!(r.waveforms.len(), 129);
++    let mut sim = sim_with(RC, |l| l.max_points = 129);
++    assert_eq!(
++        resource(sim.run_transient(0.5, 64.0).unwrap_err()),
++        "transient_points"
++    );
++}
++
++#[test]
++fn result_byte_budget_scales_with_dimension() {
++    let dim = Simulator::from_spice(RC).unwrap().topology.soa.mna_dim;
++    assert_eq!(dim, 3);
++    let per = ResourceLimits::bytes_per_point(dim);
++    assert_eq!(per, 72);
++    let mut sim = sim_with(RC, |l| l.max_result_bytes = 130 * per);
++    assert_eq!(sim.run_transient(0.5, 64.0).unwrap().time_points.len(), 129);
++    let mut sim = sim_with(RC, |l| l.max_result_bytes = 129 * per);
++    assert_eq!(
++        resource(sim.run_transient(0.5, 64.0).unwrap_err()),
++        "transient_points"
++    );
++}
++
++#[test]
++fn dc_sweep_point_budget() {
++    for (start, stop, step) in [(0.0, 1.0, 1e-9), (0.0, 1.0, 1e-320), (0.0, 1e300, 1.0)] {
++        let mut sim = sim_with(DIV, |_| {});
++        let t0 = std::time::Instant::now();
++        let e = sim
++            .run_dc_sweep("V1", start, stop, step)
++            .expect_err("budget");
++        assert_eq!(resource(e), "dc_sweep_points");
++        assert!(t0.elapsed().as_secs_f64() < 1.0);
++    }
++    // within budget: 0..1 step 0.1 -> 11 points
++    let mut sim = sim_with(DIV, |_| {});
++    let r = sim.run_dc_sweep("V1", 0.0, 1.0, 0.1).unwrap();
++    assert_eq!(r.sweep_values.len(), 11);
++    assert!((r.solutions[10][1] - 0.5).abs() < 1e-12);
++}
++
++#[test]
++fn dc_sweep_that_cannot_advance_is_refused() {
++    // ulp(1e17) = 16: `cur += 1.0` never changes `cur`; the former loop appended points forever
++    let mut sim = sim_with(DIV, |_| {});
++    let e = sim
++        .run_dc_sweep("V1", 1e17, 1e17 + 100.0, 1.0)
++        .expect_err("no progress");
++    assert!(matches!(e, SimError::TopologyError(m) if m.contains("cannot advance")));
++}
++
++#[test]
++fn dc_sweep_nonfinite_bounds_are_refused() {
++    let mut sim = sim_with(DIV, |_| {});
++    for (a, b, c) in [
++        (0.0, f64::INFINITY, 1.0),
++        (f64::NAN, 1.0, 1.0),
++        (0.0, 1.0, f64::NAN),
++    ] {
++        assert!(matches!(
++            sim.run_dc_sweep("V1", a, b, c),
++            Err(SimError::TopologyError(_))
++        ));
++    }
++}
++
++#[test]
++fn linear_overflow_is_a_loud_error_not_inf_output() {
++    // v(1) = 1e308 V across 2 x 1 mohm: i(v1) = -5e310 A is not representable in f64
++    let mut sim =
++        Simulator::from_spice("ovf\nV1 1 0 1e308\nR1 1 2 1e-3\nR2 2 0 1e-3\n.op\n.end\n").unwrap();
++    assert!(matches!(
++        sim.run_dc_op(),
++        Err(SimError::NonFiniteSolution { .. })
++    ));
++    // the same circuit at 1 V solves (control: the guard does not fire on finite results)
++    let mut ok =
++        Simulator::from_spice("ok\nV1 1 0 1\nR1 1 2 1e-3\nR2 2 0 1e-3\n.op\n.end\n").unwrap();
++    let op = ok.run_dc_op().unwrap();
++    assert!((op.solution[0] - 1.0).abs() < 1e-12 && (op.solution[1] - 0.5).abs() < 1e-12);
++}
++
++#[test]
++fn open_circuit_resistor_literal_still_solves() {
++    // control for the guard: 1e999 parses to +inf = open circuit, the finite answer v(2) = 5 V is unchanged
++    let mut sim =
++        Simulator::from_spice("open\nV1 1 0 5\nR1 1 2 1k\nR2 2 0 1e999\n.op\n.end\n").unwrap();
++    let op = sim.run_dc_op().unwrap();
++    assert!((op.solution[0] - 5.0).abs() < 1e-12 && (op.solution[1] - 5.0).abs() < 1e-12);
++}

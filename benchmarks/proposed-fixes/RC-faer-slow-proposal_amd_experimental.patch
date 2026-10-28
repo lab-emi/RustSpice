@@ -1,0 +1,161 @@
+--- a/crates/rustspice-solver/src/linear.rs
++++ b/crates/rustspice-solver/src/linear.rs
+@@ -44,6 +44,19 @@
+     factored: bool,
+ }
+ 
++struct AmdCache {
++    col_ptr: Vec<usize>,
++    row_idx: Vec<usize>,
++    cperm: Vec<usize>,
++    cperm_inv: Vec<usize>,
++    rperm: Vec<usize>,
++    rperm_inv: Vec<usize>,
++    lu: faer::sparse::linalg::lu::simplicial::SimplicialLu<usize, f64>,
++    factor_mem: GlobalPodBuffer,
++    work: Mat<f64>,
++    factored: bool,
++}
++
+ /// Adaptive sparse linear solver maintaining pre-allocated workspaces (`lu_buf`, `work_vec`)
+ /// so that hot-loop Newton-Raphson and Transient solves incur **zero heap allocations**.
+ pub struct AdaptiveSparseSolver {
+@@ -53,6 +66,7 @@
+     lu_buf: Vec<f64>,
+     work_vec: Vec<f64>,
+     faer: Option<FaerLuCache>,
++    amd: Option<AmdCache>,
+     has_valid_factors: bool,
+ }
+ 
+@@ -82,6 +96,7 @@
+                     lu_buf: vec![0.0; lu_nnz],
+                     work_vec: vec![0.0; dim],
+                     faer: None,
++                    amd: None,
+                     has_valid_factors: false,
+                 });
+             }
+@@ -94,6 +109,7 @@
+             lu_buf: Vec::new(),
+             work_vec: vec![0.0; dim],
+             faer: None,
++            amd: None,
+             has_valid_factors: false,
+         })
+     }
+@@ -151,7 +167,9 @@
+             jit.symbolic.solve(&self.lu_buf, rhs, x);
+             return Ok(());
+         }
+-        if self.faer.as_ref().is_some_and(|c| c.factored) {
++        if self.faer.as_ref().is_some_and(|c| c.factored)
++            || self.amd.as_ref().is_some_and(|c| c.factored)
++        {
+             self.solve_faer(rhs, x);
+             return Ok(());
+         }
+@@ -215,7 +233,82 @@
+     /// only on the sparsity pattern, which is fixed for a compiled topology: it is built once and reused;
+     /// every call after the first only runs the numeric phase (with partial pivoting, so the row pivots still
+     /// follow the current values) into the retained `NumericLu` storage and workspace.
++    fn factorize_amd(&mut self, csc: &CscMatrix<f64>) -> SimResult<()> {
++        use faer::sparse::linalg::{amd, lu::simplicial};
++        let n = csc.nrows;
++        let sym = unsafe {
++            SymbolicSparseColMatRef::new_unchecked(
++                n,
++                n,
++                csc.col_ptr.as_slice(),
++                None,
++                csc.row_idx.as_slice(),
++            )
++        };
++        let mat = SparseColMatRef::new(sym, csc.values.as_slice());
++        let ok = self
++            .amd
++            .as_ref()
++            .is_some_and(|c| c.col_ptr == csc.col_ptr && c.row_idx == csc.row_idx);
++        if !ok {
++            let mut cperm = vec![0usize; n];
++            let mut cperm_inv = vec![0usize; n];
++            let req = amd::order_maybe_unsorted_req::<usize>(n, csc.values.len())
++                .map_err(|_| SimError::SingularMatrix { index: 0 })?;
++            let mut mem = GlobalPodBuffer::new(req);
++            amd::order_maybe_unsorted(
++                &mut cperm,
++                &mut cperm_inv,
++                sym,
++                amd::Control::default(),
++                PodStack::new(&mut mem),
++            )
++            .map_err(|_| SimError::SingularMatrix { index: 0 })?;
++            let freq = simplicial::factorize_simplicial_numeric_lu_req::<usize, f64>(n, n)
++                .map_err(|_| SimError::SingularMatrix { index: 0 })?;
++            self.amd = Some(AmdCache {
++                col_ptr: csc.col_ptr.clone(),
++                row_idx: csc.row_idx.clone(),
++                cperm,
++                cperm_inv,
++                rperm: vec![0; n],
++                rperm_inv: vec![0; n],
++                lu: simplicial::SimplicialLu::new(),
++                factor_mem: GlobalPodBuffer::new(freq),
++                work: Mat::<f64>::zeros(n, 1),
++                factored: false,
++            });
++        }
++        let c = self.amd.as_mut().unwrap();
++        c.factored = false;
++        let cp = faer::perm::PermRef::<usize>::new_checked(&c.cperm, &c.cperm_inv, n);
++        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            simplicial::factorize_simplicial_numeric_lu(
++                &mut c.rperm,
++                &mut c.rperm_inv,
++                &mut c.lu,
++                mat,
++                cp,
++                PodStack::new(&mut c.factor_mem),
++            )
++        }));
++        match r {
++            Ok(Ok(())) => {
++                c.factored = true;
++                Ok(())
++            }
++            _ => {
++                c.lu = simplicial::SimplicialLu::new();
++                self.has_valid_factors = false;
++                Err(SimError::SingularMatrix { index: 0 })
++            }
++        }
++    }
++
+     fn factorize_faer(&mut self, csc: &CscMatrix<f64>) -> SimResult<()> {
++        if std::env::var_os("RS_ORDER_AMD").is_some() {
++            return self.factorize_amd(csc);
++        }
+         if csc.values.iter().any(|v| !v.is_finite()) {
+             return Err(SimError::SingularMatrix { index: 0 });
+         }
+@@ -295,6 +388,20 @@
+ 
+     fn solve_faer(&mut self, rhs: &[f64], x: &mut [f64]) {
+         let n = self.dim;
++        if let Some(c) = self.amd.as_mut().filter(|c| c.factored) {
++            x[..n].copy_from_slice(&rhs[..n]);
++            let rp = faer::perm::PermRef::<usize>::new_checked(&c.rperm, &c.rperm_inv, n);
++            let cp = faer::perm::PermRef::<usize>::new_checked(&c.cperm, &c.cperm_inv, n);
++            c.lu.solve_in_place_with_conj(
++                rp,
++                cp,
++                Conj::No,
++                faer::mat::from_column_major_slice_mut::<f64, usize, usize>(&mut x[..n], n, 1),
++                faer::Parallelism::None,
++                c.work.as_mut(),
++            );
++            return;
++        }
+         if let Some(cache) = self.faer.as_mut().filter(|c| c.factored) {
+             x[..n].copy_from_slice(&rhs[..n]);
+             // SAFETY: `numeric` is the output of `symbolic.factorize_numeric_lu` for this pattern (`factored`).

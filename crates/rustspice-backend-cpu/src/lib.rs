@@ -12,4 +12,4 @@ pub mod simd;
 
 pub use batch::{BatchCircuitInput, BatchCircuitOutput, BatchCpuExecutor};
 pub use jit::{CraneliftTopologyJit, SymbolicLuOp, UnrolledSymbolicLu};
-pub use simd::{fetlim, pnjlim, CpuSimdBackend};
+pub use simd::{fetlim, pnjlim, CpuSimdBackend, DIODE_EXP_ARG_MAX};

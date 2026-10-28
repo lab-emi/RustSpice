@@ -1,20 +1,20 @@
 //! Command-line interface (`rustspice`) and automated `ngspice` head-to-head verification
 //! and performance benchmark runner.
 
-use std::fmt::Write as FmtWrite;
+mod bench;
+
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use rustspice_backend_cpu::{BatchCircuitInput, CpuSimdBackend};
+use rustspice_backend_cpu::CpuSimdBackend;
 use rustspice_backend_cuda_simt::CudaSimtBackend;
 use rustspice_backend_cuda_tile::{CudaTileBackend, TileShape};
 use rustspice_backend_metal::MetalUmaBackend;
 use rustspice_backend_wasm::WasmWebGpuBackend;
-use rustspice_core::{AnalysisCmd, ComputeBackend, SimResult};
+use rustspice_core::{AnalysisCmd, ComputeBackend, Diagnostic, ResourceLimits, Severity};
 use rustspice_ir::{
     build_diode_ir, build_mosfet_ekv_ir, build_mosfet_level1_ir, emit_cuda_ptx_kernel,
     emit_cuda_tile_kernel, emit_msl_df64_kernel, emit_rust_scalar_fn, emit_wgsl_df64_kernel,
@@ -41,6 +41,30 @@ enum Commands {
         /// Hardware execution backend (`cpu`, `metal`, `cuda-tile`, `cuda-simt`, `wasm`)
         #[arg(long, default_value = "cpu")]
         backend: String,
+        /// Write an ngspice-compatible binary rawfile (one plot per analysis, in execution order)
+        #[arg(long)]
+        raw: Option<PathBuf>,
+        /// Write a JSON timing/status summary (unavailable numbers are null)
+        #[arg(long)]
+        stats: Option<PathBuf>,
+        /// Refuse the deck (exit 1) when the reader had to ignore, approximate or re-interpret anything
+        #[arg(long)]
+        strict: bool,
+        /// Maximum stored `.dc` / `.tran` points per analysis [default: 50000000]
+        #[arg(long)]
+        max_points: Option<u64>,
+        /// Maximum MiB held by the stored result of one analysis [default: 1024]
+        #[arg(long)]
+        max_result_mib: Option<u64>,
+        /// Maximum `.subckt` instantiation depth [default: 1000]
+        #[arg(long)]
+        max_subckt_depth: Option<usize>,
+        /// Maximum cards visited while flattening subcircuits [default: 2000000]
+        #[arg(long)]
+        max_expanded_cards: Option<usize>,
+        /// Maximum MiB of flattened netlist text [default: 256]
+        #[arg(long)]
+        max_expanded_mib: Option<usize>,
     },
     /// Compute Discrete Adjoint parameter sensitivities at the DC operating point
     Adjoint {
@@ -59,89 +83,71 @@ enum Commands {
         #[arg(long, default_value = "msl")]
         target: String,
     },
-    /// Run head-to-head accuracy and speed benchmarks against local `ngspice`
-    BenchNgspice {
-        /// Path to write the Markdown benchmark report
-        #[arg(long, default_value = "docs/benchmark_report.md")]
-        output: PathBuf,
-    },
+    /// Run the differential capability / accuracy / robustness / performance suite against local `ngspice`
+    BenchSuite(bench::SuiteArgs),
+    /// Run the six legacy head-to-head benchmarks against local `ngspice` (interleaved subprocess timing, tight references)
+    BenchNgspice(bench::legacy::LegacyArgs),
 }
 
-fn select_backend(name: &str) -> Arc<dyn ComputeBackend> {
+fn select_backend(name: &str) -> Result<Arc<dyn ComputeBackend>, String> {
     match name.to_ascii_lowercase().as_str() {
-        "metal" => Arc::new(MetalUmaBackend::new()),
-        "cuda-tile" => Arc::new(CudaTileBackend::new(TileShape::default())),
-        "cuda-simt" => Arc::new(CudaSimtBackend::new()),
-        "wasm" => Arc::new(WasmWebGpuBackend::default()),
-        _ => Arc::new(CpuSimdBackend::new()),
+        "cpu" | "cpu-simd" => Ok(Arc::new(CpuSimdBackend::new())),
+        "metal" => Ok(Arc::new(MetalUmaBackend::new())),
+        "cuda-tile" => Ok(Arc::new(CudaTileBackend::new(TileShape::default()))),
+        "cuda-simt" => Ok(Arc::new(CudaSimtBackend::new())),
+        "wasm" => Ok(Arc::new(WasmWebGpuBackend::default())),
+        other => Err(format!(
+            "unknown backend `{other}` (expected one of: cpu, metal, cuda-tile, cuda-simt, wasm)"
+        )),
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run { netlist, backend } => {
-            let src = fs::read_to_string(&netlist)?;
-            let backend_arc = select_backend(&backend);
-            let t0 = Instant::now();
-            let mut sim = Simulator::from_spice_with_backend(&src, backend_arc)?;
-            let compile_us = t0.elapsed().as_secs_f64() * 1e6;
-
-            println!(
-                "=== RustSpice Simulation: {} (Backend: {}, Solver: {:?}, Compile: {:.1} us) ===",
-                sim.netlist.title,
-                sim.backend.backend_name(),
-                sim.linear_solver.kind,
-                compile_us
-            );
-
-            let analyses = sim.netlist.analyses.clone();
-            for cmd in analyses {
-                match cmd {
-                    AnalysisCmd::Op => {
-                        let t_run = Instant::now();
-                        let res = sim.run_dc_op()?;
-                        let run_us = t_run.elapsed().as_secs_f64() * 1e6;
-                        println!(
-                            "[DC OP] Converged in {} iterations ({:.1} us, max residual = {:.3e} A)",
-                            res.iterations, run_us, res.max_residual
-                        );
-                        for node_id in 1..sim.netlist.node_names.len().min(16) {
-                            let name = &sim.netlist.node_names[node_id];
-                            println!("  V({name}) = {:.9} V", res.solution[node_id - 1]);
-                        }
-                    }
-                    AnalysisCmd::Dc {
-                        source_name,
-                        start,
-                        stop,
-                        step,
-                    } => {
-                        let t_run = Instant::now();
-                        let res = sim.run_dc_sweep(&source_name, start, stop, step)?;
-                        let run_us = t_run.elapsed().as_secs_f64() * 1e6;
-                        println!(
-                            "[DC Sweep] {} points on `{}` ({} total NR iterations, {:.1} us)",
-                            res.sweep_values.len(),
-                            source_name,
-                            res.total_iterations,
-                            run_us
-                        );
-                    }
-                    AnalysisCmd::Tran { tstep, tstop, .. } => {
-                        let t_run = Instant::now();
-                        let res = sim.run_transient(tstep, tstop)?;
-                        let run_us = t_run.elapsed().as_secs_f64() * 1e6;
-                        println!(
-                            "[Transient] {} time points up to {:.3e}s ({} NR iters, {} LU factorizations, {:.1} us)",
-                            res.time_points.len(),
-                            tstop,
-                            res.total_nr_iterations,
-                            res.lu_factorizations,
-                            run_us
-                        );
-                    }
+        Commands::Run {
+            netlist,
+            backend,
+            raw,
+            stats,
+            strict,
+            max_points,
+            max_result_mib,
+            max_subckt_depth,
+            max_expanded_cards,
+            max_expanded_mib,
+        } => {
+            let mut limits = ResourceLimits::default();
+            if let Some(v) = max_points {
+                limits.max_points = v;
+            }
+            if let Some(v) = max_result_mib {
+                limits.max_result_bytes = v.saturating_mul(1 << 20);
+            }
+            if let Some(v) = max_subckt_depth {
+                limits.max_subckt_depth = v;
+            }
+            if let Some(v) = max_expanded_cards {
+                limits.max_expanded_cards = v;
+            }
+            if let Some(v) = max_expanded_mib {
+                limits.max_expanded_bytes = v.saturating_mul(1 << 20);
+            }
+            if let Err(e) = run_deck(
+                &netlist,
+                &backend,
+                raw.as_deref(),
+                stats.as_deref(),
+                strict,
+                &limits,
+            ) {
+                if e.downcast_ref::<RawWriteError>().is_some() {
+                    // a harness-side I/O failure (full or read-only scratch disk) is not a simulator failure:
+                    // the dedicated exit code lets `bench-suite` classify the case `unverified`, not `loud_error`
+                    eprintln!("Error: {e}");
+                    std::process::exit(bench::rustsim::HARNESS_IO_EXIT);
                 }
+                return Err(e);
             }
         }
         Commands::Adjoint {
@@ -150,6 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let src = fs::read_to_string(&netlist)?;
             let mut sim = Simulator::from_spice(&src)?;
+            report_diagnostics(&sim.netlist.diagnostics);
             let mut specs: Vec<ParameterGradSpec> = Vec::new();
             for rname in &sim.topology.soa.res_names {
                 specs.push(ParameterGradSpec::new(rname.clone(), "r"));
@@ -169,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 adj.gradients.len(),
                 adj_us
             );
-            for (spec, &grad) in specs.iter().zip(adj.gradients.iter()).take(15) {
+            for (spec, &grad) in specs.iter().zip(adj.gradients.iter()) {
                 println!(
                     "  dV({target_node})/d({}.{}) = {:.9e}",
                     spec.device_name, spec.param_name, grad
@@ -179,563 +186,390 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Codegen { model, target } => {
             let ir = match model.as_str() {
                 "diode" => build_diode_ir(),
+                "mosfet-l1" => build_mosfet_level1_ir(),
                 "mosfet-ekv" => build_mosfet_ekv_ir(),
-                _ => build_mosfet_level1_ir(),
+                other => {
+                    return Err(format!(
+                        "unknown device model `{other}` (expected one of: diode, mosfet-l1, mosfet-ekv)"
+                    )
+                    .into());
+                }
             };
             let code = match target.as_str() {
+                "msl" => emit_msl_df64_kernel(&ir),
                 "wgsl" => emit_wgsl_df64_kernel(&ir),
                 "cuda-tile" => emit_cuda_tile_kernel(&ir, 128),
                 "cuda-ptx" => emit_cuda_ptx_kernel(&ir),
                 "rust" => emit_rust_scalar_fn(&ir),
-                _ => emit_msl_df64_kernel(&ir),
+                other => {
+                    return Err(format!(
+                        "unknown codegen target `{other}` (expected one of: msl, wgsl, cuda-tile, cuda-ptx, rust)"
+                    )
+                    .into());
+                }
             };
             println!("{code}");
         }
-        Commands::BenchNgspice { output } => {
-            run_ngspice_benchmark_suite(&output)?;
+        Commands::BenchSuite(args) => {
+            std::process::exit(bench::run_suite(args));
+        }
+        Commands::BenchNgspice(args) => {
+            std::process::exit(bench::legacy::run(args));
         }
     }
     Ok(())
 }
 
-struct BenchEntry {
-    name: String,
-    circuit_desc: String,
-    ngspice_wall_ms: f64,
-    ngspice_internal_ms: f64,
-    rustspice_total_ms: f64,
-    rustspice_solve_ms: f64,
-    max_abs_error_v: f64,
-    speedup_e2e: f64,
-    speedup_solver: f64,
+/// One analysis result waiting to be written to the rawfile.
+struct RawPlotOut {
+    plotname: &'static str,
+    vars: Vec<bench::rawfile::Var>,
+    /// Sweep / time axis (becomes variable 0); `None` for `.op`.
+    axis: Option<Vec<f64>>,
+    rows: Vec<Vec<f64>>,
 }
 
-fn parse_ngspice_internal_time_ms(stdout: &str) -> Option<f64> {
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("Total analysis time (seconds) =") {
-            if let Ok(sec) = rest.trim().parse::<f64>() {
-                return Some(sec * 1000.0);
-            }
+/// `v(node)` / `i(vsrc)` / `i(lname)` labels of the MNA unknowns, lower-case like ngspice.
+fn mna_labels(sim: &Simulator) -> Vec<String> {
+    let soa = &sim.topology.soa;
+    let mut l: Vec<String> = vec![String::new(); soa.mna_dim];
+    for (i, n) in sim.netlist.node_names.iter().enumerate().skip(1) {
+        l[i - 1] = format!("v({})", n.to_ascii_lowercase());
+    }
+    for (k, name) in soa.vsrc_names.iter().enumerate() {
+        l[soa.vsrc_branch_idx[k]] = format!("i({})", name.to_ascii_lowercase());
+    }
+    for (k, name) in soa.ind_names.iter().enumerate() {
+        l[soa.ind_branch_idx[k]] = format!("i({})", name.to_ascii_lowercase());
+    }
+    for (i, s) in l.iter_mut().enumerate() {
+        if s.is_empty() {
+            *s = format!("x({i})");
         }
-        if let Some(rest) = trimmed.strip_prefix("Total elapsed time (seconds) =") {
-            if let Ok(sec) = rest.trim().parse::<f64>() {
-                return Some(sec * 1000.0);
+    }
+    l
+}
+
+fn raw_vars(labels: &[String]) -> Vec<bench::rawfile::Var> {
+    labels
+        .iter()
+        .map(|n| bench::rawfile::Var {
+            name: n.clone(),
+            kind: if n.starts_with("i(") {
+                "current"
+            } else {
+                "voltage"
+            }
+            .to_string(),
+        })
+        .collect()
+}
+
+/// Peak resident set (`VmHWM`) of this process in KiB, if `/proc` is available.
+fn peak_rss_kib() -> Option<u64> {
+    let s = fs::read_to_string("/proc/self/status").ok()?;
+    let line = s.lines().find(|l| l.starts_with("VmHWM:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[derive(Default, serde::Serialize)]
+struct AnalysisStat {
+    analysis: &'static str,
+    analysis_us: Option<f64>,
+    points: Option<u64>,
+}
+
+#[derive(Default, serde::Serialize)]
+struct RunStats {
+    parse_us: Option<f64>,
+    compile_us: Option<f64>,
+    solver_kind: Option<String>,
+    /// Not separable from `compile_us` with the current `Simulator` facade.
+    solver_compile_us: Option<f64>,
+    analysis: Option<String>,
+    analysis_us: Option<f64>,
+    write_us: Option<f64>,
+    peak_rss_kib: Option<u64>,
+    points: Option<u64>,
+    status: Option<String>,
+    analyses: Vec<AnalysisStat>,
+}
+
+/// Prints every reader diagnostic on stderr (`warning[code]: line N: ...`) and returns the number of warnings.
+/// Diagnostics never change the exit code unless `--strict` is given.
+fn report_diagnostics(diags: &[Diagnostic]) -> usize {
+    let mut warnings = 0;
+    for d in diags {
+        eprintln!("{}", d.render());
+        if d.severity == Severity::Warning {
+            warnings += 1;
+        }
+    }
+    if warnings > 0 {
+        eprintln!(
+            "rustspice: {warnings} reader warning(s): parts of this deck were ignored, approximated or re-interpreted, so the results may differ from SPICE (--strict refuses such decks)"
+        );
+    }
+    warnings
+}
+
+/// `rustspice run`: unchanged stdout; optionally a rawfile (written only after every analysis succeeded) and a
+/// stats JSON (also written on failure, with `status = "error: ..."`).
+fn run_deck(
+    netlist: &std::path::Path,
+    backend: &str,
+    raw: Option<&std::path::Path>,
+    stats_path: Option<&std::path::Path>,
+    strict: bool,
+    limits: &ResourceLimits,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(r) = raw {
+        // never leave a stale or partial rawfile behind a failed run
+        let _ = fs::remove_file(r);
+    }
+    let mut stats = RunStats::default();
+    let result = run_deck_inner(netlist, backend, raw, &mut stats, strict, limits);
+    stats.peak_rss_kib = peak_rss_kib();
+    stats.status = Some(match &result {
+        Ok(()) => "ok".to_string(),
+        Err(e) => format!("error: {e}"),
+    });
+    if let Some(sp) = stats_path {
+        if let Ok(text) = serde_json::to_string_pretty(&stats) {
+            if let Err(e) = fs::write(sp, text) {
+                eprintln!("warning: cannot write stats file {}: {e}", sp.display());
             }
         }
     }
-    None
+    result
 }
 
-fn parse_ngspice_printed_value(stdout: &str, var_prefix: &str) -> Option<f64> {
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(var_prefix) {
-            let rest_trimmed = rest.trim_start();
-            if let Some(val_str) = rest_trimmed.strip_prefix('=') {
-                if let Ok(v) = val_str.trim().parse::<f64>() {
-                    return Some(v);
+fn run_deck_inner(
+    netlist: &std::path::Path,
+    backend: &str,
+    raw: Option<&std::path::Path>,
+    stats: &mut RunStats,
+    strict: bool,
+    limits: &ResourceLimits,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let src = fs::read_to_string(netlist)?;
+    let backend_arc = select_backend(backend)?;
+    let t0 = Instant::now();
+    let parsed = rustspice_core::parse_netlist_with_limits(&src, limits)?;
+    stats.parse_us = Some(t0.elapsed().as_secs_f64() * 1e6);
+    let n_warnings = report_diagnostics(&parsed.diagnostics);
+    for r in &parsed.resistors {
+        if rustspice_core::soa::resistance_is_floored(r.resistance) {
+            eprintln!(
+                "warning: resistor {} has zero resistance; it is stamped as {:e} ohm",
+                r.name,
+                rustspice_core::soa::ZERO_OHM_SUBSTITUTE
+            );
+        }
+    }
+    if strict && n_warnings > 0 {
+        return Err(format!(
+            "{n_warnings} reader warning(s) treated as errors (--strict): the deck uses constructs RustSpice ignores or approximates"
+        )
+        .into());
+    }
+    let t1 = Instant::now();
+    let mut sim = Simulator::from_netlist(parsed, backend_arc)?;
+    sim.set_limits(*limits);
+    let compile_us = t1.elapsed().as_secs_f64() * 1e6;
+    stats.compile_us = Some(compile_us);
+    stats.solver_kind = Some(format!("{:?}", sim.linear_solver.kind));
+
+    println!(
+        "=== RustSpice Simulation: {} (Backend: {}, Solver: {:?}, Compile: {:.1} us) ===",
+        sim.netlist.title,
+        sim.backend.backend_name(),
+        sim.linear_solver.kind,
+        compile_us
+    );
+
+    let labels = mna_labels(&sim);
+    let mut plots: Vec<RawPlotOut> = Vec::new();
+    let analyses = sim.netlist.analyses.clone();
+    let mut total_us = 0.0;
+    let mut total_pts = 0u64;
+    let mut kinds: Vec<&'static str> = Vec::new();
+    for cmd in analyses {
+        match cmd {
+            AnalysisCmd::Op => {
+                let t_run = Instant::now();
+                let res = sim.run_dc_op()?;
+                let run_us = t_run.elapsed().as_secs_f64() * 1e6;
+                println!(
+                    "[DC OP] Converged in {} iterations ({:.1} us, max residual = {:.3e} A)",
+                    res.iterations, run_us, res.max_residual
+                );
+                for node_id in 1..sim.netlist.node_names.len().min(16) {
+                    let name = &sim.netlist.node_names[node_id];
+                    println!("  V({name}) = {:.9} V", res.solution[node_id - 1]);
+                }
+                stats.analyses.push(AnalysisStat {
+                    analysis: "op",
+                    analysis_us: Some(run_us),
+                    points: Some(1),
+                });
+                total_us += run_us;
+                total_pts += 1;
+                kinds.push("op");
+                if raw.is_some() {
+                    plots.push(RawPlotOut {
+                        plotname: "Operating Point",
+                        vars: raw_vars(&labels),
+                        axis: None,
+                        rows: vec![res.solution],
+                    });
+                }
+            }
+            AnalysisCmd::Dc {
+                source_name,
+                start,
+                stop,
+                step,
+            } => {
+                let t_run = Instant::now();
+                let res = sim.run_dc_sweep(&source_name, start, stop, step)?;
+                let run_us = t_run.elapsed().as_secs_f64() * 1e6;
+                println!(
+                    "[DC Sweep] {} points on `{}` ({} total NR iterations, {:.1} us)",
+                    res.sweep_values.len(),
+                    source_name,
+                    res.total_iterations,
+                    run_us
+                );
+                let n = res.sweep_values.len() as u64;
+                stats.analyses.push(AnalysisStat {
+                    analysis: "dc",
+                    analysis_us: Some(run_us),
+                    points: Some(n),
+                });
+                total_us += run_us;
+                total_pts += n;
+                kinds.push("dc");
+                if raw.is_some() {
+                    // ngspice names the sweep vector `v(v-sweep)` / `i(i-sweep)` after the source type
+                    let k = if source_name.to_ascii_lowercase().starts_with('i') {
+                        "i"
+                    } else {
+                        "v"
+                    };
+                    let mut vars = vec![bench::rawfile::Var {
+                        name: format!("{k}({k}-sweep)"),
+                        kind: if k == "i" { "current" } else { "voltage" }.to_string(),
+                    }];
+                    vars.extend(raw_vars(&labels));
+                    plots.push(RawPlotOut {
+                        plotname: "DC transfer characteristic",
+                        vars,
+                        axis: Some(res.sweep_values),
+                        rows: res.solutions,
+                    });
+                }
+            }
+            AnalysisCmd::Tran { tstep, tstop, .. } => {
+                let t_run = Instant::now();
+                let res = sim.run_transient(tstep, tstop)?;
+                let run_us = t_run.elapsed().as_secs_f64() * 1e6;
+                println!(
+                    "[Transient] {} time points up to {:.3e}s ({} NR iters, {} LU factorizations, {:.1} us)",
+                    res.time_points.len(),
+                    tstop,
+                    res.total_nr_iterations,
+                    res.lu_factorizations,
+                    run_us
+                );
+                let n = res.time_points.len() as u64;
+                stats.analyses.push(AnalysisStat {
+                    analysis: "tran",
+                    analysis_us: Some(run_us),
+                    points: Some(n),
+                });
+                total_us += run_us;
+                total_pts += n;
+                kinds.push("tran");
+                if raw.is_some() {
+                    let mut vars = vec![bench::rawfile::Var {
+                        name: "time".to_string(),
+                        kind: "time".to_string(),
+                    }];
+                    vars.extend(raw_vars(&labels));
+                    plots.push(RawPlotOut {
+                        plotname: "Transient Analysis",
+                        vars,
+                        axis: Some(res.time_points),
+                        rows: res.waveforms,
+                    });
                 }
             }
         }
     }
-    None
-}
-
-fn run_ngspice_deck(deck_content: &str, temp_name: &str) -> (f64, f64, String) {
-    let tmp_path = std::env::temp_dir().join(temp_name);
-    fs::write(&tmp_path, deck_content).expect("Failed to write temporary SPICE deck");
-
-    // Warmup run
-    let _ = Command::new("ngspice").arg("-b").arg(&tmp_path).output();
-
-    let runs = 3;
-    let mut best_wall_ms = f64::INFINITY;
-    let mut best_internal_ms = f64::INFINITY;
-    let mut last_stdout = String::new();
-
-    for _ in 0..runs {
-        let t0 = Instant::now();
-        let out = Command::new("ngspice")
-            .arg("-b")
-            .arg(&tmp_path)
-            .output()
-            .expect("Failed to execute ngspice");
-        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        best_wall_ms = best_wall_ms.min(wall_ms);
-        last_stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        if let Some(int_ms) = parse_ngspice_internal_time_ms(&last_stdout) {
-            if int_ms > 0.0 {
-                best_internal_ms = best_internal_ms.min(int_ms);
+    if let Some(from) = sim.linear_solver.demoted_from {
+        // The unrolled LU's frozen pivot order became unstable and the pivoting tier took over.
+        stats.solver_kind = Some(format!("{:?}>{:?}", from, sim.linear_solver.kind));
+        eprintln!(
+            "note: {:?} pivot order became numerically unstable; continued with {:?}",
+            from, sim.linear_solver.kind
+        );
+    }
+    if !kinds.is_empty() {
+        stats.analysis = Some(kinds.join("+"));
+        stats.analysis_us = Some(total_us);
+        stats.points = Some(total_pts);
+    }
+    if let Some(raw_path) = raw {
+        let t_w = Instant::now();
+        let tmp = raw_path.with_extension("raw.partial");
+        let written = (|| -> std::io::Result<()> {
+            {
+                let f = fs::File::create(&tmp)?;
+                let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+                for p in &plots {
+                    bench::rawfile::write_rows(
+                        &mut w,
+                        &sim.netlist.title,
+                        p.plotname,
+                        &p.vars,
+                        p.axis.as_deref(),
+                        &p.rows,
+                    )?;
+                }
+                std::io::Write::flush(&mut w)?;
             }
+            fs::rename(&tmp, raw_path)
+        })();
+        if let Err(source) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(Box::new(RawWriteError {
+                path: raw_path.to_path_buf(),
+                source,
+            }));
         }
+        stats.write_us = Some(t_w.elapsed().as_secs_f64() * 1e6);
     }
-    let _ = fs::remove_file(&tmp_path);
-    if !best_internal_ms.is_finite() {
-        best_internal_ms = best_wall_ms;
-    }
-    (best_wall_ms, best_internal_ms, last_stdout)
-}
-
-fn build_resistor_ladder_deck(num_stages: usize, include_ngspice_control: bool) -> String {
-    let mut s = String::with_capacity(num_stages * 40);
-    s.push_str("Large Resistor Ladder Power Grid Benchmark\n");
-    s.push_str("V1 1 0 DC 5.0\n");
-    for k in 1..=num_stages {
-        let n_in = k;
-        let n_out = k + 1;
-        let _ = writeln!(s, "Rser{k} {n_in} {n_out} 10.0");
-        let _ = writeln!(s, "Rsh{k} {n_out} 0 10000.0");
-    }
-    s.push_str(".op\n");
-    if include_ngspice_control {
-        let mid = num_stages / 2;
-        let last = num_stages + 1;
-        let _ = writeln!(
-            s,
-            ".control\nset numdgt=12\nop\nprint v({mid}) v({last})\nrusage all\nquit\n.endc"
-        );
-    }
-    s.push_str(".end\n");
-    s
-}
-
-fn build_rc_transmission_line_deck(num_stages: usize, include_ngspice_control: bool) -> String {
-    let mut s = String::with_capacity(num_stages * 50);
-    s.push_str("Distributed RC Transmission Line Transient Benchmark\n");
-    s.push_str("V1 1 0 PULSE(0.0 3.3 0.0 10p 10p 10n 20n)\n");
-    for k in 1..=num_stages {
-        let n_in = k;
-        let n_out = k + 1;
-        let _ = writeln!(s, "R{k} {n_in} {n_out} 5.0");
-        let _ = writeln!(s, "C{k} {n_out} 0 10f");
-    }
-    s.push_str(".tran 10p 5n\n");
-    if include_ngspice_control {
-        let _ = writeln!(s, ".control\ntran 10p 5n\nrusage all\nquit\n.endc");
-    }
-    s.push_str(".end\n");
-    s
-}
-
-fn build_diode_cascade_sweep_deck(num_diodes: usize, include_ngspice_control: bool) -> String {
-    let mut s = String::with_capacity(num_diodes * 60);
-    s.push_str("Nonlinear PN Diode Cascade DC Sweep Benchmark\n");
-    s.push_str(".model DMOD D(IS=1e-14 N=1.05)\n");
-    s.push_str("V1 1 0 DC 5.0\n");
-    for k in 1..=num_diodes {
-        let n_in = if k == 1 { 1 } else { num_diodes + k };
-        let n_mid = num_diodes + k + 1;
-        let _ = writeln!(s, "R{k} 1 {n_mid} 1000.0");
-        let _ = writeln!(s, "D{k} {n_mid} 0 DMOD");
-        let _ = writeln!(s, "Rlink{k} {n_in} {n_mid} 10000.0");
-    }
-    s.push_str(".dc V1 0.0 5.0 0.025\n");
-    if include_ngspice_control {
-        s.push_str(".options reltol=1e-9 vntol=1e-12 abstol=1e-14\n");
-        let check_node = num_diodes + 2;
-        let _ = writeln!(
-            s,
-            ".control\nset numdgt=12\nop\nprint v({check_node})\ndc V1 0.0 5.0 0.025\nrusage all\nquit\n.endc"
-        );
-    }
-    s.push_str(".end\n");
-    s
-}
-
-fn build_cmos_inverter_chain_deck(num_stages: usize, include_ngspice_control: bool) -> String {
-    let mut s = String::with_capacity(num_stages * 100);
-    s.push_str("CMOS Inverter Chain Transient & DC Benchmark\n");
-    s.push_str(".model NMOD NMOS(LEVEL=1 VTO=0.7 KP=120u LAMBDA=0.02)\n");
-    s.push_str(".model PMOD PMOS(LEVEL=1 VTO=-0.7 KP=60u LAMBDA=0.02)\n");
-    s.push_str("VDD vdd 0 DC 3.3\n");
-    s.push_str("VIN in1 0 PULSE(0.0 3.3 0.2n 0.1n 0.1n 2n 4n)\n");
-    for k in 1..=num_stages {
-        let inp = if k == 1 {
-            "in1".to_string()
-        } else {
-            format!("n{}", k - 1)
-        };
-        let out = format!("n{k}");
-        let _ = writeln!(s, "MP{k} {out} {inp} vdd vdd PMOD W=20u L=1u");
-        let _ = writeln!(s, "MN{k} {out} {inp} 0 0 NMOD W=10u L=1u");
-        let _ = writeln!(s, "CL{k} {out} 0 20f");
-    }
-    s.push_str(".tran 5p 2n\n");
-    if include_ngspice_control {
-        let last = format!("n{num_stages}");
-        let _ = writeln!(
-            s,
-            ".control\nset numdgt=12\nop\nprint v(n1) v({last})\ntran 5p 2n\nrusage all\nquit\n.endc"
-        );
-    }
-    s.push_str(".end\n");
-    s
-}
-
-fn run_ngspice_benchmark_suite(output_path: &PathBuf) -> SimResult<()> {
-    println!("================================================================================");
-    println!("  RustSpice vs. ngspice-47 (KLU) Head-to-Head Accuracy & Performance Suite");
-    println!("================================================================================");
-
-    let mut entries: Vec<BenchEntry> = Vec::new();
-
-    // -------------------------------------------------------------------------
-    // Benchmark 1: 5,000-Stage (5,002-Dim) Resistor Ladder Power Grid (.op)
-    // -------------------------------------------------------------------------
-    {
-        let stages = 5_000;
-        let ng_deck = build_resistor_ladder_deck(stages, true);
-        let rs_deck = build_resistor_ladder_deck(stages, false);
-        let (ng_wall, ng_int, ng_stdout) = run_ngspice_deck(&ng_deck, "bench_res_grid.sp");
-
-        let mid_node = (stages / 2).to_string();
-        let last_node = (stages + 1).to_string();
-        let ng_v_mid =
-            parse_ngspice_printed_value(&ng_stdout, &format!("v({mid_node})")).unwrap_or(0.0);
-        let ng_v_last =
-            parse_ngspice_printed_value(&ng_stdout, &format!("v({last_node})")).unwrap_or(0.0);
-
-        let mut best_total_ms = f64::INFINITY;
-        let mut best_solve_ms = f64::INFINITY;
-        let mut max_err = 0.0_f64;
-
-        for _ in 0..5 {
-            let t_tot = Instant::now();
-            let mut sim = Simulator::from_spice(&rs_deck)?;
-            let t_sol = Instant::now();
-            let op = sim.run_dc_op()?;
-            let sol_ms = t_sol.elapsed().as_secs_f64() * 1000.0;
-            let tot_ms = t_tot.elapsed().as_secs_f64() * 1000.0;
-            best_total_ms = best_total_ms.min(tot_ms);
-            best_solve_ms = best_solve_ms.min(sol_ms);
-
-            let rs_v_mid = sim.node_voltage(&op.solution, &mid_node).unwrap_or(0.0);
-            let rs_v_last = sim.node_voltage(&op.solution, &last_node).unwrap_or(0.0);
-            max_err = (rs_v_mid - ng_v_mid)
-                .abs()
-                .max((rs_v_last - ng_v_last).abs());
-        }
-
-        entries.push(BenchEntry {
-            name: "1. 5,000-Node Power Grid (DC OP)".to_string(),
-            circuit_desc: "10,000 Resistors, 5,002 MNA variables".to_string(),
-            ngspice_wall_ms: ng_wall,
-            ngspice_internal_ms: ng_int,
-            rustspice_total_ms: best_total_ms,
-            rustspice_solve_ms: best_solve_ms,
-            max_abs_error_v: max_err,
-            speedup_e2e: ng_wall / best_total_ms,
-            speedup_solver: ng_int / best_solve_ms,
-        });
-    }
-
-    // -------------------------------------------------------------------------
-    // Benchmark 2: 2,000-Stage RC Transmission Line (.tran 500 Steps)
-    // -------------------------------------------------------------------------
-    {
-        let stages = 2_000;
-        let ng_deck = build_rc_transmission_line_deck(stages, true);
-        let rs_deck = build_rc_transmission_line_deck(stages, false);
-        let (ng_wall, ng_int, _) = run_ngspice_deck(&ng_deck, "bench_rc_tran.sp");
-
-        let mut best_total_ms = f64::INFINITY;
-        let mut best_solve_ms = f64::INFINITY;
-        for _ in 0..3 {
-            let t_tot = Instant::now();
-            let mut sim = Simulator::from_spice(&rs_deck)?;
-            let t_sol = Instant::now();
-            let _tran = sim.run_transient(10e-12, 5e-9)?;
-            let sol_ms = t_sol.elapsed().as_secs_f64() * 1000.0;
-            let tot_ms = t_tot.elapsed().as_secs_f64() * 1000.0;
-            best_total_ms = best_total_ms.min(tot_ms);
-            best_solve_ms = best_solve_ms.min(sol_ms);
-        }
-
-        entries.push(BenchEntry {
-            name: "2. 2,000-Node RC Line (500-Step Tran)".to_string(),
-            circuit_desc: "4,000 R/C elements, 500 time steps".to_string(),
-            ngspice_wall_ms: ng_wall,
-            ngspice_internal_ms: ng_int,
-            rustspice_total_ms: best_total_ms,
-            rustspice_solve_ms: best_solve_ms,
-            max_abs_error_v: 0.0,
-            speedup_e2e: ng_wall / best_total_ms,
-            speedup_solver: ng_int / best_solve_ms,
-        });
-    }
-
-    // -------------------------------------------------------------------------
-    // Benchmark 3: 64-Stage Nonlinear PN Diode Array (201-Point DC Sweep)
-    // -------------------------------------------------------------------------
-    {
-        let n_diodes = 64;
-        let ng_deck = build_diode_cascade_sweep_deck(n_diodes, true);
-        let rs_deck = build_diode_cascade_sweep_deck(n_diodes, false);
-        let (ng_wall, ng_int, ng_stdout) = run_ngspice_deck(&ng_deck, "bench_diode_sweep.sp");
-
-        let check_node = (n_diodes + 2).to_string();
-        let ng_v_check =
-            parse_ngspice_printed_value(&ng_stdout, &format!("v({check_node})")).unwrap_or(0.0);
-
-        let mut best_total_ms = f64::INFINITY;
-        let mut best_solve_ms = f64::INFINITY;
-        let mut max_err = 0.0_f64;
-
-        for _ in 0..5 {
-            let t_tot = Instant::now();
-            let mut sim = Simulator::from_spice(&rs_deck)?;
-            let t_sol = Instant::now();
-            let sweep = sim.run_dc_sweep("V1", 0.0, 5.0, 0.025)?;
-            let sol_ms = t_sol.elapsed().as_secs_f64() * 1000.0;
-            let tot_ms = t_tot.elapsed().as_secs_f64() * 1000.0;
-            best_total_ms = best_total_ms.min(tot_ms);
-            best_solve_ms = best_solve_ms.min(sol_ms);
-
-            if let Some(last_sol) = sweep.solutions.last() {
-                let rs_v_check = sim.node_voltage(last_sol, &check_node).unwrap_or(0.0);
-                max_err = (rs_v_check - ng_v_check).abs();
-            }
-        }
-
-        entries.push(BenchEntry {
-            name: "3. 64-Diode Nonlinear Array (201-Pt DC Sweep)".to_string(),
-            circuit_desc: "64 Diodes + 128 Resistors, 201 sweep points".to_string(),
-            ngspice_wall_ms: ng_wall,
-            ngspice_internal_ms: ng_int,
-            rustspice_total_ms: best_total_ms,
-            rustspice_solve_ms: best_solve_ms,
-            max_abs_error_v: max_err,
-            speedup_e2e: ng_wall / best_total_ms,
-            speedup_solver: ng_int / best_solve_ms,
-        });
-    }
-
-    // -------------------------------------------------------------------------
-    // Benchmark 4: 100-Stage CMOS Inverter Chain (200 MOSFETs, 400-Step Tran)
-    // -------------------------------------------------------------------------
-    {
-        let stages = 100;
-        let ng_deck = build_cmos_inverter_chain_deck(stages, true);
-        let rs_deck = build_cmos_inverter_chain_deck(stages, false);
-        let (ng_wall, ng_int, ng_stdout) = run_ngspice_deck(&ng_deck, "bench_cmos_chain.sp");
-
-        let last_node = format!("n{stages}");
-        let ng_v_n1 = parse_ngspice_printed_value(&ng_stdout, "v(n1)").unwrap_or(3.3);
-        let ng_v_last =
-            parse_ngspice_printed_value(&ng_stdout, &format!("v({last_node})")).unwrap_or(0.0);
-
-        let mut best_total_ms = f64::INFINITY;
-        let mut best_solve_ms = f64::INFINITY;
-        let mut max_err = 0.0_f64;
-
-        for _ in 0..3 {
-            let t_tot = Instant::now();
-            let mut sim = Simulator::from_spice(&rs_deck)?;
-            let t_sol = Instant::now();
-            let tran = sim.run_transient(5e-12, 2e-9)?;
-            let sol_ms = t_sol.elapsed().as_secs_f64() * 1000.0;
-            let tot_ms = t_tot.elapsed().as_secs_f64() * 1000.0;
-            best_total_ms = best_total_ms.min(tot_ms);
-            best_solve_ms = best_solve_ms.min(sol_ms);
-
-            if let Some(op_sol) = tran.waveforms.first() {
-                let rs_v_n1 = sim.node_voltage(op_sol, "n1").unwrap_or(0.0);
-                let rs_v_last = sim.node_voltage(op_sol, &last_node).unwrap_or(0.0);
-                max_err = (rs_v_n1 - ng_v_n1).abs().max((rs_v_last - ng_v_last).abs());
-            }
-        }
-
-        entries.push(BenchEntry {
-            name: "4. 100-Stage CMOS Inverter Chain (Tran)".to_string(),
-            circuit_desc: "200 NMOS/PMOS + 100 Caps, 400 time steps".to_string(),
-            ngspice_wall_ms: ng_wall,
-            ngspice_internal_ms: ng_int,
-            rustspice_total_ms: best_total_ms,
-            rustspice_solve_ms: best_solve_ms,
-            max_abs_error_v: max_err,
-            speedup_e2e: ng_wall / best_total_ms,
-            speedup_solver: ng_int / best_solve_ms,
-        });
-    }
-
-    // -------------------------------------------------------------------------
-    // Benchmark 5: 200-Parameter Sensitivity (Adjoint vs. 400x ngspice FD)
-    // -------------------------------------------------------------------------
-    {
-        let stages = 100;
-        let ng_deck = build_resistor_ladder_deck(stages, true);
-        let rs_deck = build_resistor_ladder_deck(stages, false);
-        let (single_ng_wall, single_ng_int, _) = run_ngspice_deck(&ng_deck, "bench_sens_base.sp");
-
-        // Central finite difference for 200 resistors in ngspice requires 2 * 200 = 400 runs
-        let num_params = 200;
-        let ng_fd_wall_ms = single_ng_wall * (2.0 * num_params as f64);
-        let ng_fd_int_ms = single_ng_int * (2.0 * num_params as f64);
-
-        let t_tot = Instant::now();
-        let mut sim = Simulator::from_spice(&rs_deck)?;
-        let specs: Vec<ParameterGradSpec> = sim
-            .topology
-            .soa
-            .res_names
-            .iter()
-            .take(num_params)
-            .map(|rname| ParameterGradSpec::new(rname.clone(), "r"))
-            .collect();
-        let t_sol = Instant::now();
-        let target_node = (stages + 1).to_string();
-        let (_op, adj) = sim.run_dc_adjoint(&target_node, &specs)?;
-        let sol_ms = t_sol.elapsed().as_secs_f64() * 1000.0;
-        let tot_ms = t_tot.elapsed().as_secs_f64() * 1000.0;
-
-        // Verify exactness against central finite difference on the first parameter
-        let eps = 1e-4;
-        let base_r = sim.topology.soa.res_resistance[0];
-        sim.topology
-            .soa
-            .set_device_parameter(&specs[0].device_name, "r", base_r + eps)?;
-        let sol_plus = sim.run_dc_op()?.solution;
-        let v_plus = sim.node_voltage(&sol_plus, &target_node).unwrap();
-        sim.topology
-            .soa
-            .set_device_parameter(&specs[0].device_name, "r", base_r - eps)?;
-        let sol_minus = sim.run_dc_op()?.solution;
-        let v_minus = sim.node_voltage(&sol_minus, &target_node).unwrap();
-        let fd_grad = (v_plus - v_minus) / (2.0 * eps);
-        let grad_err = (adj.gradients[0] - fd_grad).abs();
-
-        entries.push(BenchEntry {
-            name: "5. 200-Param Sensitivity (Adjoint vs. FD)".to_string(),
-            circuit_desc: "200 Resistor Gradients (1 Adjoint Solve vs. 400 FD)".to_string(),
-            ngspice_wall_ms: ng_fd_wall_ms,
-            ngspice_internal_ms: ng_fd_int_ms,
-            rustspice_total_ms: tot_ms,
-            rustspice_solve_ms: sol_ms,
-            max_abs_error_v: grad_err,
-            speedup_e2e: ng_fd_wall_ms / tot_ms,
-            speedup_solver: ng_fd_int_ms / sol_ms,
-        });
-    }
-
-    // -------------------------------------------------------------------------
-    // Benchmark 6: 128-Corner Parallel PVT Batch (Rayon Multi-Core vs. ngspice)
-    // -------------------------------------------------------------------------
-    {
-        let n_diodes = 32;
-        let ng_deck = build_diode_cascade_sweep_deck(n_diodes, true);
-        let rs_deck = build_diode_cascade_sweep_deck(n_diodes, false);
-        let (single_ng_wall, single_ng_int, _) = run_ngspice_deck(&ng_deck, "bench_pvt_base.sp");
-
-        let num_corners = 128;
-        let ng_batch_wall_ms = single_ng_wall * (num_corners as f64);
-        let ng_batch_int_ms = single_ng_int * (num_corners as f64);
-
-        let t_tot = Instant::now();
-        let sim = Simulator::from_spice(&rs_deck)?;
-        let batch_inputs: Vec<BatchCircuitInput> = (0..num_corners)
-            .map(|c| BatchCircuitInput {
-                overrides: vec![("V1".to_string(), "dc".to_string(), 1.5 + 0.03 * (c as f64))],
-            })
-            .collect();
-        let t_sol = Instant::now();
-        let batch_out = sim.run_batch_dc_op(&batch_inputs)?;
-        assert_eq!(batch_out.len(), num_corners);
-        let sol_ms = t_sol.elapsed().as_secs_f64() * 1000.0;
-        let tot_ms = t_tot.elapsed().as_secs_f64() * 1000.0;
-
-        entries.push(BenchEntry {
-            name: "6. 128-Corner PVT Batch (Rayon Parallel)".to_string(),
-            circuit_desc: "128 Nonlinear 32-Diode Corners in Parallel".to_string(),
-            ngspice_wall_ms: ng_batch_wall_ms,
-            ngspice_internal_ms: ng_batch_int_ms,
-            rustspice_total_ms: tot_ms,
-            rustspice_solve_ms: sol_ms,
-            max_abs_error_v: 0.0,
-            speedup_e2e: ng_batch_wall_ms / tot_ms,
-            speedup_solver: ng_batch_int_ms / sol_ms,
-        });
-    }
-
-    // Print summary table and write Markdown report
-    let mut md = String::with_capacity(8192);
-    let _ = writeln!(
-        md,
-        "# RustSpice vs. `ngspice-47` (KLU) Performance & Accuracy Benchmark Report\n"
-    );
-    let _ = writeln!(
-        md,
-        "> **Hardware Environment**: Linux x86_64 (32 Hardware Threads, AVX-512/AVX2 + NVIDIA GeForce RTX 4090 Laptop GPU)  "
-    );
-    let _ = writeln!(
-        md,
-        "> **Reference Baseline**: `ngspice-47` compiled with KLU Direct Sparse Solver (`ngspice -b`)\n"
-    );
-    let _ = writeln!(md, "## Head-to-Head Benchmark Results\n");
-    let _ = writeln!(
-        md,
-        "| Benchmark Suite | Circuit Scale | `ngspice` Wall (ms) | `ngspice` Solver (ms) | `RustSpice` Total (ms) | `RustSpice` Solver (ms) | Max \\|ΔV\\| (V) | **End-to-End Speedup** | **Solver Kernel Speedup** |"
-    );
-    let _ = writeln!(
-        md,
-        "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
-    );
-
-    for e in &entries {
-        println!(
-            "{:<44} | ngspice: {:>8.2} ms (int {:>7.2} ms) | RustSpice: {:>6.3} ms (solve {:>6.3} ms) | Err: {:.2e} | Speedup: {:>7.1}x (Solver {:>7.1}x)",
-            e.name,
-            e.ngspice_wall_ms,
-            e.ngspice_internal_ms,
-            e.rustspice_total_ms,
-            e.rustspice_solve_ms,
-            e.max_abs_error_v,
-            e.speedup_e2e,
-            e.speedup_solver
-        );
-        let _ = writeln!(
-            md,
-            "| **{}** | {} | {:.2} | {:.2} | **{:.3}** | **{:.3}** | `{:.2e}` | **{:.1}x** | **{:.1}x** |",
-            e.name,
-            e.circuit_desc,
-            e.ngspice_wall_ms,
-            e.ngspice_internal_ms,
-            e.rustspice_total_ms,
-            e.rustspice_solve_ms,
-            e.max_abs_error_v,
-            e.speedup_e2e,
-            e.speedup_solver
-        );
-    }
-
-    let _ = writeln!(md, "\n## Key Architectural Speedup Drivers\n");
-    let _ = writeln!(
-        md,
-        "1. **Zero-Indirection Symbolic LU & Cranelift Native Machine Code JIT (`rustspice-backend-cpu::jit`)**: Eliminates 100% of sparse row/column index lookups and dynamic pivoting loops after initial topology compilation."
-    );
-    let _ = writeln!(
-        md,
-        "2. **Static-Base Conflict-Free Gather Table (`CscGatherTable`)**: Pre-stamps all linear conductances once during compilation and gathers only active dynamic/nonlinear terms via contiguous indices with zero atomic contention."
-    );
-    let _ = writeln!(
-        md,
-        "3. **Constant-$h$ LU Factorization Caching (`TransientSolver`)**: Reuses factored $L$ and $U$ matrices across fixed-timestep linear transient steps, reducing each time step to a single $O(\\text{{NNZ}})$ forward/backward substitution."
-    );
-    let _ = writeln!(
-        md,
-        "4. **Secant Trajectory Predictor & Shamanskii NR Reuse (`NonlinearSolver`)**: Extrapolates initial guesses across `.dc` sweeps and `.tran` steps, cutting Newton-Raphson iterations per step by more than 50%."
-    );
-    let _ = writeln!(
-        md,
-        "5. **Discrete Adjoint Sensitivity (`AdjointSensitivityEngine`)**: Computes exact gradients with respect to $P$ parameters in 1 transposed triangular solve instead of $2P$ perturbed simulations."
-    );
-
-    if let Some(parent) = output_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    fs::write(output_path, &md).expect("Failed to write benchmark report");
-    println!("================================================================================");
-    println!("Benchmark report written to {}", output_path.display());
-
     Ok(())
 }
+
+/// The `--raw` file could not be written (disk full, read-only or missing directory). Typed so that `main` can exit
+/// with [`bench::rustsim::HARNESS_IO_EXIT`] instead of the generic error code of a simulation failure.
+#[derive(Debug)]
+struct RawWriteError {
+    path: PathBuf,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for RawWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot write rawfile {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for RawWriteError {}

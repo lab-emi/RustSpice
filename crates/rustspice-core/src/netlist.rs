@@ -1,24 +1,17 @@
 //! High-speed zero-copy SPICE netlist parser and programmatic [`CircuitBuilder`] API.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+use crate::diag::{
+    audit_dc, audit_element_tail, audit_ic, audit_ignored_dot_card, audit_model_params,
+    audit_nodes, audit_number, audit_source, audit_tran, code, DiagSink, Diagnostic, Elem, KvPair,
+};
 use crate::error::{SimError, SimResult};
+use crate::limits::ResourceLimits;
 
-/// Parses a SPICE numeric literal with engineering unit suffixes (`f`, `p`, `n`, `u`, `m`,
-/// `mil`, `k`, `meg`, `g`, `t`).
-pub fn parse_spice_number(raw: &str, params: &FxHashMap<String, f64>) -> Option<f64> {
-    let trimmed = raw
-        .trim()
-        .trim_matches(|c| c == '{' || c == '}' || c == '\'' || c == '"');
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some(&val) = params.get(&trimmed.to_ascii_lowercase()) {
-        return Some(val);
-    }
-
-    let bytes = trimmed.as_bytes();
+/// Length of the numeric prefix (`digits . e +-`) that [`parse_spice_number`] reads; the rest is the suffix.
+pub(crate) fn number_prefix_len(bytes: &[u8]) -> usize {
     let mut num_end = 0;
     let mut seen_e = false;
     while num_end < bytes.len() {
@@ -41,7 +34,23 @@ pub fn parse_spice_number(raw: &str, params: &FxHashMap<String, f64>) -> Option<
             break;
         }
     }
+    num_end
+}
 
+/// Parses a SPICE numeric literal with engineering unit suffixes (`f`, `p`, `n`, `u`, `m`,
+/// `mil`, `k`, `meg`, `g`, `t`).
+pub fn parse_spice_number(raw: &str, params: &FxHashMap<String, f64>) -> Option<f64> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c| c == '{' || c == '}' || c == '\'' || c == '"');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(&val) = params.get(&trimmed.to_ascii_lowercase()) {
+        return Some(val);
+    }
+
+    let num_end = number_prefix_len(trimmed.as_bytes());
     if num_end == 0 {
         return None;
     }
@@ -370,6 +379,9 @@ pub struct Netlist {
     pub mosfets: Vec<MosfetInstance>,
     pub initial_conditions: FxHashMap<usize, f64>,
     pub analyses: Vec<AnalysisCmd>,
+    /// Everything the reader ignored, approximated or re-interpreted (never changes the parsed circuit).
+    #[serde(default)]
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 impl Netlist {
@@ -418,6 +430,79 @@ impl Netlist {
     #[inline]
     pub fn mna_dimension(&self) -> usize {
         self.num_nodes() + self.v_sources.len() + self.inductors.len()
+    }
+
+    /// Fails if a source amplitude / frequency or an analysis bound is infinite or NaN.
+    ///
+    /// A literal such as `1e999` parses to `+inf` (it overflows `f64`). For an independent source amplitude
+    /// (`DC`, `PULSE v1 v2`, `SIN vo va freq`) or a `.dc` / `.tran` bound no finite answer exists (the former
+    /// behaviour was NaN output rows or an endless run with exit status 0), while ngspice itself fails on
+    /// these. Device values (`R`, `C`, `L`, `G`, ...) and the timing fields of `PULSE` / `SIN` are NOT
+    /// checked: an infinite resistance is a valid open circuit (both tools agree), and a non-finite
+    /// RESULT is caught by the solver (`SimError::NonFiniteSolution`).
+    pub fn validate_finite(&self) -> SimResult<()> {
+        fn bad(fields: &[(&'static str, f64)]) -> Option<(&'static str, f64)> {
+            fields.iter().copied().find(|(_, v)| !v.is_finite())
+        }
+        fn waveform_fields(w: &SourceWaveform) -> [(&'static str, f64); 4] {
+            const PAD: (&str, f64) = ("", 0.0);
+            match *w {
+                SourceWaveform::Dc(v) => [("dc value", v), PAD, PAD, PAD],
+                SourceWaveform::Pulse { dc_val, v1, v2, .. } => [
+                    ("PULSE dc value", dc_val),
+                    ("PULSE v1", v1),
+                    ("PULSE v2", v2),
+                    PAD,
+                ],
+                SourceWaveform::Sin {
+                    dc_val,
+                    vo,
+                    va,
+                    freq,
+                    ..
+                } => [
+                    ("SIN dc value", dc_val),
+                    ("SIN vo", vo),
+                    ("SIN va", va),
+                    ("SIN frequency", freq),
+                ],
+            }
+        }
+        let fail = |name: &str, field: &str, v: f64| {
+            Err(SimError::TopologyError(format!(
+                "non-finite value ({v}) for {field} of `{name}`: a numeric literal that overflows f64 (e.g. 1e999) is not a valid source amplitude or analysis bound"
+            )))
+        };
+        for src in &self.v_sources {
+            if let Some((f, v)) = bad(&waveform_fields(&src.waveform)) {
+                return fail(&src.name, f, v);
+            }
+        }
+        for src in &self.i_sources {
+            if let Some((f, v)) = bad(&waveform_fields(&src.waveform)) {
+                return fail(&src.name, f, v);
+            }
+        }
+        for a in &self.analyses {
+            match a {
+                AnalysisCmd::Op => {}
+                AnalysisCmd::Dc {
+                    start, stop, step, ..
+                } => {
+                    if let Some((f, v)) =
+                        bad(&[("start", *start), ("stop", *stop), ("step", *step)])
+                    {
+                        return fail(".dc", f, v);
+                    }
+                }
+                AnalysisCmd::Tran { tstep, tstop, .. } => {
+                    if let Some((f, v)) = bad(&[("tstep", *tstep), ("tstop", *tstop)]) {
+                        return fail(".tran", f, v);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -572,24 +657,97 @@ struct SubcktDef {
     lines: Vec<(usize, String)>,
 }
 
-/// Parses a complete SPICE netlist string into a [`Netlist`] AST with zero unnecessary allocations.
+/// Mutable state shared by the second parsing pass (diagnostics bookkeeping only; never alters the circuit).
+#[derive(Default)]
+struct ParseState {
+    /// Hashes of the lower-cased element names seen so far (duplicate detection without allocation).
+    seen_names: FxHashSet<u64>,
+    /// Element `ic=` fields (line, description) whose severity depends on `uic`.
+    pending_elem_ic: Vec<(usize, String)>,
+    /// Line of the first `.tran ... uic` card.
+    uic_line: Option<usize>,
+    /// `DC <v>` attributes dropped next to a waveform (line, text): they only matter for .op/.dc.
+    pending_dc_attr: Vec<(usize, String)>,
+}
+
+fn name_hash(name: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.bytes() {
+        h ^= u64::from(b.to_ascii_lowercase());
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Shortens a source line for use inside a diagnostic.
+fn clip(text: &str) -> String {
+    const MAX: usize = 60;
+    if text.len() <= MAX {
+        return text.to_string();
+    }
+    let mut end = MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+/// Parses a complete SPICE netlist string into a [`Netlist`] AST with default [`ResourceLimits`].
+///
+/// Constructs the reader ignores, approximates or re-interprets are recorded in [`Netlist::diagnostics`]
+/// (they never change the parsed circuit and never fail the parse).
 pub fn parse_netlist(src: &str) -> SimResult<Netlist> {
+    parse_netlist_with_limits(src, &ResourceLimits::default())
+}
+
+/// Like [`parse_netlist`] with explicit hierarchy-expansion budgets (`max_subckt_depth`,
+/// `max_expanded_cards`, `max_expanded_bytes`).
+pub fn parse_netlist_with_limits(src: &str, limits: &ResourceLimits) -> SimResult<Netlist> {
+    let mut sink = DiagSink::new();
     let mut logical_lines: Vec<(usize, String)> = Vec::new();
     let mut title = String::from("Untitled SPICE Deck");
     let mut seen_title = false;
     let mut in_control_block = false;
+    let mut control_start = 0usize;
+    let mut control_lines = 0usize;
+    let mut first_line_blank = false;
+    let mut title_card_line: Option<usize> = None;
 
     for (idx, raw_line) in src.lines().enumerate() {
         let line_no = idx + 1;
         let trimmed = raw_line.trim();
         if trimmed.is_empty() {
+            if idx == 0 {
+                first_line_blank = true;
+            }
             continue;
         }
         if !seen_title {
             seen_title = true;
             if !trimmed.starts_with('.') && !trimmed.starts_with('*') && !trimmed.starts_with(';') {
                 title = trimmed.to_string();
+                if first_line_blank {
+                    sink.warn(
+                        line_no,
+                        code::TITLE_LINE,
+                        format!(
+                            "line 1 is blank: SPICE takes line 1 as the title and simulates this line (`{}`) as a card; RustSpice used it as the title and does not simulate it",
+                            clip(trimmed)
+                        ),
+                    );
+                }
                 continue;
+            }
+            if trimmed.starts_with('.') {
+                title_card_line = Some(line_no);
+                sink.warn(
+                    line_no,
+                    code::TITLE_LINE,
+                    format!(
+                        "the first line `{}` starts with `.` and is parsed as a card; SPICE always takes line 1 as the title",
+                        clip(trimmed)
+                    ),
+                );
             }
         }
         if trimmed.starts_with('*') || trimmed.starts_with(';') {
@@ -598,13 +756,31 @@ pub fn parse_netlist(src: &str) -> SimResult<Netlist> {
         let lower_head = trimmed.to_ascii_lowercase();
         if lower_head.starts_with(".control") {
             in_control_block = true;
+            control_start = line_no;
+            control_lines = 0;
             continue;
         }
         if lower_head.starts_with(".endc") {
+            if in_control_block {
+                sink.warn(
+                    control_start,
+                    code::IGNORED_ANALYSIS,
+                    format!(
+                        ".control block ({control_lines} lines) is ignored: scripted commands (alter, run, let, ...) are not executed"
+                    ),
+                );
+            } else {
+                sink.warn(
+                    line_no,
+                    code::MALFORMED_INPUT,
+                    "`.endc` without a matching `.control` was ignored",
+                );
+            }
             in_control_block = false;
             continue;
         }
         if in_control_block {
+            control_lines += 1;
             continue;
         }
         // Strip inline comments starting with `;` or `$`
@@ -623,15 +799,31 @@ pub fn parse_netlist(src: &str) -> SimResult<Netlist> {
             if let Some(last) = logical_lines.last_mut() {
                 last.1.push(' ');
                 last.1.push_str(cont.trim());
+            } else {
+                sink.warn(
+                    line_no,
+                    code::MALFORMED_INPUT,
+                    "continuation line `+...` has no preceding card and was ignored",
+                );
             }
         } else {
             logical_lines.push((line_no, clean.to_string()));
         }
     }
+    if in_control_block {
+        sink.warn(
+            control_start,
+            code::IGNORED_ANALYSIS,
+            format!(
+                ".control block ({control_lines} lines, never closed by .endc) is ignored: scripted commands are not executed"
+            ),
+        );
+    }
 
     let mut netlist = Netlist::new(title);
     let mut subckts: FxHashMap<String, SubcktDef> = FxHashMap::default();
     let mut active_subckt: Option<(String, SubcktDef)> = None;
+    let mut subckt_start = 0usize;
     let mut top_lines: Vec<(usize, String)> = Vec::new();
 
     // First pass: collect `.param`, `.model`, and `.subckt` definitions
@@ -664,38 +856,181 @@ pub fn parse_netlist(src: &str) -> SimResult<Netlist> {
                     lines: Vec::new(),
                 },
             ));
+            subckt_start = line_no;
         } else if lower.starts_with(".param") {
-            parse_param_card(&line[6..], &mut netlist.params);
+            parse_param_card(line_no, &line[6..], &mut netlist.params, &mut sink);
         } else if lower.starts_with(".model") {
-            parse_model_card(line_no, &line, &mut netlist)?;
+            parse_model_card(line_no, &line, &mut netlist, &mut sink)?;
         } else {
             top_lines.push((line_no, line));
         }
     }
+    if let Some((name, def)) = &active_subckt {
+        sink.warn(
+            subckt_start,
+            code::MALFORMED_INPUT,
+            format!(
+                "`.subckt {name}` has no matching `.ends`: its {} body lines were discarded",
+                def.lines.len()
+            ),
+        );
+    }
 
-    // Expand subcircuits (`X...`) recursively
-    let expanded_lines = expand_subcircuits(&top_lines, &subckts, "", &FxHashMap::default())?;
+    // Expand subcircuits (`X...`) with an explicit stack: bounded by `limits`, never by the call stack
+    let expanded_lines = expand_subcircuits(&top_lines, &subckts, limits)?;
 
     // Second pass: parse all elements and analysis cards
+    let mut state = ParseState::default();
+    state.seen_names.reserve(expanded_lines.len());
     for (line_no, line) in expanded_lines {
-        parse_statement(line_no, &line, &mut netlist)?;
+        parse_statement(line_no, &line, &mut netlist, &mut sink, &mut state)?;
+    }
+
+    if let Some(ln) = state.uic_line {
+        if netlist.initial_conditions.is_empty() {
+            sink.warn(
+                ln,
+                code::IGNORED_IC,
+                "`uic` is ignored: the transient starts from the DC operating point, not from the zero / initial-condition state",
+            );
+        } else {
+            sink.note(
+                ln,
+                code::IGNORED_IC,
+                "`uic` is not implemented: the transient starts from the DC operating point and the `.ic` values are imposed on top of it",
+            );
+        }
+    }
+    let dc_matters = netlist
+        .analyses
+        .iter()
+        .any(|a| matches!(a, AnalysisCmd::Op | AnalysisCmd::Dc { .. }))
+        || netlist.analyses.is_empty();
+    for (ln, msg) in std::mem::take(&mut state.pending_dc_attr) {
+        if dc_matters {
+            sink.warn(ln, code::DC_VALUE_DROPPED, msg);
+        } else {
+            sink.note(
+                ln,
+                code::DC_VALUE_DROPPED,
+                format!(
+                    "{msg} (no .op/.dc analysis in this deck, so the transient is not affected)"
+                ),
+            );
+        }
+    }
+    for (ln, what) in std::mem::take(&mut state.pending_elem_ic) {
+        if state.uic_line.is_some() {
+            sink.warn(
+                ln,
+                code::IGNORED_IC,
+                format!("{what} is parsed but never applied: the transient starts from the DC operating point (no UIC support)"),
+            );
+        } else {
+            sink.note(
+                ln,
+                code::IGNORED_IC,
+                format!("{what} is not applied (it only matters together with `.tran ... uic`, which RustSpice does not support)"),
+            );
+        }
     }
 
     if netlist.analyses.is_empty() {
         netlist.analyses.push(AnalysisCmd::Op);
+        if sink.has(code::IGNORED_ANALYSIS) {
+            sink.warn(
+                0,
+                code::IGNORED_ANALYSIS,
+                "no supported analysis card (.op/.dc/.tran) remains: a DC .op is run instead",
+            );
+        } else {
+            sink.note(
+                0,
+                code::IGNORED_ANALYSIS,
+                "no .op/.dc/.tran card found: a DC .op is run",
+            );
+        }
     }
+
+    if let Some(ln) = title_card_line {
+        // whatever else that first line produced is an artifact of it being parsed as a card
+        sink.retain_only_code_on_line(ln, code::TITLE_LINE);
+    }
+    netlist.diagnostics = sink.finish();
+    netlist.validate_finite()?;
 
     Ok(netlist)
 }
 
+/// One level of the explicit hierarchy stack used by [`expand_subcircuits`].
+struct ExpandFrame<'a> {
+    /// Lower-case subcircuit name (empty for the top level).
+    name: &'a str,
+    lines: &'a [(usize, String)],
+    next: usize,
+    prefix: String,
+    port_map: FxHashMap<String, String>,
+}
+
+fn expansion_limit(
+    resource: &'static str,
+    requested: String,
+    limit: String,
+    hint: &str,
+) -> SimError {
+    SimError::ResourceLimit {
+        resource,
+        requested,
+        limit,
+        hint: hint.to_string(),
+    }
+}
+
+/// Flattens `X` instances depth-first with an explicit stack (same card order as plain recursion).
+///
+/// * a subcircuit instantiating itself, directly or through other subcircuits, is refused with the cycle
+///   spelled out (without a parameter language such an expansion can never terminate);
+/// * `limits.max_subckt_depth`, `limits.max_expanded_cards` (instance + element cards visited) and
+///   `limits.max_expanded_bytes` (flattened text) are enforced while expanding.
 fn expand_subcircuits(
-    lines: &[(usize, String)],
+    top_lines: &[(usize, String)],
     subckts: &FxHashMap<String, SubcktDef>,
-    prefix: &str,
-    port_map: &FxHashMap<String, String>,
+    limits: &ResourceLimits,
 ) -> SimResult<Vec<(usize, String)>> {
-    let mut out = Vec::with_capacity(lines.len());
-    for (line_no, line) in lines {
+    let mut out: Vec<(usize, String)> = Vec::with_capacity(top_lines.len());
+    let mut cards = 0usize;
+    let mut bytes = 0usize;
+    let mut active: FxHashSet<&str> = FxHashSet::default();
+    let mut stack: Vec<ExpandFrame> = vec![ExpandFrame {
+        name: "",
+        lines: top_lines,
+        next: 0,
+        prefix: String::new(),
+        port_map: FxHashMap::default(),
+    }];
+
+    while let Some(frame) = stack.last_mut() {
+        let lines: &[(usize, String)] = frame.lines;
+        let Some((line_no, line)) = lines.get(frame.next) else {
+            if let Some(done) = stack.pop() {
+                active.remove(done.name);
+            }
+            continue;
+        };
+        frame.next += 1;
+        cards += 1;
+        if cards > limits.max_expanded_cards {
+            return Err(expansion_limit(
+                "expanded_cards",
+                format!(
+                    "more than {} flattened cards (stopped at line {line_no}, depth {})",
+                    limits.max_expanded_cards,
+                    stack.len() - 1
+                ),
+                format!("{} cards (max_expanded_cards)", limits.max_expanded_cards),
+                "the hierarchy flattens to more cards than the budget; reduce the fan-out or raise --max-expanded-cards",
+            ));
+        }
         let first_char = line.as_bytes()[0].to_ascii_uppercase();
         if first_char == b'X' {
             let toks: Vec<&str> = line.split_whitespace().collect();
@@ -707,10 +1042,13 @@ fn expand_subcircuits(
             }
             let inst_name = toks[0];
             let sub_name = toks.last().unwrap().to_ascii_lowercase();
-            let sub = subckts.get(&sub_name).ok_or_else(|| SimError::ParseError {
-                line: *line_no,
-                message: format!("Unknown subcircuit `{sub_name}`"),
-            })?;
+            let (sub_key, sub) =
+                subckts
+                    .get_key_value(&sub_name)
+                    .ok_or_else(|| SimError::ParseError {
+                        line: *line_no,
+                        message: format!("Unknown subcircuit `{sub_name}`"),
+                    })?;
             let actual_nodes = &toks[1..toks.len() - 1];
             if actual_nodes.len() != sub.ports.len() {
                 return Err(SimError::ParseError {
@@ -722,23 +1060,70 @@ fn expand_subcircuits(
                     ),
                 });
             }
-            let new_prefix = if prefix.is_empty() {
+            let new_prefix = if frame.prefix.is_empty() {
                 inst_name.to_string()
             } else {
-                format!("{prefix}.{inst_name}")
+                format!("{}.{inst_name}", frame.prefix)
             };
             let mut child_map = FxHashMap::default();
             for (formal, actual) in sub.ports.iter().zip(actual_nodes.iter()) {
-                let mapped_actual = map_subckt_node(actual, prefix, port_map);
+                let mapped_actual = map_subckt_node(actual, &frame.prefix, &frame.port_map);
                 child_map.insert(formal.to_ascii_lowercase(), mapped_actual);
             }
-            let child_expanded = expand_subcircuits(&sub.lines, subckts, &new_prefix, &child_map)?;
-            out.extend(child_expanded);
-        } else if prefix.is_empty() {
-            out.push((*line_no, line.clone()));
+
+            if active.contains(sub_key.as_str()) {
+                let first = stack
+                    .iter()
+                    .position(|f| f.name == sub_key.as_str())
+                    .unwrap_or(0);
+                let mut chain: Vec<&str> = stack[first..].iter().map(|f| f.name).collect();
+                chain.push(sub_key.as_str());
+                return Err(SimError::ParseError {
+                    line: *line_no,
+                    message: format!(
+                        "Recursive subcircuit instantiation `{}` (instance `{inst_name}`): the expansion would never terminate",
+                        chain.join(" -> ")
+                    ),
+                });
+            }
+            let child_depth = stack.len();
+            if child_depth > limits.max_subckt_depth {
+                return Err(expansion_limit(
+                    "subckt_depth",
+                    format!(
+                        "instantiation depth {child_depth} (instance `{inst_name}` of `{sub_name}`, line {line_no}) exceeds the limit"
+                    ),
+                    format!("{} levels (max_subckt_depth)", limits.max_subckt_depth),
+                    "flatten the hierarchy or raise --max-subckt-depth",
+                ));
+            }
+            active.insert(sub_key.as_str());
+            stack.push(ExpandFrame {
+                name: sub_key.as_str(),
+                lines: sub.lines.as_slice(),
+                next: 0,
+                prefix: new_prefix,
+                port_map: child_map,
+            });
         } else {
-            let rewritten = rewrite_subckt_line(line, prefix, port_map);
-            out.push((*line_no, rewritten));
+            let text = if frame.prefix.is_empty() {
+                line.clone()
+            } else {
+                rewrite_subckt_line(line, &frame.prefix, &frame.port_map)
+            };
+            bytes += text.len();
+            if bytes > limits.max_expanded_bytes {
+                return Err(expansion_limit(
+                    "expanded_bytes",
+                    format!(
+                        "more than {} bytes of flattened netlist text (stopped at line {line_no})",
+                        limits.max_expanded_bytes
+                    ),
+                    format!("{} bytes (max_expanded_bytes)", limits.max_expanded_bytes),
+                    "flattened instance names grow with the nesting depth; reduce depth or raise --max-expanded-mib",
+                ));
+            }
+            out.push((*line_no, text));
         }
     }
     Ok(out)
@@ -782,45 +1167,109 @@ fn rewrite_subckt_line(line: &str, prefix: &str, port_map: &FxHashMap<String, St
     parts.join(" ")
 }
 
-fn parse_param_card(rest: &str, params: &mut FxHashMap<String, f64>) {
+fn parse_param_card(
+    line_no: usize,
+    rest: &str,
+    params: &mut FxHashMap<String, f64>,
+    sink: &mut DiagSink,
+) {
+    let spaced = rest.contains(" =") || rest.contains("= ");
+    if spaced {
+        sink.warn(
+            line_no,
+            code::MALFORMED_INPUT,
+            "`.param` with blanks around `=` is not understood: write `name=value` (the affected parameters are not defined)",
+        );
+    }
     for token in rest.split_whitespace() {
         if let Some((k, v)) = token.split_once('=') {
             if let Some(num) = parse_spice_number(v, params) {
+                audit_number(v, params, ".param", k, line_no, sink);
                 params.insert(k.trim().to_ascii_lowercase(), num);
+            } else if !spaced {
+                sink.warn(
+                    line_no,
+                    code::MALFORMED_INPUT,
+                    format!("`.param {token}`: the value is not a number (expressions are not evaluated); the parameter is not defined"),
+                );
             }
+        } else if !spaced {
+            sink.warn(
+                line_no,
+                code::MALFORMED_INPUT,
+                format!("`.param` token `{token}` was ignored (expected name=value)"),
+            );
         }
     }
 }
 
-fn extract_key_values(text: &str, params: &FxHashMap<String, f64>) -> FxHashMap<String, f64> {
+/// Scans `key=value` / `key = value` pairs of a card (parentheses and commas count as blanks).
+fn scan_key_values(text: &str, params: &FxHashMap<String, f64>) -> Vec<KvPair> {
     let cleaned = text.replace(['(', ')', ','], " ");
     let toks: Vec<&str> = cleaned.split_whitespace().collect();
-    let mut kv = FxHashMap::default();
+    let mut out = Vec::new();
     let mut i = 0;
     while i < toks.len() {
         if let Some((k, v)) = toks[i].split_once('=') {
             if !v.is_empty() {
-                if let Some(num) = parse_spice_number(v, params) {
-                    kv.insert(k.trim().to_ascii_lowercase(), num);
-                }
+                out.push(KvPair {
+                    key: k.trim().to_ascii_lowercase(),
+                    raw: v.to_string(),
+                    val: parse_spice_number(v, params),
+                });
             } else if i + 1 < toks.len() {
-                if let Some(num) = parse_spice_number(toks[i + 1], params) {
-                    kv.insert(k.trim().to_ascii_lowercase(), num);
+                let val = parse_spice_number(toks[i + 1], params);
+                out.push(KvPair {
+                    key: k.trim().to_ascii_lowercase(),
+                    raw: toks[i + 1].to_string(),
+                    val,
+                });
+                if val.is_some() {
                     i += 1;
                 }
+            } else {
+                out.push(KvPair {
+                    key: k.trim().to_ascii_lowercase(),
+                    raw: String::new(),
+                    val: None,
+                });
             }
         } else if i + 2 < toks.len() && toks[i + 1] == "=" {
-            if let Some(num) = parse_spice_number(toks[i + 2], params) {
-                kv.insert(toks[i].trim().to_ascii_lowercase(), num);
+            let val = parse_spice_number(toks[i + 2], params);
+            out.push(KvPair {
+                key: toks[i].trim().to_ascii_lowercase(),
+                raw: toks[i + 2].to_string(),
+                val,
+            });
+            if val.is_some() {
                 i += 2;
             }
         }
         i += 1;
     }
+    out
+}
+
+fn kv_map(pairs: &[KvPair]) -> FxHashMap<String, f64> {
+    let mut kv = FxHashMap::default();
+    for p in pairs {
+        if let Some(v) = p.val {
+            kv.insert(p.key.clone(), v);
+        }
+    }
     kv
 }
 
-fn parse_model_card(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResult<()> {
+fn extract_key_values(text: &str, params: &FxHashMap<String, f64>) -> FxHashMap<String, f64> {
+    kv_map(&scan_key_values(text, params))
+}
+
+fn parse_model_card(
+    line_no: usize,
+    line: &str,
+    netlist: &mut Netlist,
+    sink: &mut DiagSink,
+) -> SimResult<()> {
     let normalized = line.replace('(', " ( ").replace(')', " ) ");
     let toks: Vec<&str> = normalized.split_whitespace().collect();
     if toks.len() < 3 {
@@ -831,7 +1280,8 @@ fn parse_model_card(line_no: usize, line: &str, netlist: &mut Netlist) -> SimRes
     }
     let mname = toks[1].to_ascii_lowercase();
     let mtype = toks[2].to_ascii_uppercase();
-    let kv = extract_key_values(line, &netlist.params);
+    let pairs = scan_key_values(line, &netlist.params);
+    let kv = kv_map(&pairs);
 
     if mtype == "D" {
         let mut model = DiodeModelParams {
@@ -859,6 +1309,7 @@ fn parse_model_card(line_no: usize, line: &str, netlist: &mut Netlist) -> SimRes
         if let Some(&v) = kv.get("tt") {
             model.tt = v;
         }
+        audit_model_params(toks[1], "D", &pairs, &netlist.params, line_no, sink);
         netlist.diode_models.insert(mname, model);
     } else if mtype == "NMOS" || mtype == "PMOS" {
         let mos_type = if mtype == "PMOS" {
@@ -904,7 +1355,17 @@ fn parse_model_card(line_no: usize, line: &str, netlist: &mut Netlist) -> SimRes
         if let Some(&v) = kv.get("l") {
             model.l_default = v;
         }
+        audit_model_params(toks[1], &mtype, &pairs, &netlist.params, line_no, sink);
         netlist.mosfet_models.insert(mname, model);
+    } else {
+        sink.warn(
+            line_no,
+            code::IGNORED_DIRECTIVE,
+            format!(
+                "`.model {} {}`: model type `{}` is not supported (only D, NMOS and PMOS are); the card was ignored",
+                toks[1], toks[2], toks[2]
+            ),
+        );
     }
     Ok(())
 }
@@ -994,7 +1455,13 @@ fn parse_waveform(
     SourceWaveform::Dc(dc_val)
 }
 
-fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResult<()> {
+fn parse_statement(
+    line_no: usize,
+    line: &str,
+    netlist: &mut Netlist,
+    sink: &mut DiagSink,
+    state: &mut ParseState,
+) -> SimResult<()> {
     let toks: Vec<&str> = line.split_whitespace().collect();
     if toks.is_empty() {
         return Ok(());
@@ -1032,6 +1499,10 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
                         message: "Invalid .dc step value".to_string(),
                     }
                 })?;
+                for (field, raw) in [("start", toks[2]), ("stop", toks[3]), ("step", toks[4])] {
+                    audit_number(raw, &netlist.params, ".dc", field, line_no, sink);
+                }
+                audit_dc(&toks, line_no, sink);
                 netlist.analyses.push(AnalysisCmd::Dc {
                     source_name,
                     start,
@@ -1065,6 +1536,11 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
                 let tmax = toks
                     .get(4)
                     .and_then(|s| parse_spice_number(s, &netlist.params));
+                audit_number(toks[1], &netlist.params, ".tran", "tstep", line_no, sink);
+                audit_number(toks[2], &netlist.params, ".tran", "tstop", line_no, sink);
+                if audit_tran(&toks, tstop, &netlist.params, line_no, sink) {
+                    state.uic_line.get_or_insert(line_no);
+                }
                 netlist.analyses.push(AnalysisCmd::Tran {
                     tstep,
                     tstop,
@@ -1073,6 +1549,7 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
                 });
             }
             "ic" => {
+                audit_ic(&toks, &netlist.params, line_no, sink);
                 for tok in &toks[1..] {
                     let lower = tok.to_ascii_lowercase();
                     if let Some(rest) = lower.strip_prefix("v(") {
@@ -1086,10 +1563,20 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
                 }
             }
             _ => {
-                // Gracefully ignore `.end`, `.options`, `.print`, `.save`, `.plot`, `.temp`, etc.
+                // Everything else (`.end`, `.options`, `.print`, `.save`, `.plot`, `.temp`, ...) is not
+                // interpreted; each ignored card is reported (never silently dropped).
+                audit_ignored_dot_card(&cmd_lower, &toks, &netlist.params, line_no, sink);
             }
         }
         return Ok(());
+    }
+
+    if !state.seen_names.insert(name_hash(first)) {
+        sink.warn(
+            line_no,
+            code::MALFORMED_INPUT,
+            format!("element name `{first}` is used more than once (SPICE rejects the netlist); both cards are kept"),
+        );
     }
 
     let lead = first.as_bytes()[0].to_ascii_uppercase();
@@ -1113,6 +1600,16 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
                     message: format!("Invalid resistance value `{}`", toks[3]),
                 }
             })?;
+            audit_nodes(first, &toks[1..3], line_no, sink);
+            audit_number(val_str, &netlist.params, first, "value", line_no, sink);
+            if resistance == 0.0 {
+                sink.warn(
+                    line_no,
+                    code::MALFORMED_INPUT,
+                    format!("{first}: resistance {val_str} is zero; RustSpice substitutes 1e-6 ohm (SPICE rejects R=0)"),
+                );
+            }
+            audit_element_tail(Elem::R, first, &toks[4..], &netlist.params, line_no, sink);
             netlist.resistors.push(ResistorInstance {
                 name: first.to_string(),
                 n_pos,
@@ -1135,7 +1632,15 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
                     message: format!("Invalid capacitance value `{}`", toks[3]),
                 }
             })?;
+            audit_nodes(first, &toks[1..3], line_no, sink);
+            audit_number(toks[3], &netlist.params, first, "value", line_no, sink);
+            audit_element_tail(Elem::C, first, &toks[4..], &netlist.params, line_no, sink);
             let kv = extract_key_values(line, &netlist.params);
+            if let Some(ic) = kv.get("ic") {
+                state
+                    .pending_elem_ic
+                    .push((line_no, format!("{first}: ic={ic}")));
+            }
             netlist.capacitors.push(CapacitorInstance {
                 name: first.to_string(),
                 n_pos,
@@ -1159,7 +1664,15 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
                     message: format!("Invalid inductance value `{}`", toks[3]),
                 }
             })?;
+            audit_nodes(first, &toks[1..3], line_no, sink);
+            audit_number(toks[3], &netlist.params, first, "value", line_no, sink);
+            audit_element_tail(Elem::L, first, &toks[4..], &netlist.params, line_no, sink);
             let kv = extract_key_values(line, &netlist.params);
+            if let Some(ic) = kv.get("ic") {
+                state
+                    .pending_elem_ic
+                    .push((line_no, format!("{first}: ic={ic}")));
+            }
             netlist.inductors.push(InductorInstance {
                 name: first.to_string(),
                 n_pos,
@@ -1185,6 +1698,9 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
                     message: format!("Invalid VCCS transconductance `{}`", toks[5]),
                 }
             })?;
+            audit_nodes(first, &toks[1..5], line_no, sink);
+            audit_number(toks[5], &netlist.params, first, "gm", line_no, sink);
+            audit_element_tail(Elem::G, first, &toks[6..], &netlist.params, line_no, sink);
             netlist.vccs.push(VccsInstance {
                 name: first.to_string(),
                 n_pos,
@@ -1204,6 +1720,18 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
             let n_pos = netlist.intern_node(toks[1]);
             let n_neg = netlist.intern_node(toks[2]);
             let waveform = parse_waveform(&toks[3..], line, &netlist.params);
+            audit_nodes(first, &toks[1..3], line_no, sink);
+            if let Some(msg) = audit_source(
+                first,
+                line,
+                &toks[3..],
+                &waveform,
+                &netlist.params,
+                line_no,
+                sink,
+            ) {
+                state.pending_dc_attr.push((line_no, msg));
+            }
             netlist.v_sources.push(VoltageSourceInstance {
                 name: first.to_string(),
                 n_pos,
@@ -1221,6 +1749,18 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
             let n_pos = netlist.intern_node(toks[1]);
             let n_neg = netlist.intern_node(toks[2]);
             let waveform = parse_waveform(&toks[3..], line, &netlist.params);
+            audit_nodes(first, &toks[1..3], line_no, sink);
+            if let Some(msg) = audit_source(
+                first,
+                line,
+                &toks[3..],
+                &waveform,
+                &netlist.params,
+                line_no,
+                sink,
+            ) {
+                state.pending_dc_attr.push((line_no, msg));
+            }
             netlist.i_sources.push(CurrentSourceInstance {
                 name: first.to_string(),
                 n_pos,
@@ -1238,6 +1778,18 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
             let n_anode = netlist.intern_node(toks[1]);
             let n_cathode = netlist.intern_node(toks[2]);
             let model = toks[3].to_ascii_lowercase();
+            audit_nodes(first, &toks[1..3], line_no, sink);
+            if !netlist.diode_models.contains_key(&model) {
+                report_undefined_model(
+                    first,
+                    toks[3],
+                    "diode",
+                    netlist.mosfet_models.contains_key(&model),
+                    "MOSFET",
+                    line_no,
+                    sink,
+                );
+            }
             netlist
                 .diode_models
                 .entry(model.clone())
@@ -1245,6 +1797,7 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
                     name: toks[3].to_string(),
                     ..Default::default()
                 });
+            audit_element_tail(Elem::D, first, &toks[4..], &netlist.params, line_no, sink);
             let kv = extract_key_values(&toks[4..].join(" "), &netlist.params);
             let area = kv.get("area").copied().unwrap_or(1.0);
             netlist.diodes.push(DiodeInstance {
@@ -1267,6 +1820,24 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
             let n_source = netlist.intern_node(toks[3]);
             let n_bulk = netlist.intern_node(toks[4]);
             let model = toks[5].to_ascii_lowercase();
+            audit_nodes(first, &toks[1..5], line_no, sink);
+            if toks[5].contains('=') {
+                sink.warn(
+                    line_no,
+                    code::MISPARSE,
+                    format!("{first}: `{}` is in the model-name position: a node (usually the bulk) is missing from the card", toks[5]),
+                );
+            } else if !netlist.mosfet_models.contains_key(&model) {
+                report_undefined_model(
+                    first,
+                    toks[5],
+                    "MOSFET",
+                    netlist.diode_models.contains_key(&model),
+                    "diode",
+                    line_no,
+                    sink,
+                );
+            }
             netlist
                 .mosfet_models
                 .entry(model.clone())
@@ -1279,7 +1850,19 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
                     },
                     ..Default::default()
                 });
+            audit_element_tail(Elem::M, first, &toks[6..], &netlist.params, line_no, sink);
             let kv = extract_key_values(&toks[6..].join(" "), &netlist.params);
+            let w = kv.get("w").copied();
+            let l = kv.get("l").copied();
+            if let Some(l_val) = l {
+                if l_val <= 0.0 {
+                    sink.warn(
+                        line_no,
+                        code::MALFORMED_INPUT,
+                        format!("{first}: L={l_val:.4e} is not positive; SPICE rejects non-positive channel length"),
+                    );
+                }
+            }
             netlist.mosfets.push(MosfetInstance {
                 name: first.to_string(),
                 n_drain,
@@ -1287,8 +1870,8 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
                 n_source,
                 n_bulk,
                 model,
-                w: kv.get("w").copied(),
-                l: kv.get("l").copied(),
+                w,
+                l,
             });
         }
         _ => {
@@ -1299,4 +1882,29 @@ fn parse_statement(line_no: usize, line: &str, netlist: &mut Netlist) -> SimResu
         }
     }
     Ok(())
+}
+
+/// A device names a model that has no `.model` card of the right type: the reader silently substitutes defaults.
+fn report_undefined_model(
+    device: &str,
+    model: &str,
+    dev_kind: &str,
+    declared_as_other: bool,
+    other_kind: &str,
+    line: usize,
+    sink: &mut DiagSink,
+) {
+    if declared_as_other {
+        sink.warn(
+            line,
+            code::UNDEFINED_MODEL,
+            format!("{device}: {dev_kind} uses model `{model}`, which is declared as a {other_kind} model; default {dev_kind} parameters are used (SPICE rejects the mismatch)"),
+        );
+    } else {
+        sink.warn(
+            line,
+            code::UNDEFINED_MODEL,
+            format!("{device}: model `{model}` is not defined (no usable `.model` card: it may sit in an unread .include/.lib or inside a .subckt); default {dev_kind} parameters are used"),
+        );
+    }
 }

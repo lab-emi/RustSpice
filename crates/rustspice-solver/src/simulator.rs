@@ -7,7 +7,8 @@ use rustspice_backend_cpu::{
     BatchCircuitInput, BatchCircuitOutput, BatchCpuExecutor, CpuSimdBackend,
 };
 use rustspice_core::{
-    compile_netlist, parse_netlist, CompiledTopology, ComputeBackend, Netlist, SimError, SimResult,
+    compile_netlist, parse_netlist, parse_netlist_with_limits, CompiledTopology, ComputeBackend,
+    Netlist, ResourceLimits, SimError, SimResult,
 };
 
 use crate::adjoint::{AdjointGradientResult, AdjointSensitivityEngine, ParameterGradSpec};
@@ -44,6 +45,7 @@ impl Simulator {
 
     /// Compiles a [`Netlist`] with the specified hardware [`ComputeBackend`].
     pub fn from_netlist(netlist: Netlist, backend: Arc<dyn ComputeBackend>) -> SimResult<Self> {
+        netlist.validate_finite()?;
         let mut topology = compile_netlist(&netlist)?;
         let dim = topology.soa.mna_dim;
         let mut init_rhs = vec![0.0_f64; dim];
@@ -65,6 +67,24 @@ impl Simulator {
             transient_solver,
             adjoint_engine,
         })
+    }
+
+    /// Parses `spice_src` under explicit [`ResourceLimits`] and applies them to the analyses.
+    pub fn from_spice_with_limits(
+        spice_src: &str,
+        backend: Arc<dyn ComputeBackend>,
+        limits: ResourceLimits,
+    ) -> SimResult<Self> {
+        let netlist = parse_netlist_with_limits(spice_src, &limits)?;
+        let mut sim = Self::from_netlist(netlist, backend)?;
+        sim.set_limits(limits);
+        Ok(sim)
+    }
+
+    /// Sets the work / memory budgets of the `.dc` and `.tran` analyses.
+    pub fn set_limits(&mut self, limits: ResourceLimits) {
+        self.nonlinear_solver.limits = limits;
+        self.transient_solver.limits = limits;
     }
 
     /// Solves the DC Operating Point (`.op`).
@@ -145,7 +165,8 @@ impl Simulator {
         let nr_opts = self.nonlinear_solver.options;
 
         executor.execute_batch(&self.topology, batch_inputs, |local_topo| {
-            let mut local_lin = AdaptiveSparseSolver::compile(&local_topo.jacobian)?;
+            let mut local_lin = self.linear_solver.clone();
+            local_lin.invalidate_factorization();
             let mut local_nl = NonlinearSolver::new(local_topo.soa.mna_dim, nr_opts);
             let res = local_nl.solve_dc_op(local_topo, backend.as_ref(), &mut local_lin)?;
             Ok(BatchCircuitOutput {

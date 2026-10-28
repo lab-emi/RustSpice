@@ -1,0 +1,202 @@
+--- RustSpice.orig/crates/rustspice-backend-cpu/src/simd.rs	2026-10-27 20:21:29.638005962 +0100
++++ RustSpice.v5x/crates/rustspice-backend-cpu/src/simd.rs	2026-10-27 21:03:48.547687549 +0100
+@@ -4,6 +4,11 @@
+ use pulp::Arch;
+ use rustspice_core::{ComputeBackend, CscMatrix, DeviceSoaBuffer, SimResult};
+ 
++fn exp_flag_nomoslim() -> &'static bool {
++    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    F.get_or_init(|| std::env::var_os("RS_X_NOMOSLIM").is_some())
++}
++
+ /// SPICE3f5 / `ngspice` PN-junction logarithmic voltage step limiter (`pnjlim`).
+ ///
+ /// Prevents exponential numerical overflow in Newton-Raphson iterations when a PN junction
+@@ -76,6 +81,39 @@
+     }
+ }
+ 
++/// SPICE3f5 drain-source voltage step limiter (`limvds`), the companion of [`fetlim`].
++#[inline]
++pub fn limvds(vnew: f64, vold: f64) -> f64 {
++    if vold >= 3.5 {
++        if vnew > vold {
++            vnew.min(3.0 * vold + 2.0)
++        } else if vnew < 3.5 {
++            vnew.max(2.0)
++        } else {
++            vnew
++        }
++    } else if vnew > vold {
++        vnew.min(4.0)
++    } else {
++        vnew.max(-0.5)
++    }
++}
++
++/// Level-1 threshold voltage (polarised frame) for a given bulk-source voltage.
++#[inline]
++fn mos1_von(vt0: f64, gamma: f64, phi: f64, vbs: f64) -> f64 {
++    if gamma > 0.0 {
++        let sqrt_phi = phi.sqrt();
++        if vbs <= 0.0 {
++            vt0 + gamma * ((phi - vbs).sqrt() - sqrt_phi)
++        } else {
++            vt0 - gamma * vbs / (2.0 * sqrt_phi)
++        }
++    } else {
++        vt0
++    }
++}
++
+ /// High-throughput CPU backend utilizing `pulp` SIMD runtime dispatch (`AVX-512` / `AVX2` / `NEON`)
+ /// and `rayon` multi-threading for large device arrays.
+ #[derive(Clone, Debug)]
+@@ -105,6 +143,7 @@
+         if n_diodes == 0 {
+             return;
+         }
++        let mut any_limited = false;
+ 
+         let vt_base = state.temp_vt;
+         let gmin = state.gmin;
+@@ -124,8 +163,14 @@
+             } else {
+                 vd_raw
+             };
++            // `pnjlim` altered the linearisation point, or the exponent saturates (`arg > 80`, a
++            // numerical guard, not physics): neither iterate may be accepted as converged.
++            if vd != vd_raw || vd > 80.0 * n_vt {
++                any_limited = true;
++            }
+             state.diode_vd[i] = vd;
+         }
++        state.limiter_active |= any_limited;
+ 
+         // Dispatch diode physics equation evaluation through pulp::Arch SIMD vectorization
+         let vd_slice = state.diode_vd.as_slice();
+@@ -182,6 +227,8 @@
+         }
+         let vt = state.temp_vt;
+         let gmin = state.gmin;
++        let use_limit = self.use_step_limiting && !*exp_flag_nomoslim();
++        let mut any_limited = false;
+ 
+         self.arch.dispatch(|| {
+             for i in 0..n_mos {
+@@ -192,12 +239,71 @@
+ 
+                 let pol = state.mos_polarity[i];
+                 let vds_signed = pol * (vd - vs);
+-                let (mode, vds, vgs, vbs) = if vds_signed >= 0.0 {
++                let (mut mode, mut vds, mut vgs, mut vbs) = if vds_signed >= 0.0 {
+                     (1.0_f64, vds_signed, pol * (vg - vs), pol * (vb - vs))
+                 } else {
+                     (-1.0_f64, -vds_signed, pol * (vg - vd), pol * (vb - vd))
+                 };
+ 
++                // Newton step limiting of the Level-1 terminal voltages (`fetlim` on the gate
++                // overdrive, `limvds` on the drain-source voltage), relative to the previous
++                // iterate stored in `mos_vgs/mos_vds`. The companion model below is then the
++                // exact linearisation about the LIMITED point, and `limiter_active` tells the
++                // Newton loop that this iterate must not be accepted as converged.
++                let mut limited = false;
++                let (mut vgs_p, mut vds_p, vbs_p) = (pol * (vg - vs), vds_signed, pol * (vb - vs));
++                if use_limit && state.mos_level[i] < 2 {
++                    let old_vds = state.mos_vds[i];
++                    let old_vgs = if old_vds >= 0.0 {
++                        state.mos_vgs[i]
++                    } else {
++                        state.mos_vgs[i] + old_vds
++                    };
++                    let vt0 = pol * state.mos_vto[i];
++                    let gamma = state.mos_gamma[i];
++                    let phi = state.mos_phi[i].max(0.1);
++                    let (raw_gs, raw_ds) = (vgs_p, vds_p);
++                    // NOTE: every update is written as `raw + correction` so that an inactive limiter
++                    // returns the raw voltages bit-for-bit (a `a - (a - b)` form differs by 1 ulp and
++                    // would report "limited" at a true fixed point).
++                    if vds_p >= 0.0 {
++                        let von = mos1_von(vt0, gamma, phi, vbs_p);
++                        let vgs_l = fetlim(vgs_p, old_vgs, von);
++                        // vgd is kept: vds follows the limited vgs
++                        vds_p = limvds(vds_p + (vgs_l - vgs_p), old_vds);
++                        vgs_p = vgs_l;
++                    } else {
++                        let von = mos1_von(vt0, gamma, phi, vbs_p - vds_p);
++                        let vgd = vgs_p - vds_p;
++                        let vgd_l = fetlim(vgd, old_vgs - old_vds, von);
++                        // vgs is kept while vgd moves: vds' = vgs - vgd_l = vds + (vgd - vgd_l)
++                        let vds_l = -limvds(-(vds_p + (vgd - vgd_l)), -old_vds);
++                        vgs_p += (vgd_l - vgd) + (vds_l - vds_p);
++                        vds_p = vds_l;
++                    }
++                    limited = vgs_p != raw_gs || vds_p != raw_ds;
++                    if limited {
++                        any_limited = true;
++                        if vds_p >= 0.0 {
++                            (mode, vds, vgs, vbs) = (1.0, vds_p, vgs_p, vbs_p);
++                        } else {
++                            (mode, vds, vgs, vbs) = (-1.0, -vds_p, vgs_p - vds_p, vbs_p - vds_p);
++                        }
++                    }
++                }
++                // Voltage differences the companion model is linearised about (global frame)
++                let (g_gs, g_bs, g_gd, g_bd, g_ds) = if limited {
++                    (
++                        pol * vgs_p,
++                        pol * vbs_p,
++                        pol * (vgs_p - vds_p),
++                        pol * (vbs_p - vds_p),
++                        pol * vds_p,
++                    )
++                } else {
++                    (vg - vs, vb - vs, vg - vd, vb - vd, vd - vs)
++                };
++
+                 state.mos_vgs[i] = vgs;
+                 state.mos_vds[i] = mode * vds;
+                 state.mos_vbs[i] = vbs;
+@@ -294,7 +400,7 @@
+ 
+                 // Signed drain-to-source current in global node orientation (with minimum Gmin bleed conductance)
+                 let gds = gds + gmin;
+-                let id_oriented = pol * mode * cdrain + gmin * (vd - vs);
++                let id_oriented = pol * mode * cdrain + gmin * g_ds;
+                 state.mos_id[i] = id_oriented;
+                 state.mos_gm[i] = gm;
+                 state.mos_gds[i] = gds;
+@@ -306,7 +412,7 @@
+ 
+                 if mode > 0.0 {
+                     // Normal mode: controlled by (V_G - V_S) and (V_B - V_S)
+-                    let ieq = id_oriented - gm * (vg - vs) - gmbs * (vb - vs) - gds * (vd - vs);
++                    let ieq = id_oriented - gm * g_gs - gmbs * g_bs - gds * g_ds;
+                     state.mos_ieq[i] = ieq;
+                     state.cond_buf[state.mos_gm_buf_idx[i] as usize] = gm;
+                     state.cond_buf[state.mos_gds_buf_idx[i] as usize] = gds;
+@@ -316,7 +422,7 @@
+                     state.rhs_buf[state.mos_rhs_buf_idx[i] as usize] = ieq;
+                 } else {
+                     // Reversed mode: controlled by (V_G - V_D) and (V_B - V_D)
+-                    let ieq = id_oriented + gm * (vg - vd) + gmbs * (vb - vd) - gds * (vd - vs);
++                    let ieq = id_oriented + gm * g_gd + gmbs * g_bd - gds * g_ds;
+                     state.mos_ieq[i] = ieq;
+                     state.cond_buf[state.mos_gm_buf_idx[i] as usize] = 0.0;
+                     state.cond_buf[state.mos_gds_buf_idx[i] as usize] = gds;
+@@ -327,6 +433,7 @@
+                 }
+             }
+         });
++        state.limiter_active |= any_limited;
+     }
+ }
+ 
+@@ -366,6 +473,7 @@
+         }
+ 
+         // Evaluate nonlinear semiconductor devices via SIMD
++        state.limiter_active = false;
+         self.eval_diodes(state, voltages);
+         self.eval_mosfets(state, voltages);
+ 

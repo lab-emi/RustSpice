@@ -3,7 +3,9 @@
 //! `CscGatherTable`, hardware [`ComputeBackend`] trait, and OpenVAF/OSDI v0.3 interface.
 
 pub mod backend;
+pub mod diag;
 pub mod error;
+pub mod limits;
 pub mod netlist;
 pub mod osdi;
 pub mod precision;
@@ -11,10 +13,12 @@ pub mod soa;
 pub mod sparse;
 
 pub use backend::ComputeBackend;
+pub use diag::{Diagnostic, Severity};
 pub use error::{SimError, SimResult};
+pub use limits::ResourceLimits;
 pub use netlist::{
-    parse_netlist, parse_spice_number, AnalysisCmd, CircuitBuilder, DiodeModelParams,
-    MosfetModelParams, MosfetType, Netlist, SourceWaveform,
+    parse_netlist, parse_netlist_with_limits, parse_spice_number, AnalysisCmd, CircuitBuilder,
+    DiodeModelParams, MosfetModelParams, MosfetType, Netlist, SourceWaveform,
 };
 pub use osdi::{OsdiDescriptor, OsdiLibrary, OsdiModelInstance};
 pub use precision::{Df64, Dual};

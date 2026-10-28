@@ -1,0 +1,7 @@
+* bench.id: rob_hs_ff_utf16_le_with_bom
+* bench.group: robustness
+* bench.title: a valid 5 V divider saved as UTF-16 LE with a byte-order mark
+* bench.expect: loud_error
+* bench.tags: hostile, file, encoding
+* bench.est_rss_mib: 64
+* bench.note: neither tool reads UTF-16 text (ngspice-47 exits 0 without a rawfile, RustSpice refuses the invalid UTF-8): a loud refusal is correct, silent numbers would be a defect

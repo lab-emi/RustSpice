@@ -1,0 +1,2 @@
+* first level include target of cap_lang_inc_nested
+.include cap_lang_inc_nested_b.lib

@@ -1,0 +1,2 @@
+* include target B (part of rob_hs_include_loop)
+.include rob_hs_include_loop_a.lib

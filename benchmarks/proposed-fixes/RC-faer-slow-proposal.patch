@@ -1,0 +1,358 @@
+--- a/crates/rustspice-backend-cpu/src/jit.rs
++++ b/crates/rustspice-backend-cpu/src/jit.rs
+@@ -13,6 +13,7 @@
+ use cranelift_module::{Linkage, Module};
+ use rustc_hash::FxHashMap;
+ use rustspice_core::{CscMatrix, SimError, SimResult};
++use std::collections::hash_map::Entry;
+ 
+ /// Micro-operation in the pre-compiled symbolic LU factorization stream.
+ #[derive(Clone, Copy, Debug)]
+@@ -61,8 +62,23 @@
+ 
+ impl UnrolledSymbolicLu {
+     /// Performs symbolic Gaussian elimination with numerical static pivoting on `initial_csc`
+-    /// to synthesize a zero-indirection [`UnrolledSymbolicLu`] execution plan.
++    /// to synthesize a zero-indirection [`UnrolledSymbolicLu`] execution plan (no op budget).
+     pub fn compile(initial_csc: &CscMatrix<f64>) -> SimResult<Self> {
++        Ok(Self::compile_with_budget(initial_csc, usize::MAX)?
++            .expect("an unbounded op budget cannot be exceeded"))
++    }
++
++    /// Like [`Self::compile`], but gives up as soon as the factorization is *certain* to need more than
++    /// `max_ops` micro-operations (`Ok(None)`), so the analysis time and memory are bounded by
++    /// O(`max_ops`) instead of by the (possibly cubic) fill of the matrix.
++    ///
++    /// The returned plan is bit-identical to the one [`Self::compile`] builds whenever it has at most
++    /// `max_ops` ops. The abort is exact (never early): the phase-1 counter only counts eliminations that
++    /// phase 2 and 3 will emit, and phase 2 counts the final op total before phase 3 allocates anything.
++    pub fn compile_with_budget(
++        initial_csc: &CscMatrix<f64>,
++        max_ops: usize,
++    ) -> SimResult<Option<Self>> {
+         let n = initial_csc.nrows;
+         if n != initial_csc.ncols || n == 0 {
+             return Err(SimError::TopologyError(
+@@ -86,6 +102,8 @@
+ 
+         let mut row_perm: Vec<usize> = vec![usize::MAX; n];
+         let mut used = vec![false; n];
++        // lower bound on `factor_ops.len()`: one `InvertPivot` per row + the eliminations executed below
++        let mut ops_lb = n;
+ 
+         // Pre-pair grounded voltage-source singleton branches `(p, br)`:
+         // When row `br` has only 1 entry at column `p` and column `br` has only 1 entry at row `p`,
+@@ -174,14 +192,23 @@
+                     if lik.abs() == 0.0 {
+                         continue;
+                     }
++                    // Every executed row elimination becomes one `ScaleMultiplier` plus one `Eliminate`
++                    // per upper entry of the pivot row in the final stream (a lower bound: the symbolic
++                    // structure of phase 2 is a superset of the numerically non-zero one).
++                    ops_lb = ops_lb.saturating_add(1 + piv_upper.len());
++                    if ops_lb > max_ops {
++                        return Ok(None);
++                    }
+                     let mult = lik / piv_val;
+                     sim_rows[r_orig].remove(&k);
++                    let row = &mut sim_rows[r_orig];
+                     for &(c, ukj) in &piv_upper {
+-                        let is_new = !sim_rows[r_orig].contains_key(&c);
+-                        let entry = sim_rows[r_orig].entry(c).or_insert(0.0);
+-                        *entry -= mult * ukj;
+-                        if is_new {
+-                            col_to_rows[c].push(r_orig);
++                        match row.entry(c) {
++                            Entry::Occupied(mut e) => *e.get_mut() -= mult * ukj,
++                            Entry::Vacant(v) => {
++                                v.insert(0.0 - mult * ukj);
++                                col_to_rows[c].push(r_orig);
++                            }
+                         }
+                     }
+                 }
+@@ -212,13 +239,21 @@
+         }
+ 
+         let mut row_upper_cols: Vec<Vec<usize>> = vec![Vec::new(); n];
++        // exact final op count: one `InvertPivot` per row, then per pivot `k` every lower row `i` costs one
++        // `ScaleMultiplier` plus one `Eliminate` per upper column (both lists are final at step `k`)
++        let mut ops_exact = n;
+         for k in 0..n {
+             let split_idx = active_rows[k].partition_point(|&c| c <= k);
+             let upper_cols: Vec<usize> = active_rows[k][split_idx..].to_vec();
++            let mut lower_rows = sym_col_rows[k].clone();
++            lower_rows.sort_unstable();
++            lower_rows.dedup();
++            ops_exact =
++                ops_exact.saturating_add(lower_rows.len().saturating_mul(1 + upper_cols.len()));
++            if ops_exact > max_ops {
++                return Ok(None);
++            }
+             if !upper_cols.is_empty() {
+-                let mut lower_rows = sym_col_rows[k].clone();
+-                lower_rows.sort_unstable();
+-                lower_rows.dedup();
+                 for i in lower_rows {
+                     if i > k {
+                         for &c in &upper_cols {
+@@ -327,7 +362,8 @@
+             u_col_ptr.push(u_terms.len());
+         }
+ 
+-        Ok(Self {
++        debug_assert_eq!(factor_ops.len(), ops_exact);
++        Ok(Some(Self {
+             dim: n,
+             lu_nnz: lu_nnz as usize,
+             row_perm,
+@@ -339,7 +375,7 @@
+             l_terms,
+             u_col_ptr,
+             u_terms,
+-        })
++        }))
+     }
+ 
+     /// Scatters `csc_values` into `lu_buf` and executes the pre-compiled symbolic LU operations.
+@@ -481,6 +517,22 @@
+     /// Compiles a topology-specialized native machine code solver from `initial_csc`.
+     pub fn compile(initial_csc: &CscMatrix<f64>) -> SimResult<Self> {
+         let symbolic = UnrolledSymbolicLu::compile(initial_csc)?;
++        Self::from_symbolic(symbolic)
++    }
++
++    /// Like [`Self::compile`], but returns `Ok(None)` as soon as the unrolled LU is certain to need more
++    /// than `max_unrolled_ops` micro-operations (see [`UnrolledSymbolicLu::compile_with_budget`]).
++    pub fn compile_bounded(
++        initial_csc: &CscMatrix<f64>,
++        max_unrolled_ops: usize,
++    ) -> SimResult<Option<Self>> {
++        match UnrolledSymbolicLu::compile_with_budget(initial_csc, max_unrolled_ops)? {
++            Some(symbolic) => Self::from_symbolic(symbolic).map(Some),
++            None => Ok(None),
++        }
++    }
++
++    fn from_symbolic(symbolic: UnrolledSymbolicLu) -> SimResult<Self> {
+         if symbolic.factor_ops.len() > Self::MAX_JIT_OPS {
+             return Ok(Self {
+                 symbolic,
+--- a/crates/rustspice-solver/src/linear.rs
++++ b/crates/rustspice-solver/src/linear.rs
+@@ -6,9 +6,13 @@
+ //! 3. **Tier 3 (`PreconditionedCg`)**: SIMD-accelerated Jacobi-Preconditioned Conjugate Gradient
+ //!    with mixed-precision (`Df64` + `f64`) iterative refinement for large-scale RC grids.
+ 
++use faer::dyn_stack::{GlobalPodBuffer, PodStack};
+ use faer::prelude::SpSolver;
++use faer::sparse::linalg::lu::{
++    factorize_symbolic_lu, LuRef, LuSymbolicParams, NumericLu, SymbolicLu as FaerSymbolicLu,
++};
+ use faer::sparse::{SparseColMatRef, SymbolicSparseColMatRef};
+-use faer::Mat;
++use faer::{Conj, Mat};
+ use rustspice_backend_cpu::CraneliftTopologyJit;
+ use rustspice_core::{CscMatrix, CsrMatrix, Df64, SimError, SimResult};
+ 
+@@ -25,6 +29,21 @@
+     PreconditionedCg,
+ }
+ 
++/// Per-topology cache of the `faer` tier: the symbolic analysis (COLAMD ordering, elimination tree,
++/// supernode partition) is computed once for a sparsity pattern; every later factorization only runs the
++/// numeric phase into the retained `numeric` storage and workspaces (no allocation in the hot loop).
++struct FaerLuCache {
++    /// Sparsity pattern the symbolic analysis belongs to (compared on every call; O(nnz) `memcmp`).
++    col_ptr: Vec<usize>,
++    row_idx: Vec<usize>,
++    symbolic: FaerSymbolicLu<usize>,
++    numeric: NumericLu<usize, f64>,
++    factor_mem: GlobalPodBuffer,
++    solve_mem: GlobalPodBuffer,
++    /// `numeric` holds a successful factorization of the last matrix passed to `factorize_faer`.
++    factored: bool,
++}
++
+ /// Adaptive sparse linear solver maintaining pre-allocated workspaces (`lu_buf`, `work_vec`)
+ /// so that hot-loop Newton-Raphson and Transient solves incur **zero heap allocations**.
+ pub struct AdaptiveSparseSolver {
+@@ -33,7 +52,7 @@
+     jit_solver: Option<CraneliftTopologyJit>,
+     lu_buf: Vec<f64>,
+     work_vec: Vec<f64>,
+-    faer_lu: Option<faer::sparse::linalg::solvers::Lu<usize, f64>>,
++    faer: Option<FaerLuCache>,
+     has_valid_factors: bool,
+ }
+ 
+@@ -46,24 +65,25 @@
+         let dim = initial_csc.nrows;
+         // Attempt symbolic compilation for Tier 1 (Cranelift JIT / Unrolled Symbolic LU)
+         if dim <= 15_000 {
+-            if let Ok(jit) = CraneliftTopologyJit::compile(initial_csc) {
+-                if jit.symbolic.factor_ops.len() <= Self::MAX_UNROLLED_OPS {
+-                    let kind = if jit.has_native_jit() {
+-                        LinearSolverKind::CraneliftJit
+-                    } else {
+-                        LinearSolverKind::UnrolledSymbolic
+-                    };
+-                    let lu_nnz = jit.symbolic.lu_nnz;
+-                    return Ok(Self {
+-                        dim,
+-                        kind,
+-                        jit_solver: Some(jit),
+-                        lu_buf: vec![0.0; lu_nnz],
+-                        work_vec: vec![0.0; dim],
+-                        faer_lu: None,
+-                        has_valid_factors: false,
+-                    });
+-                }
++            // Budgeted analysis: a topology whose unrolled LU needs more than `MAX_UNROLLED_OPS` ops is
++            // rejected after O(MAX_UNROLLED_OPS) work and memory instead of after the full (cubic) fill.
++            let jit_r = CraneliftTopologyJit::compile_bounded(initial_csc, Self::MAX_UNROLLED_OPS);
++            if let Ok(Some(jit)) = jit_r {
++                let kind = if jit.has_native_jit() {
++                    LinearSolverKind::CraneliftJit
++                } else {
++                    LinearSolverKind::UnrolledSymbolic
++                };
++                let lu_nnz = jit.symbolic.lu_nnz;
++                return Ok(Self {
++                    dim,
++                    kind,
++                    jit_solver: Some(jit),
++                    lu_buf: vec![0.0; lu_nnz],
++                    work_vec: vec![0.0; dim],
++                    faer: None,
++                    has_valid_factors: false,
++                });
+             }
+         }
+ 
+@@ -73,7 +93,7 @@
+             jit_solver: None,
+             lu_buf: Vec::new(),
+             work_vec: vec![0.0; dim],
+-            faer_lu: None,
++            faer: None,
+             has_valid_factors: false,
+         })
+     }
+@@ -131,7 +151,7 @@
+             jit.symbolic.solve(&self.lu_buf, rhs, x);
+             return Ok(());
+         }
+-        if self.faer_lu.is_some() {
++        if self.faer.as_ref().is_some_and(|c| c.factored) {
+             self.solve_faer(rhs, x);
+             return Ok(());
+         }
+@@ -189,6 +209,12 @@
+         Ok(())
+     }
+ 
++    /// Numeric LU of `csc` on the `faer` tier.
++    ///
++    /// The symbolic analysis (COLAMD column ordering, column elimination tree, supernode partition) depends
++    /// only on the sparsity pattern, which is fixed for a compiled topology: it is built once and reused;
++    /// every call after the first only runs the numeric phase (with partial pivoting, so the row pivots still
++    /// follow the current values) into the retained `NumericLu` storage and workspace.
+     fn factorize_faer(&mut self, csc: &CscMatrix<f64>) -> SimResult<()> {
+         if csc.values.iter().any(|v| !v.is_finite()) {
+             return Err(SimError::SingularMatrix { index: 0 });
+@@ -211,28 +237,74 @@
+             )
+         };
+         let mat = SparseColMatRef::new(sym, csc.values.as_slice());
+-        let sym_lu = faer::sparse::linalg::solvers::SymbolicLu::try_new(sym)
+-            .map_err(|_| SimError::SingularMatrix { index: 0 })?;
+-        let lu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+-            faer::sparse::linalg::solvers::Lu::try_new_with_symbolic(sym_lu, mat)
+-        }))
+-        .map_err(|_| SimError::SingularMatrix { index: 0 })?
+-        .map_err(|_| SimError::SingularMatrix { index: 0 })?;
+-        self.faer_lu = Some(lu);
+-        Ok(())
+-    }
++        let parallelism = faer::get_global_parallelism();
+ 
+-    fn solve_faer(&self, rhs: &[f64], x: &mut [f64]) {
+-        if let Some(ref lu) = self.faer_lu {
+-            let n = self.dim;
+-            let mut b_mat = Mat::<f64>::zeros(n, 1);
+-            for i in 0..n {
+-                b_mat[(i, 0)] = rhs[i];
+-            }
+-            lu.solve_in_place(b_mat.as_mut());
+-            for i in 0..n {
+-                x[i] = b_mat[(i, 0)];
++        let pattern_matches = self
++            .faer
++            .as_ref()
++            .is_some_and(|c| c.col_ptr == csc.col_ptr && c.row_idx == csc.row_idx);
++        if !pattern_matches {
++            // New topology (or first call): symbolic analysis once, plus the numeric and solve workspaces.
++            self.faer = None;
++            self.has_valid_factors = false;
++            let symbolic = factorize_symbolic_lu(sym, LuSymbolicParams::default())
++                .map_err(|_| SimError::SingularMatrix { index: 0 })?;
++            let factor_req = symbolic
++                .factorize_numeric_lu_req::<f64>(parallelism)
++                .map_err(|_| SimError::SingularMatrix { index: 0 })?;
++            let solve_req = symbolic
++                .solve_in_place_req::<f64>(1, parallelism)
++                .map_err(|_| SimError::SingularMatrix { index: 0 })?;
++            self.faer = Some(FaerLuCache {
++                col_ptr: csc.col_ptr.clone(),
++                row_idx: csc.row_idx.clone(),
++                symbolic,
++                numeric: NumericLu::new(),
++                factor_mem: GlobalPodBuffer::new(factor_req),
++                solve_mem: GlobalPodBuffer::new(solve_req),
++                factored: false,
++            });
++        }
++
++        let cache = self.faer.as_mut().expect("faer cache was just built");
++        cache.factored = false;
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            cache
++                .symbolic
++                .factorize_numeric_lu(
++                    &mut cache.numeric,
++                    mat,
++                    parallelism,
++                    PodStack::new(&mut cache.factor_mem),
++                )
++                .map(|_| ())
++        }));
++        match result {
++            Ok(Ok(())) => {
++                cache.factored = true;
++                Ok(())
+             }
++            _ => {
++                // a failed or panicked numeric phase may leave the factor storage half written
++                cache.numeric = NumericLu::new();
++                self.has_valid_factors = false;
++                Err(SimError::SingularMatrix { index: 0 })
++            }
++        }
++    }
++
++    fn solve_faer(&mut self, rhs: &[f64], x: &mut [f64]) {
++        let n = self.dim;
++        if let Some(cache) = self.faer.as_mut().filter(|c| c.factored) {
++            x[..n].copy_from_slice(&rhs[..n]);
++            // SAFETY: `numeric` is the output of `symbolic.factorize_numeric_lu` for this pattern (`factored`).
++            let lu = unsafe { LuRef::new_unchecked(&cache.symbolic, &cache.numeric) };
++            lu.solve_in_place_with_conj(
++                Conj::No,
++                faer::mat::from_column_major_slice_mut::<f64, usize, usize>(&mut x[..n], n, 1),
++                faer::get_global_parallelism(),
++                PodStack::new(&mut cache.solve_mem),
++            );
+         }
+     }
+ 

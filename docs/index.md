@@ -20,16 +20,18 @@ rustspice codegen --model mosfet-ekv --target msl
 rustspice bench-ngspice --output docs/benchmark_report.md
 ```
 
-## Head-to-head vs. `ngspice-47` (KLU)
+## Head-to-head vs. `ngspice-47`
 
-| Benchmark suite | Circuit scale | `ngspice` wall, ms ↓ | `RustSpice` total, ms ↓ | Max \|ΔV\|, V ↓ | End-to-end speedup ↑ | Solver speedup ↑ |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| **5,000-Node Power Grid (DC OP)** | 10,000 Resistors, 5,002 MNA vars | 58.47 | **11.053** | `2.16e-45` | **5.3×** | **243.2×** |
-| **2,000-Node RC Line (500-Step Tran)** | 4,000 R/C elements, 500 steps | 244.81 | **32.218** | `0.00e0` | **7.6×** | **8.6×** |
-| **64-Diode Nonlinear Array (DC Sweep)** | 64 Diodes + 128 R, 201 points | 8.71 | **2.898** | `2.15e-14` | **3.0×** | **1.9×** |
-| **100-Stage CMOS Inverter Chain (Tran)** | 200 MOSFETs + 100 C, 400 steps | 42.14 | **16.265** | `3.31e-12` | **2.6×** | **2.5×** |
-| **200-Param Sensitivity (Adjoint vs. FD)** | 200 Resistor Gradients | 2,167.17 | **0.345** | `1.50e-11` | **6,284.9×** | **9,867.0×** |
-| **128-Corner PVT Batch (Rayon Parallel)** | 128 Nonlinear 32-Diode Corners | 686.08 | **2.136** | `0.00e0` | **321.1×** | **131.9×** |
+| Benchmark | Circuit scale | `ngspice-47`<br>end to end ↓ | `RustSpice`<br>end to end ↓ | Speedup ↑ | Max error: `RustSpice` / `ngspice` default ↓ |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| **1. Resistor ladder (DC OP)** | 10,000 resistors, 5,002 MNA unknowns (DC operating point) | 40.20 ms | 16.40 ms | **2.45×** | `1.91e-13` / `1.93e-13` V |
+| **2. RC line (transient)** | 4,000 R/C elements, `.tran 10p 5n` (500 steps) | 163 ms | 39.90 ms | **4.08×** at 32.8× the error of ngspice default | `5.40e-2` / `1.65e-3` of swing (vs tight ngspice) |
+| **3. Diode array (DC sweep)** | 64 diodes + 128 resistors, 201-point DC sweep | 7.80 ms | 4.72 ms | **1.65×** | `5.89e-11` / `5.44e-5` V |
+| **4. CMOS inverter chain (transient)** | 200 MOSFETs + 100 capacitors, `.tran 5p 2n` (400 steps) | 52.81 ms | 30.93 ms | **1.71×** | `4.14e-1` / `3.86e-1` of swing (vs tight ngspice) |
+| **5. Sensitivity (adjoint vs. ngspice `.sens`)** | 200 resistor gradients (one adjoint solve) | 11.44 ms | 1.20 ms | **9.55×** vs `.sens` | `9.33e-15` / `1.00e-6` (normalised) |
+| **6. PVT batch (128 corners)** | 128 PVT corners of a 32-diode nonlinear net (Rayon) | 3.71 ms | 3.65 ms | **1.02×** (parallel workload; **2.62×** via `.dc` sweep) | `2.47e-11` / `1.63e-5` V |
+
+Speedup = `ngspice-47` / `RustSpice`, median of 9 interleaved repetitions against the faster of ngspice's SPARSE 1.3 and KLU solvers; both tools run as subprocesses with rawfile output on tmpfs, the single-core benchmarks pinned to one idle core (the parallel batch, benchmark 6, is not pinned). The previously published 5.3×, 7.6×, 3.0×, 2.6×, 6,285× and 321× came from a harness with known defects (1 ms-quantised solver times, a cold process compared with a warm in-process call, hard-coded zero errors, single runs multiplied by 128 or 400, a transient compared at t = 0 only) and are withdrawn; the report lists each one with its replacement.
 
 ## Guides and reference
 

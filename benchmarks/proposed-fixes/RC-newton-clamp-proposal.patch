@@ -1,0 +1,350 @@
+--- a/crates/rustspice-core/src/error.rs
++++ b/crates/rustspice-core/src/error.rs
+@@ -17,6 +17,11 @@
+     #[error("Newton-Raphson failed to converge after {iterations} iterations (residual = {residual:.3e})")]
+     ConvergenceFailure { iterations: usize, residual: f64 },
+ 
++    /// A converged iterate lies outside the range in which a device model is evaluated exactly
++    /// (for example a diode junction whose exponent argument exceeds the f64 overflow guard).
++    #[error("Device model range exceeded: {0}")]
++    DeviceRangeExceeded(String),
++
+     #[error("Transient simulation failed at t = {time:.3e}s: {reason}")]
+     TransientFailure { time: f64, reason: String },
+ 
+--- a/crates/rustspice-backend-cpu/src/simd.rs
++++ b/crates/rustspice-backend-cpu/src/simd.rs
+@@ -76,6 +76,26 @@
+     }
+ }
+ 
++/// Largest diode exponent argument `v_d / (n * V_t)` that is evaluated with the exact exponential.
++///
++/// `exp(600) ~ 3.8e260` leaves 48 decades of headroom below the f64 overflow threshold, so the
++/// linear continuation above it stays finite for any argument below ~1e47 and `Is * exp(600)` stays
++/// finite for any saturation current below ~1e47 A. Above this argument the model continues
++/// linearly with matching value and slope (a C1 continuation, so the Newton linearization stays
++/// consistent), and the nonlinear solver refuses to accept an operating point in that region
++/// instead of reporting numbers from the continuation.
++pub const DIODE_EXP_ARG_MAX: f64 = 600.0;
++
++/// Shockley exponential `e^arg` and its derivative with respect to `arg`, evaluated exactly up to
++/// [`DIODE_EXP_ARG_MAX`] and continued linearly (value and slope matched) above it.
++#[inline]
++pub fn diode_exp(arg: f64) -> (f64, f64) {
++    let a = arg.min(DIODE_EXP_ARG_MAX);
++    let e = a.exp();
++    // `arg - a` is zero below the cap, so the continuation term vanishes without a branch.
++    (e * (1.0 + (arg - a)), e)
++}
++
+ /// High-throughput CPU backend utilizing `pulp` SIMD runtime dispatch (`AVX-512` / `AVX2` / `NEON`)
+ /// and `rayon` multi-threading for large device arrays.
+ #[derive(Clone, Debug)]
+@@ -146,12 +166,11 @@
+                 let inv_n_vt = 1.0 / n_vt;
+ 
+                 let (id, gd, evd_m1, evd) = if vd >= -3.0 * n_vt {
+-                    let arg = (vd * inv_n_vt).clamp(-80.0, 80.0);
+-                    let ev = arg.exp();
++                    let (ev, dev) = diode_exp(vd * inv_n_vt);
+                     let ev_m1 = ev - 1.0;
+                     let cur = is.mul_add(ev_m1, gmin * vd);
+-                    let cond = (is * inv_n_vt).mul_add(ev, gmin);
+-                    (cur, cond, ev_m1, ev)
++                    let cond = (is * inv_n_vt).mul_add(dev, gmin);
++                    (cur, cond, ev_m1, dev)
+                 } else {
+                     let arg = 3.0 * n_vt / (vd * std::f64::consts::E);
+                     let arg3 = arg * arg * arg;
+@@ -429,3 +448,23 @@
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn diode_exp_is_exact_below_the_cap_and_c1_continuous_above() {
++        for &a in &[-3.0, 0.0, 1.0, 80.0, 193.3, 599.0, DIODE_EXP_ARG_MAX] {
++            let (e, de) = diode_exp(a);
++            assert_eq!(e, a.exp());
++            assert_eq!(de, a.exp());
++        }
++        let cap = DIODE_EXP_ARG_MAX.exp();
++        let (e_hi, de_hi) = diode_exp(DIODE_EXP_ARG_MAX + 10.0);
++        assert!((e_hi / (cap * 11.0) - 1.0).abs() < 1e-15, "value must continue linearly");
++        assert_eq!(de_hi, cap, "slope must match the exact exponential at the cap");
++        let (e_far, _) = diode_exp(1.0e6);
++        assert!(e_far.is_finite(), "no overflow far above the cap");
++    }
++}
+--- a/crates/rustspice-backend-cpu/src/lib.rs
++++ b/crates/rustspice-backend-cpu/src/lib.rs
+@@ -12,4 +12,4 @@
+ 
+ pub use batch::{BatchCircuitInput, BatchCircuitOutput, BatchCpuExecutor};
+ pub use jit::{CraneliftTopologyJit, SymbolicLuOp, UnrolledSymbolicLu};
+-pub use simd::{fetlim, pnjlim, CpuSimdBackend};
++pub use simd::{diode_exp, fetlim, pnjlim, CpuSimdBackend, DIODE_EXP_ARG_MAX};
+--- a/crates/rustspice-solver/src/nonlinear.rs
++++ b/crates/rustspice-solver/src/nonlinear.rs
+@@ -5,11 +5,15 @@
+ //! - Secant Trajectory Predictor for DC Sweeps and Transient Time-Stepping
+ //! - Homotopy Continuation (`Gmin Stepping` & `Source Stepping`)
+ 
+-use rustspice_core::{CompiledTopology, ComputeBackend, SimError, SimResult};
++use rustspice_backend_cpu::DIODE_EXP_ARG_MAX;
++use rustspice_core::{CompiledTopology, ComputeBackend, DeviceSoaBuffer, SimError, SimResult};
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::linear::AdaptiveSparseSolver;
+ 
++/// Default number of consecutive binding iterations after which the voltage box is released.
++pub const BOX_RELEASE_ITERS: usize = 16;
++
+ /// Configuration options for the Damped Newton-Raphson solver.
+ #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+ pub struct NrOptions {
+@@ -17,6 +21,17 @@
+     pub reltol: f64,
+     pub vntol: f64,
+     pub abstol: f64,
++    /// Relative part of the KCL residual criterion: row `i` is converged when
++    /// `|r_i| <= abstol + res_reltol * s_i` with `s_i = |rhs_i| + sum_j |J_ij x_j|` the magnitude of the
++    /// terms that were summed to form `r_i`. A purely absolute `abstol` is below the f64 rounding
++    /// noise (`~1e-16 * s_i`) of any row that carries more than ~1e3 A, so it can never be met there.
++    pub res_reltol: f64,
++    /// The source-derived voltage box that stabilizes the first Newton iterations of circuits without
++    /// MOSFET step limiting is released for the rest of the solve once it has been *binding* (moved a
++    /// node voltage by more than the step tolerance) on this many consecutive iterations: at that point
++    /// the box, not the circuit, is what keeps the residual from vanishing (a rail, rectifier or
++    /// current-driven node outside the source range).
++    pub box_release_iters: usize,
+     pub enable_shamanskii: bool,
+     pub enable_homotopy: bool,
+ }
+@@ -28,6 +43,8 @@
+             reltol: 1e-6,
+             vntol: 1e-10,
+             abstol: 1e-12,
++            res_reltol: 1e-12,
++            box_release_iters: BOX_RELEASE_ITERS,
+             enable_shamanskii: true,
+             enable_homotopy: true,
+         }
+@@ -56,6 +73,7 @@
+     rhs: Vec<f64>,
+     next_x: Vec<f64>,
+     residual_vec: Vec<f64>,
++    residual_scale: Vec<f64>,
+     delta_x: Vec<f64>,
+ }
+ 
+@@ -67,6 +85,7 @@
+             rhs: vec![0.0; dim],
+             next_x: vec![0.0; dim],
+             residual_vec: vec![0.0; dim],
++            residual_scale: vec![0.0; dim],
+             delta_x: vec![0.0; dim],
+         }
+     }
+@@ -78,11 +97,57 @@
+             self.rhs.resize(dim, 0.0);
+             self.next_x.resize(dim, 0.0);
+             self.residual_vec.resize(dim, 0.0);
++            self.residual_scale.resize(dim, 0.0);
+             self.delta_x.resize(dim, 0.0);
+         }
+     }
+ 
+-    /// Synchronizes internal diode junction voltages `diode_vd` with a predicted node voltage vector `x`.
++    /// Fused `y = J x` and `s_i = sum_j |J_ij x_j|` in one pass over the CSC matrix.
++    #[inline]
++    fn spmv_with_magnitude(
++        jac: &rustspice_core::CscMatrix<f64>,
++        x: &[f64],
++        y: &mut [f64],
++        mag: &mut [f64],
++    ) {
++        y.fill(0.0);
++        mag.fill(0.0);
++        for (col, &xj) in x.iter().enumerate().take(jac.ncols) {
++            if xj == 0.0 {
++                continue;
++            }
++            for idx in jac.col_ptr[col]..jac.col_ptr[col + 1] {
++                let term = jac.values[idx] * xj;
++                let row = jac.row_idx[idx];
++                y[row] += term;
++                mag[row] += term.abs();
++            }
++        }
++    }
++
++    /// Rejects an accepted iterate `x` whose diode junction needs the linear continuation of the
++    /// Shockley exponential (`v_d / (n V_t) > DIODE_EXP_ARG_MAX`): the numbers there are not the
++    /// model's, so the operating point is reported as an error instead of being returned silently.
++    /// The junction voltage is read from `x` itself, not from the limited evaluation point, so a
++    /// limiter that is still climbing toward an out-of-range solution cannot hide it.
++    fn check_diode_exponent_range(soa: &DeviceSoaBuffer, x: &[f64]) -> SimResult<()> {
++        for i in 0..soa.diode_names.len() {
++            let va = DeviceSoaBuffer::node_voltage(x, soa.diode_anode[i]);
++            let vc = DeviceSoaBuffer::node_voltage(x, soa.diode_cathode[i]);
++            let vd = va - vc;
++            let arg = vd / (soa.diode_n[i] * soa.temp_vt);
++            if arg > DIODE_EXP_ARG_MAX {
++                return Err(SimError::DeviceRangeExceeded(format!(
++                    "diode `{}` junction voltage {:.6e} V is {:.1} thermal-voltage units (exponent argument limit {})",
++                    soa.diode_names[i], vd, arg, DIODE_EXP_ARG_MAX
++                )));
++            }
++        }
++        Ok(())
++    }
++
++    /// Synchronizes internal diode junction voltages `diode_vd` with a node voltage vector `x`
++    /// (the reference point of the next junction-limiting step).
+     #[inline]
+     pub fn sync_device_voltages(topo: &mut CompiledTopology, x: &[f64]) {
+         for i in 0..topo.soa.diode_names.len() {
+@@ -122,16 +187,19 @@
+             .vsrc_values
+             .iter()
+             .fold(0.0_f64, |acc, &v| acc.max(v));
+-        let (v_clamp_min, v_clamp_max) = if !topo.soa.is_transient
+-            && topo.soa.isrc_values.is_empty()
+-            && topo.soa.vccs_gm.is_empty()
+-            && (v_max - v_min) > 0.0
+-        {
+-            (v_min, v_max)
+-        } else {
+-            let span = (v_max - v_min).max(5.0);
+-            (v_min - span, v_max + span)
+-        };
++        let mut v_box = Some(
++            if !topo.soa.is_transient
++                && topo.soa.isrc_values.is_empty()
++                && topo.soa.vccs_gm.is_empty()
++                && (v_max - v_min) > 0.0
++            {
++                (v_min, v_max)
++            } else {
++                let span = (v_max - v_min).max(5.0);
++                (v_min - span, v_max + span)
++            },
++        );
++        let mut box_binding_streak = 0usize;
+ 
+         let mut prev_res_norm = f64::INFINITY;
+         let mut prev_step_converged = false;
+@@ -141,18 +209,32 @@
+             backend.evaluate_devices(&mut topo.soa, x)?;
+             backend.stamp_jacobian(&topo.soa, &mut topo.jacobian, &mut self.rhs)?;
+ 
+-            // Compute exact KCL residual vector: r = rhs - J * x
+-            topo.jacobian.spmv(x, &mut self.residual_vec);
++            // Compute exact KCL residual vector r = rhs - J * x together with the magnitude
++            // s_i = |rhs_i| + sum_j |J_ij x_j| of the terms summed into each row.
++            Self::spmv_with_magnitude(
++                &topo.jacobian,
++                x,
++                &mut self.residual_vec,
++                &mut self.residual_scale,
++            );
+             let mut max_res = 0.0_f64;
++            let mut res_ok = true;
+             for i in 0..dim {
+                 let r = self.rhs[i] - self.residual_vec[i];
+                 self.residual_vec[i] = r;
+-                max_res = max_res.max(r.abs());
++                let ar = r.abs();
++                max_res = max_res.max(ar);
++                let scale = self.residual_scale[i] + self.rhs[i].abs();
++                // `!(ar <= tol)` also fails on a NaN residual
++                if !(ar <= self.options.abstol + self.options.res_reltol * scale) {
++                    res_ok = false;
++                }
+             }
+ 
+             // Early convergence check: if previous step Δx was within voltage tolerance
+-            // AND current exact KCL residual is within abstol, x is already converged!
+-            if iter > 1 && prev_step_converged && max_res <= self.options.abstol {
++            // AND current exact KCL residual is within tolerance, x is already converged!
++            if iter > 1 && prev_step_converged && res_ok {
++                Self::check_diode_exponent_range(&topo.soa, x)?;
+                 return Ok((iter - 1, max_res));
+             }
+ 
+@@ -182,8 +264,9 @@
+                 linear_solver.factorize_and_solve(&topo.jacobian, &self.rhs, &mut self.next_x)?;
+             }
+ 
+-            // Check voltage/branch step convergence & project unbounded saturation tangent jumps onto rails
++            // Check voltage/branch step convergence
+             let mut step_ok = true;
++            let mut box_binding = false;
+             let mut max_step = 0.0_f64;
+             for (i, &xi) in x.iter().enumerate().take(dim) {
+                 let raw_dx = self.next_x[i] - xi;
+@@ -201,16 +284,32 @@
+                     step_ok = false;
+                 }
+                 if i < num_nodes {
+-                    self.next_x[i] = self.next_x[i].clamp(v_clamp_min, v_clamp_max);
++                    if let Some((lo, hi)) = v_box {
++                        let raw = self.next_x[i];
++                        let projected = raw.clamp(lo, hi);
++                        if (raw - projected).abs() > tol {
++                            box_binding = true;
++                        }
++                        self.next_x[i] = projected;
++                    }
+                 }
+             }
++            if box_binding {
++                box_binding_streak += 1;
++                if box_binding_streak >= self.options.box_release_iters {
++                    v_box = None;
++                }
++            } else {
++                box_binding_streak = 0;
++            }
+ 
+             x.copy_from_slice(&self.next_x);
+             prev_res_norm = max_res;
+             prev_step_converged = step_ok;
+             last_step_max = max_step;
+ 
+-            if step_ok && max_res <= self.options.abstol && max_step <= self.options.vntol {
++            if step_ok && res_ok && max_step <= self.options.vntol {
++                Self::check_diode_exponent_range(&topo.soa, x)?;
+                 return Ok((iter, max_res));
+             }
+         }
+@@ -406,7 +505,8 @@
+                 for i in 0..dim {
+                     x[i] = 2.0_f64.mul_add(prev_x[i], -prev2_x[i]);
+                 }
+-                Self::sync_device_voltages(topo, &x);
++                // Junction limiting is relative to the last converged point, not the extrapolation
++                Self::sync_device_voltages(topo, &prev_x);
+             }
+ 
+             let (iters, _) = self.solve_in_place(topo, backend, linear_solver, &mut x)?;
+--- a/crates/rustspice-solver/src/transient.rs
++++ b/crates/rustspice-solver/src/transient.rs
+@@ -214,7 +214,10 @@
+                     for i in 0..dim {
+                         x[i] = prev_x[i] + ratio * (prev_x[i] - prev2_x[i]);
+                     }
+-                    NonlinearSolver::sync_device_voltages(topo, &x);
++                    // Junction limiting (pnjlim) must be relative to the last converged step, not to
++                    // the extrapolated guess: a predictor that overshoots a switching edge would
++                    // otherwise start Newton unlimited, deep in the exponential.
++                    NonlinearSolver::sync_device_voltages(topo, &prev_x);
+                 } else {
+                     x.copy_from_slice(&prev_x);
+                     NonlinearSolver::sync_device_voltages(topo, &x);

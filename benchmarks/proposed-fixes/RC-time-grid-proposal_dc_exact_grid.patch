@@ -1,0 +1,54 @@
+diff --git a/crates/rustspice-solver/src/nonlinear.rs b/crates/rustspice-solver/src/nonlinear.rs
+index d002e74..6ba9250 100644
+--- a/crates/rustspice-solver/src/nonlinear.rs
++++ b/crates/rustspice-solver/src/nonlinear.rs
+@@ -369,13 +369,13 @@ impl NonlinearSolver {
+         let dim = topo.soa.mna_dim;
+         self.ensure_dim(dim);
+ 
+-        // Integer-counted sweep grid: the point count is derived once from |stop - start| / |step| instead
+-        // of from the accumulated value, whose rounding drift exceeded the old `stop + 1e-12 * step` guard
+-        // after ~100 additions and silently dropped the last point (`.dc V1 0 5 1m` wrote 5000 of 5001
+-        // points). A last point within `tol_q` steps of `stop` is kept because decimal steps such as 0.1 do
+-        // not divide the span exactly in binary. The abscissae keep the historical `cur += step` values
+-        // (bit-identical to the previous output and to ngspice's own sweep values); `start + k * step` is
+-        // the drift-free alternative.
++        // Integer-counted sweep grid: the point count is derived once from |stop - start| / |step| and
++        // point k is `start + k * step` (no repeated `cur += step`: its rounding drift exceeded the old
++        // `stop + 1e-12 * step` guard after ~100 additions and silently dropped the last point, e.g.
++        // `.dc V1 0 5 1m` wrote 5000 instead of 5001 points). A last point within `tol_q` steps of `stop`
++        // is kept because decimal steps such as 0.1 do not divide the span exactly in binary. Unlike an
++        // accumulated sum the abscissae carry no drift, so they differ from ngspice's own accumulated
++        // values by up to ~1e-14 V (ngspice reaches -9.4e-15 V where this grid is exactly 0).
+         let dir = if stop >= start { 1.0 } else { -1.0 };
+         let step_signed = step.abs() * dir;
+         let q = (stop - start).abs() / step.abs();
+@@ -384,10 +384,8 @@ impl NonlinearSolver {
+         // A NaN span or step keeps the historical empty sweep (every comparison was false).
+         if !q.is_nan() {
+             let n_last = (q + tol_q).floor() as usize;
+-            let mut cur = start;
+-            for _ in 0..=n_last {
+-                sweep_values.push(cur);
+-                cur += step_signed;
++            for k in 0..=n_last {
++                sweep_values.push(start + (k as f64) * step_signed);
+             }
+         }
+ 
+diff --git a/crates/rustspice-solver/tests/time_grid.rs b/crates/rustspice-solver/tests/time_grid.rs
+index 46e21e3..5d7ccff 100644
+--- a/crates/rustspice-solver/tests/time_grid.rs
++++ b/crates/rustspice-solver/tests/time_grid.rs
+@@ -100,9 +100,9 @@ fn dc_sweep_decimal_steps_keep_the_last_point() {
+             "last sweep value {last} for {a} {b} {s}"
+         );
+     }
+-    // 1 mV steps: abscissae stay within accumulated-rounding distance of `k * step` (4.4e-15 at 5 V).
++    // 1 mV steps: values are `start + k * step`, not an accumulated sum (drift was 4.4e-15 at 5 V).
+     let res = sim.run_dc_sweep("V1", 0.0, 5.0, 1e-3).unwrap();
+     for (k, &v) in res.sweep_values.iter().enumerate() {
+-        assert!((v - (k as f64) * 1e-3).abs() <= 1e-12, "point {k}: {v}");
++        assert_eq!(v, (k as f64) * 1e-3);
+     }
+ }

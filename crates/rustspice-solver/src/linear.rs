@@ -1,239 +1,873 @@
-//! Multi-Regime Adaptive Sparse Linear Solver:
-//! 1. **Tier 1 (`CraneliftJit` / `UnrolledSymbolicLu`)**: Zero-indirection symbolic LU with
-//!    native `Cranelift` machine code generation for small-to-medium and low-bandwidth circuits.
-//! 2. **Tier 2 (`SymbolicOnceLu` / `FaerSupernodalLu`)**: High-performance sparse LU with cached
-//!    symbolic analysis and dynamic partial pivoting fallback.
-//! 3. **Tier 3 (`PreconditionedCg`)**: SIMD-accelerated Jacobi-Preconditioned Conjugate Gradient
-//!    with mixed-precision (`Df64` + `f64`) iterative refinement for large-scale RC grids.
+//! Three-Tier Adaptive Sparse Linear Solver:
+//! 1. **Tier 1 (`CraneliftNativeJit` / `UnrolledSymbolicLu`)**: Zero-loop native machine code
+//!    or flat zero-indirection micro-op stream for low-fill circuits, with symmetric
+//!    minimum-degree ordering, diagonal-preferring Markowitz pivoting, and dynamic
+//!    pivot-growth fallback.
+//! 2. **Tier 2 (`FaerSparseLu` / `DensePartialPivotLu`)**: Cached symbolic-once `faer` sparse
+//!    LU factorization (`Parallelism::None`, reusing workspace and symbolic elimination trees
+//!    across Newton and transient steps) and dense partial-pivoting LU for small/ill-conditioned
+//!    topologies.
+//! 3. **Tier 3 (`PreconditionedCg`)**: Jacobi-Preconditioned Conjugate Gradient for ultra-large
+//!    Symmetric Positive Definite (SPD) RC/power-grid networks.
 
-use faer::prelude::SpSolver;
+use faer::dyn_stack::{GlobalPodBuffer, PodStack};
+use faer::sparse::linalg::lu::{
+    factorize_symbolic_lu, LuRef, LuSymbolicParams, NumericLu, SymbolicLu,
+};
+use faer::sparse::linalg::SupernodalThreshold;
 use faer::sparse::{SparseColMatRef, SymbolicSparseColMatRef};
-use faer::Mat;
+use faer::{Mat, Parallelism};
 use rustspice_backend_cpu::CraneliftTopologyJit;
 use rustspice_core::{CscMatrix, CsrMatrix, Df64, SimError, SimResult};
 
-/// Active linear solver strategy selected for a compiled circuit topology.
+#[inline]
+fn ensure_finite(vec: &[f64]) -> SimResult<()> {
+    if vec.iter().all(|v| v.is_finite()) {
+        Ok(())
+    } else {
+        Err(SimError::SingularMatrix { index: 0 })
+    }
+}
+
+/// Selected linear solver execution engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinearSolverKind {
-    /// Native `Cranelift` machine-code JIT unrolled LU (`<= 8,192` micro-ops).
+    /// Native `x86_64` / `AArch64` machine code compiled via `cranelift-jit`.
     CraneliftJit,
-    /// Pre-compiled zero-indirection symbolic LU instruction stream (`<= 500,000` micro-ops).
+    /// Pre-compiled zero-indirection symbolic LU micro-operation stream.
     UnrolledSymbolic,
-    /// Supernodal sparse LU with AMD ordering (`faer`).
+    /// Dense Gaussian elimination with full row partial pivoting (`dim <= 48`).
+    DensePartialPivotLu,
+    /// `faer` Symbolic-Once Supernodal / Simplicial Sparse LU.
     FaerSupernodal,
-    /// Preconditioned Conjugate Gradient (`PCG`) iterative solver.
+    /// Jacobi-Preconditioned Conjugate Gradient (`PCG`) iterative solver.
     PreconditionedCg,
 }
 
-/// Adaptive sparse linear solver maintaining pre-allocated workspaces (`lu_buf`, `work_vec`)
-/// so that hot-loop Newton-Raphson and Transient solves incur **zero heap allocations**.
-pub struct AdaptiveSparseSolver {
-    pub dim: usize,
-    pub kind: LinearSolverKind,
-    jit_solver: Option<CraneliftTopologyJit>,
-    lu_buf: Vec<f64>,
-    work_vec: Vec<f64>,
-    faer_lu: Option<faer::sparse::linalg::solvers::Lu<usize, f64>>,
-    has_valid_factors: bool,
+/// Cached symmetric permutation $P A P^T$ mapping between the caller's CSC matrix and
+/// a minimum-degree reordered CSC matrix for `UnrolledSymbolicLu`.
+#[derive(Clone, Debug)]
+struct SymmetricOrdering {
+    /// `perm[new_idx] = old_idx`.
+    perm: Vec<usize>,
+    /// Reordered CSC structure $P A P^T$.
+    reordered_csc: CscMatrix<f64>,
+    /// For each NNZ slot `k_new` in `reordered_csc.values`, `csc_value_map[k_new]` is the
+    /// source index in the original `csc.values`.
+    csc_value_map: Vec<usize>,
+    rhs_perm: Vec<f64>,
+    x_perm: Vec<f64>,
 }
 
-impl AdaptiveSparseSolver {
-    /// Maximum symbolic operation count before switching from `UnrolledSymbolicLu` to `FaerSupernodal`.
-    pub const MAX_UNROLLED_OPS: usize = 500_000;
+impl SymmetricOrdering {
+    /// Maximum graph-elimination edge updates before aborting greedy min-degree ordering
+    /// so high-fill 2D/3D meshes route directly to `faer` AMD in $O(\text{NNZ})$ time.
+    const ORDERING_WORK_BUDGET: usize = 200_000;
 
-    /// Pre-compiles the linear solver strategy from an initial assembled Jacobian `initial_csc`.
-    pub fn compile(initial_csc: &CscMatrix<f64>) -> SimResult<Self> {
-        let dim = initial_csc.nrows;
-        // Attempt symbolic compilation for Tier 1 (Cranelift JIT / Unrolled Symbolic LU)
-        if dim <= 15_000 {
-            if let Ok(jit) = CraneliftTopologyJit::compile(initial_csc) {
-                if jit.symbolic.factor_ops.len() <= Self::MAX_UNROLLED_OPS {
-                    let kind = if jit.has_native_jit() {
-                        LinearSolverKind::CraneliftJit
-                    } else {
-                        LinearSolverKind::UnrolledSymbolic
-                    };
-                    let lu_nnz = jit.symbolic.lu_nnz;
-                    return Ok(Self {
-                        dim,
-                        kind,
-                        jit_solver: Some(jit),
-                        lu_buf: vec![0.0; lu_nnz],
-                        work_vec: vec![0.0; dim],
-                        faer_lu: None,
-                        has_valid_factors: false,
-                    });
+    /// Computes a symmetric minimum-degree ordering $P$ for `csc`.
+    /// Returns `None` if the ordering work budget is exceeded (indicating a high-fill mesh
+    /// better served by `faer` sparse LU).
+    fn compute(csc: &CscMatrix<f64>) -> Option<Self> {
+        let n = csc.nrows;
+        let perm = if n <= 16 {
+            (0..n).collect()
+        } else {
+            Self::min_degree_order(csc)?
+        };
+
+        let mut inv_perm = vec![0usize; n];
+        for (new_i, &old_i) in perm.iter().enumerate() {
+            inv_perm[old_i] = new_i;
+        }
+
+        // Build reordered CSC columns: column `new_c` corresponds to `old_c = perm[new_c]`
+        let nnz = csc.nnz();
+        let mut col_ptr = Vec::with_capacity(n + 1);
+        let mut row_idx = Vec::with_capacity(nnz);
+        let mut values = Vec::with_capacity(nnz);
+        let mut csc_value_map = Vec::with_capacity(nnz);
+        let mut diag_idx = vec![usize::MAX; n];
+        col_ptr.push(0);
+
+        let mut col_entries: Vec<(usize, usize, f64)> = Vec::new();
+        for new_c in 0..n {
+            let old_c = perm[new_c];
+            col_entries.clear();
+            for orig_k in csc.col_ptr[old_c]..csc.col_ptr[old_c + 1] {
+                let old_r = csc.row_idx[orig_k];
+                let new_r = inv_perm[old_r];
+                col_entries.push((new_r, orig_k, csc.values[orig_k]));
+            }
+            col_entries.sort_unstable_by_key(|&(r, _, _)| r);
+            for &(new_r, orig_k, val) in &col_entries {
+                if new_r == new_c {
+                    diag_idx[new_c] = row_idx.len();
+                }
+                row_idx.push(new_r);
+                values.push(val);
+                csc_value_map.push(orig_k);
+            }
+            col_ptr.push(row_idx.len());
+        }
+
+        let reordered_csc = CscMatrix {
+            nrows: n,
+            ncols: n,
+            col_ptr,
+            row_idx,
+            values,
+            diag_idx,
+        };
+
+        Some(Self {
+            perm,
+            reordered_csc,
+            csc_value_map,
+            rhs_perm: vec![0.0; n],
+            x_perm: vec![0.0; n],
+        })
+    }
+
+    fn min_degree_order(csc: &CscMatrix<f64>) -> Option<Vec<usize>> {
+        let n = csc.nrows;
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for c in 0..n {
+            for idx in csc.col_ptr[c]..csc.col_ptr[c + 1] {
+                let r = csc.row_idx[idx];
+                if r != c {
+                    adj[r].push(c);
+                    adj[c].push(r);
+                }
+            }
+        }
+        for neighbors in &mut adj {
+            neighbors.sort_unstable();
+            neighbors.dedup();
+        }
+
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for v in (0..n).rev() {
+            let d = adj[v].len().min(n.saturating_sub(1));
+            buckets[d].push(v);
+        }
+
+        let mut perm = Vec::with_capacity(n);
+        let mut eliminated = vec![false; n];
+        let mut work: usize = 0;
+        let mut min_deg: usize = 0;
+
+        for _step in 0..n {
+            let mut best_v = usize::MAX;
+            while min_deg < n {
+                if let Some(v) = buckets[min_deg].pop() {
+                    if !eliminated[v] && adj[v].len().min(n.saturating_sub(1)) == min_deg {
+                        best_v = v;
+                        break;
+                    }
+                } else {
+                    min_deg += 1;
+                }
+            }
+            if best_v == usize::MAX {
+                for (v, &elim) in eliminated.iter().enumerate() {
+                    if !elim {
+                        best_v = v;
+                        break;
+                    }
+                }
+            }
+
+            eliminated[best_v] = true;
+            perm.push(best_v);
+
+            let neighbors = std::mem::take(&mut adj[best_v]);
+            for &u in &neighbors {
+                if let Some(pos) = adj[u].iter().position(|&x| x == best_v) {
+                    adj[u].swap_remove(pos);
+                }
+            }
+
+            let k = neighbors.len();
+            work = work.saturating_add(k * k);
+            if work > Self::ORDERING_WORK_BUDGET {
+                return None;
+            }
+
+            if k <= 32 {
+                for i in 0..k {
+                    let u = neighbors[i];
+                    for &w in &neighbors[(i + 1)..k] {
+                        if !adj[u].contains(&w) {
+                            adj[u].push(w);
+                            adj[w].push(u);
+                        }
+                    }
+                }
+            }
+
+            for &u in &neighbors {
+                let d = adj[u].len().min(n.saturating_sub(1));
+                buckets[d].push(u);
+                if d < min_deg {
+                    min_deg = d;
                 }
             }
         }
 
-        Ok(Self {
+        Some(perm)
+    }
+
+    #[inline]
+    fn gather_values(&mut self, orig_values: &[f64]) {
+        for (dst, &src_k) in self
+            .reordered_csc
+            .values
+            .iter_mut()
+            .zip(self.csc_value_map.iter())
+        {
+            *dst = orig_values[src_k];
+        }
+    }
+}
+
+/// Dense Gaussian elimination with full row partial pivoting for small/ill-conditioned matrices.
+#[derive(Clone, Debug)]
+struct DenseLu {
+    dim: usize,
+    lu: Vec<f64>,
+    piv: Vec<usize>,
+    valid: bool,
+}
+
+impl DenseLu {
+    fn new(dim: usize) -> Self {
+        Self {
             dim,
-            kind: LinearSolverKind::FaerSupernodal,
-            jit_solver: None,
-            lu_buf: Vec::new(),
-            work_vec: vec![0.0; dim],
-            faer_lu: None,
-            has_valid_factors: false,
+            lu: vec![0.0; dim * dim],
+            piv: (0..dim).collect(),
+            valid: false,
+        }
+    }
+
+    fn factorize(&mut self, csc: &CscMatrix<f64>) -> SimResult<()> {
+        let n = self.dim;
+        self.lu.fill(0.0);
+        for (i, p) in self.piv.iter_mut().enumerate() {
+            *p = i;
+        }
+        let mut max_a = 0.0_f64;
+        for col in 0..n {
+            for idx in csc.col_ptr[col]..csc.col_ptr[col + 1] {
+                let row = csc.row_idx[idx];
+                let v = csc.values[idx];
+                if !v.is_finite() {
+                    self.valid = false;
+                    return Err(SimError::SingularMatrix { index: col });
+                }
+                max_a = max_a.max(v.abs());
+                self.lu[row * n + col] = v;
+            }
+        }
+        if max_a == 0.0 {
+            self.valid = false;
+            return Err(SimError::SingularMatrix { index: 0 });
+        }
+
+        let piv_tol = (1e-15 * max_a).max(1e-30);
+
+        for k in 0..n {
+            let mut best_row = k;
+            let mut best_val = self.lu[k * n + k].abs();
+            for i in (k + 1)..n {
+                let v = self.lu[i * n + k].abs();
+                if v > best_val {
+                    best_val = v;
+                    best_row = i;
+                }
+            }
+            if best_val <= piv_tol || !best_val.is_finite() {
+                self.valid = false;
+                return Err(SimError::SingularMatrix { index: k });
+            }
+            if best_row != k {
+                self.piv.swap(k, best_row);
+                for j in 0..n {
+                    self.lu.swap(k * n + j, best_row * n + j);
+                }
+            }
+            let piv_val = self.lu[k * n + k];
+            for i in (k + 1)..n {
+                let mult = self.lu[i * n + k] / piv_val;
+                self.lu[i * n + k] = mult;
+                for j in (k + 1)..n {
+                    self.lu[i * n + j] -= mult * self.lu[k * n + j];
+                }
+            }
+        }
+        self.valid = true;
+        Ok(())
+    }
+
+    fn solve(&self, rhs: &[f64], x: &mut [f64]) {
+        let n = self.dim;
+        for i in 0..n {
+            x[i] = rhs[self.piv[i]];
+        }
+        for i in 0..n {
+            let mut sum = x[i];
+            for j in 0..i {
+                sum -= self.lu[i * n + j] * x[j];
+            }
+            x[i] = sum;
+        }
+        for i in (0..n).rev() {
+            let mut sum = x[i];
+            for j in (i + 1)..n {
+                sum -= self.lu[i * n + j] * x[j];
+            }
+            x[i] = sum / self.lu[i * n + i];
+        }
+    }
+
+    fn solve_transpose(&self, rhs: &[f64], lambda: &mut [f64], work: &mut [f64]) {
+        let n = self.dim;
+        work[..n].copy_from_slice(&rhs[..n]);
+        for i in 0..n {
+            let mut sum = work[i];
+            for j in 0..i {
+                sum -= self.lu[j * n + i] * work[j];
+            }
+            work[i] = sum / self.lu[i * n + i];
+        }
+        for i in (0..n).rev() {
+            let mut sum = work[i];
+            for j in (i + 1)..n {
+                sum -= self.lu[j * n + i] * work[j];
+            }
+            work[i] = sum;
+        }
+        for i in 0..n {
+            lambda[self.piv[i]] = work[i];
+        }
+    }
+}
+
+/// Cached symbolic-once `faer` sparse LU solver avoiding per-Newton-iteration symbolic
+/// analysis, heap allocations, and Rayon thread-pool contention.
+struct FaerLuCache {
+    dim: usize,
+    col_ptr: Vec<usize>,
+    row_idx: Vec<usize>,
+    symbolic: SymbolicLu<usize>,
+    numeric: NumericLu<usize, f64>,
+    lu_stack: GlobalPodBuffer,
+    solve_stack: GlobalPodBuffer,
+    rhs_mat: Mat<f64>,
+    valid: bool,
+}
+
+impl Clone for FaerLuCache {
+    fn clone(&self) -> Self {
+        let n = self.dim;
+        let symbolic = self.symbolic.clone();
+        let lu_req = symbolic
+            .factorize_numeric_lu_req::<f64>(Parallelism::None)
+            .expect("faer numeric LU scratch req");
+        let solve_req = symbolic
+            .solve_in_place_req::<f64>(1, Parallelism::None)
+            .expect("faer solve scratch req");
+        Self {
+            dim: n,
+            col_ptr: self.col_ptr.clone(),
+            row_idx: self.row_idx.clone(),
+            symbolic,
+            numeric: NumericLu::new(),
+            lu_stack: GlobalPodBuffer::new(lu_req),
+            solve_stack: GlobalPodBuffer::new(solve_req),
+            rhs_mat: Mat::<f64>::zeros(n, 1),
+            valid: false,
+        }
+    }
+}
+
+impl std::fmt::Debug for FaerLuCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FaerLuCache")
+            .field("dim", &self.dim)
+            .field("valid", &self.valid)
+            .finish()
+    }
+}
+
+impl FaerLuCache {
+    fn try_new(csc: &CscMatrix<f64>) -> SimResult<Self> {
+        let n = csc.nrows;
+        let col_ptr = csc.col_ptr.clone();
+        let row_idx = csc.row_idx.clone();
+        let sym_ref = SymbolicSparseColMatRef::new_checked(n, n, &col_ptr, None, &row_idx);
+
+        let params = LuSymbolicParams {
+            supernodal_flop_ratio_threshold: SupernodalThreshold::AUTO,
+            ..Default::default()
+        };
+        let symbolic = factorize_symbolic_lu(sym_ref, params)
+            .map_err(|_| SimError::SingularMatrix { index: 0 })?;
+        let lu_req = symbolic
+            .factorize_numeric_lu_req::<f64>(Parallelism::None)
+            .map_err(|_| SimError::SingularMatrix { index: 0 })?;
+        let solve_req = symbolic
+            .solve_in_place_req::<f64>(1, Parallelism::None)
+            .map_err(|_| SimError::SingularMatrix { index: 0 })?;
+
+        Ok(Self {
+            dim: n,
+            col_ptr,
+            row_idx,
+            symbolic,
+            numeric: NumericLu::new(),
+            lu_stack: GlobalPodBuffer::new(lu_req),
+            solve_stack: GlobalPodBuffer::new(solve_req),
+            rhs_mat: Mat::<f64>::zeros(n, 1),
+            valid: false,
         })
     }
 
-    /// Returns `true` if a valid LU factorization is currently cached in the solver.
-    #[inline]
-    pub fn has_valid_factorization(&self) -> bool {
-        self.has_valid_factors
+    fn factorize(&mut self, csc: &CscMatrix<f64>) -> SimResult<()> {
+        let n = self.dim;
+        if self.col_ptr != csc.col_ptr || self.row_idx != csc.row_idx {
+            *self = Self::try_new(csc)?;
+        }
+        let mut max_a = 0.0_f64;
+        for &v in &csc.values {
+            if !v.is_finite() {
+                self.valid = false;
+                return Err(SimError::SingularMatrix { index: 0 });
+            }
+            max_a = max_a.max(v.abs());
+        }
+        if max_a == 0.0 {
+            self.valid = false;
+            return Err(SimError::SingularMatrix { index: 0 });
+        }
+
+        let sym_ref =
+            SymbolicSparseColMatRef::new_checked(n, n, &self.col_ptr, None, &self.row_idx);
+        let mat_ref = SparseColMatRef::new(sym_ref, csc.values.as_slice());
+
+        self.valid = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.symbolic
+                .factorize_numeric_lu(
+                    &mut self.numeric,
+                    mat_ref,
+                    Parallelism::None,
+                    PodStack::new(&mut self.lu_stack),
+                )
+                .map(|_| ())
+        }));
+        match result {
+            Ok(Ok(())) => {
+                self.valid = true;
+                Ok(())
+            }
+            _ => {
+                self.numeric = NumericLu::new();
+                self.valid = false;
+                Err(SimError::SingularMatrix { index: 0 })
+            }
+        }
     }
 
-    /// Invalidates the cached LU factorization.
+    #[inline]
+    fn solve(&mut self, rhs: &[f64], x: &mut [f64]) -> SimResult<()> {
+        if !self.valid {
+            return Err(SimError::SingularMatrix { index: 0 });
+        }
+        let n = self.dim;
+        for (i, &b) in rhs.iter().enumerate().take(n) {
+            self.rhs_mat[(i, 0)] = b;
+        }
+        // SAFETY: `self.numeric` was populated by `self.symbolic.factorize_numeric_lu` when `self.valid`.
+        let factor = unsafe { LuRef::new_unchecked(&self.symbolic, &self.numeric) };
+        factor.solve_in_place_with_conj(
+            faer::Conj::No,
+            self.rhs_mat.as_mut(),
+            Parallelism::None,
+            PodStack::new(&mut self.solve_stack),
+        );
+        for (i, xi) in x.iter_mut().enumerate().take(n) {
+            *xi = self.rhs_mat[(i, 0)];
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn solve_transpose(&mut self, rhs: &[f64], lambda: &mut [f64]) -> SimResult<()> {
+        if !self.valid {
+            return Err(SimError::SingularMatrix { index: 0 });
+        }
+        let n = self.dim;
+        for (i, &b) in rhs.iter().enumerate().take(n) {
+            self.rhs_mat[(i, 0)] = b;
+        }
+        // SAFETY: `self.numeric` was populated by `self.symbolic.factorize_numeric_lu` when `self.valid`.
+        let factor = unsafe { LuRef::new_unchecked(&self.symbolic, &self.numeric) };
+        factor.solve_transpose_in_place_with_conj(
+            faer::Conj::No,
+            self.rhs_mat.as_mut(),
+            Parallelism::None,
+            PodStack::new(&mut self.solve_stack),
+        );
+        for (i, li) in lambda.iter_mut().enumerate().take(n) {
+            let v = self.rhs_mat[(i, 0)];
+            if !v.is_finite() {
+                return Err(SimError::SingularMatrix { index: i });
+            }
+            *li = v;
+        }
+        Ok(())
+    }
+}
+
+/// Adaptive Sparse Linear Solver with pre-allocated numerical factorization buffers.
+#[derive(Clone)]
+pub struct AdaptiveSparseSolver {
+    pub kind: LinearSolverKind,
+    pub dim: usize,
+    pub demoted_from: Option<LinearSolverKind>,
+    ordering: Option<SymmetricOrdering>,
+    unrolled_jit: Option<std::sync::Arc<CraneliftTopologyJit>>,
+    lu_buf: Vec<f64>,
+    work_buf: Vec<f64>,
+    pcg_r: Vec<f64>,
+    pcg_z: Vec<f64>,
+    pcg_p: Vec<f64>,
+    pcg_ap: Vec<f64>,
+    inv_diag: Vec<f64>,
+    dense_lu: Option<DenseLu>,
+    faer_cache: Option<FaerLuCache>,
+    factors_valid: bool,
+    factors_in_faer: bool,
+    factors_dense: bool,
+}
+
+impl AdaptiveSparseSolver {
+    /// Maximum dimension for the unrolled symbolic / Cranelift JIT tier.
+    pub const MAX_UNROLLED_DIM: usize = 8192;
+    /// Maximum number of symbolic LU micro-operations for `UnrolledSymbolicLu`.
+    pub const MAX_UNROLLED_OPS: usize = 500_000;
+    /// Maximum dimension for dense partial-pivoting fallback.
+    pub const MAX_DENSE_DIM: usize = 48;
+
+    /// Compiles an [`AdaptiveSparseSolver`] tailored to the sparsity structure of `initial_csc`.
+    pub fn compile(initial_csc: &CscMatrix<f64>) -> SimResult<Self> {
+        let dim = initial_csc.nrows;
+        let dense_lu = if dim <= Self::MAX_DENSE_DIM {
+            Some(DenseLu::new(dim))
+        } else {
+            None
+        };
+
+        if let Some((ord, jit_solver, lu_nnz, kind)) = Self::build_unrolled(initial_csc) {
+            return Ok(Self {
+                kind,
+                dim,
+                demoted_from: None,
+                ordering: Some(ord),
+                unrolled_jit: Some(std::sync::Arc::new(jit_solver)),
+                lu_buf: vec![0.0; lu_nnz],
+                work_buf: vec![0.0; dim],
+                pcg_r: Vec::new(),
+                pcg_z: Vec::new(),
+                pcg_p: Vec::new(),
+                pcg_ap: Vec::new(),
+                inv_diag: Vec::new(),
+                dense_lu,
+                faer_cache: None,
+                factors_valid: false,
+                factors_in_faer: false,
+                factors_dense: false,
+            });
+        }
+
+        let faer_cache = FaerLuCache::try_new(initial_csc).ok();
+        Ok(Self {
+            kind: LinearSolverKind::FaerSupernodal,
+            dim,
+            demoted_from: None,
+            ordering: None,
+            unrolled_jit: None,
+            lu_buf: Vec::new(),
+            work_buf: vec![0.0; dim],
+            pcg_r: vec![0.0; dim],
+            pcg_z: vec![0.0; dim],
+            pcg_p: vec![0.0; dim],
+            pcg_ap: vec![0.0; dim],
+            inv_diag: vec![1.0; dim],
+            dense_lu,
+            faer_cache,
+            factors_valid: false,
+            factors_in_faer: false,
+            factors_dense: false,
+        })
+    }
+
+    fn build_unrolled(
+        csc: &CscMatrix<f64>,
+    ) -> Option<(
+        SymmetricOrdering,
+        CraneliftTopologyJit,
+        usize,
+        LinearSolverKind,
+    )> {
+        let dim = csc.nrows;
+        if dim > Self::MAX_UNROLLED_DIM {
+            return None;
+        }
+        // For medium/large matrices (dim >= 256), cap unrolled micro-ops to 32 * dim
+        // so 2D/3D meshes route to `FaerLuCache` (with AMD ordering) instead of generating
+        // hundreds of thousands of unrolled scalar micro-ops.
+        let max_ops = if dim >= 256 {
+            (32 * dim).min(Self::MAX_UNROLLED_OPS)
+        } else {
+            Self::MAX_UNROLLED_OPS
+        };
+        let ord = SymmetricOrdering::compute(csc)?;
+        let jit = CraneliftTopologyJit::compile_with_budget(&ord.reordered_csc, max_ops).ok()?;
+        let lu_nnz = jit.symbolic.lu_nnz;
+        let kind = if jit.has_native_jit() {
+            LinearSolverKind::CraneliftJit
+        } else {
+            LinearSolverKind::UnrolledSymbolic
+        };
+        Some((ord, jit, lu_nnz, kind))
+    }
+
+    /// Re-compiles the unrolled symbolic LU pivot schedule on `transient_csc` when transitioning
+    /// from the DC operating point (`cap_geq = 0`, `ind_req = 0`) to transient time-stepping
+    /// (`cap_geq = 2C/h`, `ind_req = 2L/h`), ensuring diagonally-dominant transient pivots.
+    pub fn refresh_for_transient(&mut self, transient_csc: &CscMatrix<f64>) {
+        self.invalidate_factorization();
+        if self.dim <= Self::MAX_UNROLLED_DIM {
+            if let Some((ord, jit_solver, lu_nnz, kind)) = Self::build_unrolled(transient_csc) {
+                self.kind = kind;
+                self.ordering = Some(ord);
+                self.unrolled_jit = Some(std::sync::Arc::new(jit_solver));
+                self.lu_buf.resize(lu_nnz, 0.0);
+            }
+        }
+    }
+
+    /// Invalidates cached LU factors (called when switching from DC OP to Transient or changing timestep $h$).
     #[inline]
     pub fn invalidate_factorization(&mut self) {
-        self.has_valid_factors = false;
+        self.factors_valid = false;
+        self.factors_in_faer = false;
+        self.factors_dense = false;
     }
 
-    /// Performs numerical LU factorization of `csc` and solves $A x = b$ in a single pass.
+    /// Returns `true` if a valid LU factorization is currently cached.
     #[inline]
+    pub fn has_valid_factorization(&self) -> bool {
+        self.factors_valid
+    }
+
+    /// Factorizes `csc` and solves $A x = b$ into `x`.
     pub fn factorize_and_solve(
         &mut self,
         csc: &CscMatrix<f64>,
         rhs: &[f64],
         x: &mut [f64],
     ) -> SimResult<()> {
-        if let Some(ref jit) = self.jit_solver {
+        if let (Some(ord), Some(jit)) = (&mut self.ordering, &self.unrolled_jit) {
+            ord.gather_values(&csc.values);
+            for (new_i, &old_i) in ord.perm.iter().enumerate() {
+                ord.rhs_perm[new_i] = rhs[old_i];
+            }
             if jit
-                .factor_and_solve(&csc.values, &mut self.lu_buf, rhs, x)
+                .factor_and_solve(
+                    &ord.reordered_csc.values,
+                    &mut self.lu_buf,
+                    &ord.rhs_perm,
+                    &mut ord.x_perm,
+                )
                 .is_ok()
             {
-                self.has_valid_factors = true;
+                for (new_i, &old_i) in ord.perm.iter().enumerate() {
+                    x[old_i] = ord.x_perm[new_i];
+                }
+                self.factors_valid = true;
+                self.factors_in_faer = false;
+                self.factors_dense = false;
+                return Ok(());
+            }
+
+            // Pivot-order mismatch (e.g. nonlinear regime switch or transient companion activation):
+            // attempt to recompile `UnrolledSymbolicLu` once using the live numerical Jacobian.
+            if let Ok(new_jit) = CraneliftTopologyJit::compile_with_budget(
+                &ord.reordered_csc,
+                Self::MAX_UNROLLED_OPS,
+            ) {
+                self.lu_buf.resize(new_jit.symbolic.lu_nnz, 0.0);
+                if new_jit
+                    .factor_and_solve(
+                        &ord.reordered_csc.values,
+                        &mut self.lu_buf,
+                        &ord.rhs_perm,
+                        &mut ord.x_perm,
+                    )
+                    .is_ok()
+                {
+                    for (new_i, &old_i) in ord.perm.iter().enumerate() {
+                        x[old_i] = ord.x_perm[new_i];
+                    }
+                    self.unrolled_jit = Some(std::sync::Arc::new(new_jit));
+                    self.factors_valid = true;
+                    self.factors_in_faer = false;
+                    self.factors_dense = false;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fallback 1: Dense Gaussian elimination with full row partial pivoting for small circuits
+        if let Some(dense) = &mut self.dense_lu {
+            if dense.factorize(csc).is_ok() {
+                dense.solve(rhs, x);
+                if matches!(
+                    self.kind,
+                    LinearSolverKind::CraneliftJit | LinearSolverKind::UnrolledSymbolic
+                ) {
+                    self.demoted_from.get_or_insert(self.kind);
+                }
+                self.ordering = None;
+                self.unrolled_jit = None;
+                self.kind = LinearSolverKind::DensePartialPivotLu;
+                self.factors_valid = true;
+                self.factors_in_faer = false;
+                self.factors_dense = true;
                 return Ok(());
             }
         }
 
-        // Tier 2: Supernodal sparse LU via `faer`
-        self.factorize_faer(csc)?;
-        self.solve_faer(rhs, x);
-        self.has_valid_factors = true;
-        Ok(())
+        // Fallback 2: `faer` Symbolic-Once Supernodal / Simplicial Sparse LU
+        if matches!(
+            self.kind,
+            LinearSolverKind::CraneliftJit | LinearSolverKind::UnrolledSymbolic
+        ) {
+            self.demoted_from.get_or_insert(self.kind);
+        }
+        self.ordering = None;
+        self.unrolled_jit = None;
+        self.factorize_and_solve_faer(csc, rhs, x)
     }
 
-    /// Solves $A x = b$ reusing the most recently computed LU factorization without re-factorizing.
-    ///
-    /// Used in:
-    /// - Linear fixed-step Transient simulation (factorize once, solve 1,000+ times)
-    /// - Shamanskii / Modified Newton-Raphson iterations
+    /// Solves $A x = b$ reusing the most recently computed LU factorization (Constant-$h$ Transient
+    /// & Shamanskii Newton steps).
     #[inline]
     pub fn solve_cached(&mut self, rhs: &[f64], x: &mut [f64]) -> SimResult<()> {
-        if !self.has_valid_factors {
-            return Err(SimError::TopologyError(
-                "No cached LU factorization available".to_string(),
-            ));
+        if !self.factors_valid {
+            return Err(SimError::SingularMatrix { index: 0 });
         }
-        if let Some(ref jit) = self.jit_solver {
-            jit.symbolic.solve(&self.lu_buf, rhs, x);
-            return Ok(());
+        if self.factors_dense {
+            if let Some(dense) = &self.dense_lu {
+                dense.solve(rhs, x);
+                ensure_finite(x)?;
+                return Ok(());
+            }
         }
-        if self.faer_lu.is_some() {
-            self.solve_faer(rhs, x);
-            return Ok(());
+        if !self.factors_in_faer {
+            if let (Some(ord), Some(jit)) = (&mut self.ordering, &self.unrolled_jit) {
+                for (new_i, &old_i) in ord.perm.iter().enumerate() {
+                    ord.rhs_perm[new_i] = rhs[old_i];
+                }
+                jit.symbolic
+                    .solve(&self.lu_buf, &ord.rhs_perm, &mut ord.x_perm);
+                for (new_i, &old_i) in ord.perm.iter().enumerate() {
+                    x[old_i] = ord.x_perm[new_i];
+                }
+                ensure_finite(x)?;
+                return Ok(());
+            }
         }
-        Err(SimError::TopologyError(
-            "Solver has no active factorization backend".to_string(),
-        ))
+        if let Some(cache) = &mut self.faer_cache {
+            return cache.solve(rhs, x);
+        }
+        Err(SimError::SingularMatrix { index: 0 })
     }
 
-    /// Solves the transposed linear system $A^T \lambda = b$ reusing the cached LU factorization
-    /// for **Discrete Adjoint Sensitivity Analysis**.
-    #[inline]
+    /// Solves the transposed system $A^T \lambda = b$ reusing the cached LU factorization
+    /// for Discrete Adjoint Sensitivity Analysis.
     pub fn solve_transpose_cached(
         &mut self,
-        csc_fallback: &CscMatrix<f64>,
+        csc: &CscMatrix<f64>,
         rhs: &[f64],
         lambda: &mut [f64],
     ) -> SimResult<()> {
-        if let Some(ref jit) = self.jit_solver {
-            if self.has_valid_factors {
-                jit.symbolic
-                    .solve_transpose(&self.lu_buf, rhs, lambda, &mut self.work_vec);
+        if self.factors_valid && self.factors_dense {
+            if let Some(dense) = &self.dense_lu {
+                dense.solve_transpose(rhs, lambda, &mut self.work_buf);
+                ensure_finite(lambda)?;
+                return Ok(());
+            }
+        }
+        if self.factors_valid && !self.factors_in_faer {
+            if let (Some(ord), Some(jit)) = (&mut self.ordering, &self.unrolled_jit) {
+                for (new_i, &old_i) in ord.perm.iter().enumerate() {
+                    ord.rhs_perm[new_i] = rhs[old_i];
+                }
+                jit.symbolic.solve_transpose(
+                    &self.lu_buf,
+                    &ord.rhs_perm,
+                    &mut ord.x_perm,
+                    &mut self.work_buf,
+                );
+                for (new_i, &old_i) in ord.perm.iter().enumerate() {
+                    lambda[old_i] = ord.x_perm[new_i];
+                }
+                ensure_finite(lambda)?;
                 return Ok(());
             }
         }
 
-        // Fallback for `faer`: build explicit CSC transpose and solve
-        let n = self.dim;
-        let csr = csc_fallback.to_csr();
-        // CSR of A has the exact column pointers and row indices of CSC(A^T)!
-        let sym = unsafe {
-            SymbolicSparseColMatRef::new_unchecked(
-                n,
-                n,
-                csr.row_ptr.as_slice(),
-                None,
-                csr.col_idx.as_slice(),
-            )
-        };
-        let mat = SparseColMatRef::new(sym, csr.values.as_slice());
-        let lu_t = faer::sparse::linalg::solvers::Lu::try_new_with_symbolic(
-            faer::sparse::linalg::solvers::SymbolicLu::try_new(sym)
-                .map_err(|_| SimError::SingularMatrix { index: 0 })?,
-            mat,
-        )
-        .map_err(|_| SimError::SingularMatrix { index: 0 })?;
+        if let Some(dense) = &mut self.dense_lu {
+            if dense.factorize(csc).is_ok() {
+                dense.solve_transpose(rhs, lambda, &mut self.work_buf);
+                ensure_finite(lambda)?;
+                return Ok(());
+            }
+        }
 
-        let mut b_mat = Mat::<f64>::zeros(n, 1);
-        for i in 0..n {
-            b_mat[(i, 0)] = rhs[i];
+        if self.faer_cache.is_none() {
+            self.faer_cache = Some(FaerLuCache::try_new(csc)?);
         }
-        lu_t.solve_in_place(b_mat.as_mut());
-        for i in 0..n {
-            lambda[i] = b_mat[(i, 0)];
+        let cache = self.faer_cache.as_mut().unwrap();
+        if !self.factors_valid || !self.factors_in_faer {
+            cache.factorize(csc)?;
+            self.factors_valid = true;
+            self.factors_in_faer = true;
+            self.factors_dense = false;
         }
-        Ok(())
+        cache.solve_transpose(rhs, lambda)
     }
 
-    fn factorize_faer(&mut self, csc: &CscMatrix<f64>) -> SimResult<()> {
-        if csc.values.iter().any(|v| !v.is_finite()) {
-            return Err(SimError::SingularMatrix { index: 0 });
+    fn factorize_and_solve_faer(
+        &mut self,
+        csc: &CscMatrix<f64>,
+        rhs: &[f64],
+        x: &mut [f64],
+    ) -> SimResult<()> {
+        if self.faer_cache.is_none() {
+            self.faer_cache = Some(FaerLuCache::try_new(csc)?);
         }
-        let n = csc.nrows;
-        for col in 0..n {
-            let start = csc.col_ptr[col];
-            let end = csc.col_ptr[col + 1];
-            if !(start..end).any(|idx| csc.values[idx].abs() > 0.0) {
-                return Err(SimError::SingularMatrix { index: col });
-            }
-        }
-        let sym = unsafe {
-            SymbolicSparseColMatRef::new_unchecked(
-                n,
-                n,
-                csc.col_ptr.as_slice(),
-                None,
-                csc.row_idx.as_slice(),
-            )
-        };
-        let mat = SparseColMatRef::new(sym, csc.values.as_slice());
-        let sym_lu = faer::sparse::linalg::solvers::SymbolicLu::try_new(sym)
-            .map_err(|_| SimError::SingularMatrix { index: 0 })?;
-        let lu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            faer::sparse::linalg::solvers::Lu::try_new_with_symbolic(sym_lu, mat)
-        }))
-        .map_err(|_| SimError::SingularMatrix { index: 0 })?
-        .map_err(|_| SimError::SingularMatrix { index: 0 })?;
-        self.faer_lu = Some(lu);
+        let cache = self.faer_cache.as_mut().unwrap();
+        cache.factorize(csc)?;
+        cache.solve(rhs, x)?;
+        self.kind = LinearSolverKind::FaerSupernodal;
+        self.factors_valid = true;
+        self.factors_in_faer = true;
+        self.factors_dense = false;
         Ok(())
-    }
-
-    fn solve_faer(&self, rhs: &[f64], x: &mut [f64]) {
-        if let Some(ref lu) = self.faer_lu {
-            let n = self.dim;
-            let mut b_mat = Mat::<f64>::zeros(n, 1);
-            for i in 0..n {
-                b_mat[(i, 0)] = rhs[i];
-            }
-            lu.solve_in_place(b_mat.as_mut());
-            for i in 0..n {
-                x[i] = b_mat[(i, 0)];
-            }
-        }
     }
 
     /// Solves an SPD conductance system $A x = b$ using Jacobi-Preconditioned Conjugate Gradient
@@ -251,7 +885,6 @@ impl AdaptiveSparseSolver {
         let mut p = vec![0.0_f64; n];
         let mut ap = vec![0.0_f64; n];
 
-        // Precompute inverse diagonal preconditioner in Df64 double-float precision
         let mut inv_diag_df64 = vec![Df64::ONE; n];
         for (i, inv_d) in inv_diag_df64.iter_mut().enumerate().take(n) {
             let d_idx = csr.diag_idx[i];
@@ -263,7 +896,6 @@ impl AdaptiveSparseSolver {
             *inv_d = Df64::from_f64(1.0 / d_val);
         }
 
-        // r = b - A * x
         csr.spmv(x, &mut ap);
         let mut rhs_norm = 0.0_f64;
         for i in 0..n {
@@ -308,5 +940,87 @@ impl AdaptiveSparseSolver {
         }
 
         Ok(max_iter)
+    }
+
+    /// Jacobi-Preconditioned Conjugate Gradient (`PCG`) solver for large SPD linear systems.
+    pub fn solve_pcg(
+        &mut self,
+        csc: &CscMatrix<f64>,
+        rhs: &[f64],
+        x: &mut [f64],
+        tol: f64,
+        max_iters: usize,
+    ) -> SimResult<usize> {
+        let n = self.dim;
+        if self.pcg_r.len() != n {
+            self.pcg_r.resize(n, 0.0);
+            self.pcg_z.resize(n, 0.0);
+            self.pcg_p.resize(n, 0.0);
+            self.pcg_ap.resize(n, 0.0);
+            self.inv_diag.resize(n, 1.0);
+        }
+
+        for i in 0..n {
+            let d = csc.values[csc.diag_idx[i]];
+            self.inv_diag[i] = if d.abs() > 1e-18 { 1.0 / d } else { 1.0 };
+        }
+
+        // r = rhs - A * x
+        csc.spmv(x, &mut self.pcg_ap);
+        let mut rhs_norm_sq = 0.0_f64;
+        for i in 0..n {
+            self.pcg_r[i] = rhs[i] - self.pcg_ap[i];
+            self.pcg_z[i] = self.inv_diag[i] * self.pcg_r[i];
+            self.pcg_p[i] = self.pcg_z[i];
+            rhs_norm_sq += rhs[i] * rhs[i];
+        }
+
+        if rhs_norm_sq == 0.0 {
+            x.fill(0.0);
+            return Ok(0);
+        }
+
+        let mut rz_old: f64 = self
+            .pcg_r
+            .iter()
+            .zip(self.pcg_z.iter())
+            .map(|(r, z)| r * z)
+            .sum();
+        let abs_tol_sq = (tol * tol * rhs_norm_sq).max(1e-30);
+
+        for iter in 1..=max_iters {
+            csc.spmv(&self.pcg_p, &mut self.pcg_ap);
+            let p_ap: f64 = self
+                .pcg_p
+                .iter()
+                .zip(self.pcg_ap.iter())
+                .map(|(p, ap)| p * ap)
+                .sum();
+            if p_ap.abs() < 1e-30 {
+                break;
+            }
+            let alpha = rz_old / p_ap;
+            let mut r_norm_sq = 0.0_f64;
+            for (i, xi) in x.iter_mut().enumerate().take(n) {
+                *xi += alpha * self.pcg_p[i];
+                self.pcg_r[i] -= alpha * self.pcg_ap[i];
+                r_norm_sq += self.pcg_r[i] * self.pcg_r[i];
+            }
+            if r_norm_sq <= abs_tol_sq {
+                return Ok(iter);
+            }
+            let mut rz_new = 0.0_f64;
+            for i in 0..n {
+                self.pcg_z[i] = self.inv_diag[i] * self.pcg_r[i];
+                rz_new += self.pcg_r[i] * self.pcg_z[i];
+            }
+            let beta = rz_new / rz_old;
+            for i in 0..n {
+                self.pcg_p[i] = self.pcg_z[i] + beta * self.pcg_p[i];
+            }
+            rz_old = rz_new;
+        }
+
+        Ok(max_iters)
     }
 }

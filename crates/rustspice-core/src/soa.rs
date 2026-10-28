@@ -121,6 +121,11 @@ pub struct DeviceSoaBuffer {
     pub temp_vt: f64,
     pub is_transient: bool,
     pub transient_g_scale: f64,
+    /// Set during `evaluate_devices` when any junction limiter (`pnjlim` / exponent clamp)
+    /// modified a trial terminal voltage so the outer Newton loop does not accept a damped step as converged.
+    pub limiter_active: bool,
+    /// Circuit node names by 1-based node id (`node_names[0]` is ground); used for diagnostics only.
+    pub node_names: Vec<String>,
 
     // --- Resistors (SoA) ---
     pub res_names: Vec<String>,
@@ -247,6 +252,7 @@ pub struct DeviceSoaBuffer {
     // --- Pre-Stamped Static Linear Fast-Path ---
     pub static_linear_csc_values: Vec<f64>,
     pub dynamic_gather_table: CscGatherTable,
+    pub dc_floating_diag_idx: Vec<usize>,
     pub linear_dirty: bool,
 }
 
@@ -258,6 +264,15 @@ pub struct CompiledTopology {
 }
 
 impl DeviceSoaBuffer {
+    /// Minimum resistance magnitude substituted when a netlist specifies `R = 0` (`1 uOhm`).
+    /// Negative resistances (`R < 0`) are preserved with their exact signed conductance `1 / R`.
+    pub const ZERO_OHM_SUBSTITUTE: f64 = ZERO_OHM_SUBSTITUTE;
+
+    #[inline]
+    pub fn resistor_conductance(_name: &str, r: f64) -> f64 {
+        resistor_conductance(r)
+    }
+
     /// Returns `true` if the circuit contains no nonlinear devices (Diodes or MOSFETs).
     #[inline]
     pub fn is_linear(&self) -> bool {
@@ -282,6 +297,7 @@ impl DeviceSoaBuffer {
                 None => wf.dc_value(),
             };
             self.vsrc_values[i] = v;
+            self.rhs_buf[self.vsrc_rhs_buf_idx[i] as usize] = v;
         }
         for (i, wf) in self.isrc_waveforms.iter().enumerate() {
             let cur = match t {
@@ -289,6 +305,7 @@ impl DeviceSoaBuffer {
                 None => wf.dc_value(),
             };
             self.isrc_values[i] = cur;
+            self.rhs_buf[self.isrc_rhs_buf_idx[i] as usize] = cur;
         }
     }
 
@@ -299,6 +316,7 @@ impl DeviceSoaBuffer {
             if name.eq_ignore_ascii_case(source_name) {
                 self.vsrc_waveforms[i] = SourceWaveform::Dc(val);
                 self.vsrc_values[i] = val;
+                self.rhs_buf[self.vsrc_rhs_buf_idx[i] as usize] = val;
                 return Ok(());
             }
         }
@@ -306,6 +324,7 @@ impl DeviceSoaBuffer {
             if name.eq_ignore_ascii_case(source_name) {
                 self.isrc_waveforms[i] = SourceWaveform::Dc(val);
                 self.isrc_values[i] = val;
+                self.rhs_buf[self.isrc_rhs_buf_idx[i] as usize] = val;
                 return Ok(());
             }
         }
@@ -327,7 +346,7 @@ impl DeviceSoaBuffer {
             if name.eq_ignore_ascii_case(device_name) && (p_lower == "r" || p_lower == "resistance")
             {
                 self.res_resistance[i] = value;
-                let g = 1.0 / value.max(1e-18);
+                let g = Self::resistor_conductance(device_name, value);
                 self.res_conductance[i] = g;
                 self.cond_buf[self.res_cond_buf_idx[i] as usize] = g;
                 self.linear_dirty = true;
@@ -356,7 +375,15 @@ impl DeviceSoaBuffer {
                 match p_lower.as_str() {
                     "is" => self.diode_is[i] = value,
                     "n" => self.diode_n[i] = value,
-                    "area" => self.diode_area[i] = value,
+                    "area" => {
+                        let old_area = self.diode_area[i];
+                        if old_area > 0.0 {
+                            let scale = value / old_area;
+                            self.diode_is[i] *= scale;
+                            self.diode_cjo[i] *= scale;
+                        }
+                        self.diode_area[i] = value;
+                    }
                     _ => {
                         return Err(SimError::TopologyError(format!(
                             "Unsupported Diode parameter `{param_name}`"
@@ -373,6 +400,208 @@ impl DeviceSoaBuffer {
             "Device `{device_name}` or parameter `{param_name}` not found"
         )))
     }
+
+    /// Detects KCL-inconsistent DC cutsets: any connected component of DC-conductive branches
+    /// (`R`, `V`, `L`, `D`, MOSFET drain-source channel, VCCS output) not containing ground (`0`)
+    /// into which independent current sources inject a non-zero net DC current.
+    ///
+    /// Returns the 1-based node ID of a representative node in the first offending cutset,
+    /// or `None` if all floating DC cutsets have zero net current injection.
+    pub fn find_dc_current_cutset(
+        &self,
+        fixed_nodes: Option<&rustc_hash::FxHashMap<usize, f64>>,
+    ) -> Option<usize> {
+        let total = self.num_nodes + 1;
+        let mut parent: Vec<usize> = (0..total).collect();
+
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                let p = parent[x];
+                parent[x] = parent[p];
+                x = p;
+            }
+            x
+        }
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                if ra < rb {
+                    parent[rb] = ra;
+                } else {
+                    parent[ra] = rb;
+                }
+            }
+        }
+
+        if let Some(ic_map) = fixed_nodes {
+            for &node_id in ic_map.keys() {
+                if node_id < total {
+                    union(&mut parent, 0, node_id);
+                }
+            }
+        }
+
+        for i in 0..self.res_names.len() {
+            union(&mut parent, self.res_n_pos[i], self.res_n_neg[i]);
+        }
+        for i in 0..self.vsrc_names.len() {
+            union(&mut parent, self.vsrc_n_pos[i], self.vsrc_n_neg[i]);
+        }
+        for i in 0..self.ind_names.len() {
+            union(&mut parent, self.ind_n_pos[i], self.ind_n_neg[i]);
+        }
+        for i in 0..self.diode_names.len() {
+            union(&mut parent, self.diode_anode[i], self.diode_cathode[i]);
+        }
+        for i in 0..self.mos_names.len() {
+            union(&mut parent, self.mos_drain[i], self.mos_source[i]);
+        }
+        for i in 0..self.vccs_names.len() {
+            if self.vccs_gm[i].abs() > 0.0 {
+                union(&mut parent, self.vccs_n_pos[i], self.vccs_n_neg[i]);
+            }
+        }
+
+        let mut net_isrc = vec![0.0_f64; total];
+        let mut scale_isrc = vec![0.0_f64; total];
+        for i in 0..self.isrc_names.len() {
+            let cur = self.isrc_values[i];
+            if cur == 0.0 {
+                continue;
+            }
+            let rp = find(&mut parent, self.isrc_n_pos[i]);
+            let rn = find(&mut parent, self.isrc_n_neg[i]);
+            net_isrc[rp] -= cur;
+            net_isrc[rn] += cur;
+            scale_isrc[rp] += cur.abs();
+            scale_isrc[rn] += cur.abs();
+        }
+
+        let gnd_root = find(&mut parent, 0);
+        (1..total).find(|&r| {
+            find(&mut parent, r) == r
+                && r != gnd_root
+                && scale_isrc[r] > 0.0
+                && net_isrc[r].abs() > 1e-12 * scale_isrc[r]
+        })
+    }
+
+    /// Verifies that the circuit has a well-posed DC operating point, returning
+    /// [`SimError::SingularMatrix`] if a floating DC cutset has a non-zero net current injection.
+    pub fn check_dc_solvable_with_ic(
+        &self,
+        fixed_nodes: Option<&rustc_hash::FxHashMap<usize, f64>>,
+    ) -> SimResult<()> {
+        if let Some((nodes, _)) = find_dc_current_cutset(self) {
+            if let Some(ic_map) = fixed_nodes {
+                if nodes.iter().all(|k| ic_map.contains_key(k)) {
+                    return Ok(());
+                }
+            }
+            return Err(SimError::SingularMatrix {
+                index: nodes[0] - 1,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Resistance stamped for a resistor written with value `R = 0` (an ideal short, whose conductance is
+/// infinite). 1 nano-ohm keeps the stamped conductance within 1e9 S, so that the LU factorisation of
+/// a zero-ohm link in series with a 1 kohm load is exact to ~1e-4 while a short to ground stays below 1e-11 V.
+/// Reported by the CLI as a warning.
+pub const ZERO_OHM_SUBSTITUTE: f64 = 1e-9;
+
+/// `true` if a resistor of value `r` is not stamped as written (only an exact zero is).
+#[inline]
+pub fn resistance_is_floored(r: f64) -> bool {
+    r == 0.0
+}
+
+/// Conductance stamped for a resistor of value `r` ohm. Negative resistances are legal (negative
+/// conductance, exactly as written); positive ones keep the historical 1e-18 ohm lower bound.
+#[inline]
+pub fn resistor_conductance(r: f64) -> f64 {
+    if r == 0.0 {
+        1.0 / ZERO_OHM_SUBSTITUTE
+    } else if r < 0.0 {
+        1.0 / r
+    } else {
+        1.0 / r.max(1e-18)
+    }
+}
+
+/// Detects a DC problem that has NO solution because of KCL: a connected island of elements that
+/// carry DC current (R, L, V, diode, MOS channel) and does not contain ground, yet receives a net
+/// non-zero current from independent current sources (e.g. a node touched only by a current
+/// source and capacitors). `gmin` would regularise such a circuit into `I / gmin` volts.
+/// Returns `(island nodes, net injected current)`; islands touched by a VCCS output are skipped.
+pub fn find_dc_current_cutset(soa: &DeviceSoaBuffer) -> Option<(Vec<usize>, f64)> {
+    let n = soa.num_nodes + 1;
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut a: usize) -> usize {
+        while parent[a] != a {
+            parent[a] = parent[parent[a]];
+            a = parent[a];
+        }
+        a
+    }
+    let union = |a: usize, b: usize, parent: &mut Vec<usize>| {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    };
+    for i in 0..soa.res_names.len() {
+        union(soa.res_n_pos[i], soa.res_n_neg[i], &mut parent);
+    }
+    for i in 0..soa.ind_names.len() {
+        union(soa.ind_n_pos[i], soa.ind_n_neg[i], &mut parent);
+    }
+    for i in 0..soa.vsrc_names.len() {
+        union(soa.vsrc_n_pos[i], soa.vsrc_n_neg[i], &mut parent);
+    }
+    for i in 0..soa.diode_names.len() {
+        union(soa.diode_anode[i], soa.diode_cathode[i], &mut parent);
+    }
+    for i in 0..soa.mos_names.len() {
+        union(soa.mos_drain[i], soa.mos_source[i], &mut parent);
+    }
+    let mut injected = vec![0.0_f64; n];
+    let mut magnitude = vec![0.0_f64; n];
+    let mut indeterminate = vec![false; n];
+    for i in 0..soa.isrc_names.len() {
+        let (p, q, v) = (soa.isrc_n_pos[i], soa.isrc_n_neg[i], soa.isrc_values[i]);
+        let (rp, rq) = (find(&mut parent, p), find(&mut parent, q));
+        // current flows n+ -> n- THROUGH the source: it leaves n+ and enters n-
+        injected[rp] -= v;
+        injected[rq] += v;
+        magnitude[rp] += v.abs();
+        magnitude[rq] += v.abs();
+    }
+    for i in 0..soa.vccs_names.len() {
+        let (rp, rq) = (
+            find(&mut parent, soa.vccs_n_pos[i]),
+            find(&mut parent, soa.vccs_n_neg[i]),
+        );
+        indeterminate[rp] = true;
+        indeterminate[rq] = true;
+    }
+    let ground = find(&mut parent, 0);
+    for root in 0..n {
+        if root == ground || indeterminate[root] || magnitude[root] == 0.0 {
+            continue;
+        }
+        if find(&mut parent, root) != root {
+            continue;
+        }
+        if injected[root].abs() > 1e-9 * magnitude[root] {
+            let nodes: Vec<usize> = (1..n).filter(|&k| find(&mut parent, k) == root).collect();
+            return Some((nodes, injected[root]));
+        }
+    }
+    None
 }
 
 /// Compiles a parsed [`Netlist`] into a 64-byte aligned [`DeviceSoaBuffer`] and a conflict-free
@@ -452,6 +681,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         temp_vt: 0.025864917007155805, // Exact ngspice-47 k*T/q at 300.15 K (27 C)
         is_transient: false,
         transient_g_scale: 0.0,
+        node_names: netlist.node_names.clone(),
         ..Default::default()
     };
 
@@ -486,7 +716,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
 
     // 1. Resistors (static linear)
     for r in &netlist_expanded.resistors {
-        let g = 1.0 / r.resistance.max(1e-18);
+        let g = DeviceSoaBuffer::resistor_conductance(&r.name, r.resistance);
         let buf_idx = soa.cond_buf.len() as u32;
         soa.cond_buf.push(g);
         soa.res_names.push(r.name.clone());
@@ -689,6 +919,19 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
             .get(&mos.model)
             .cloned()
             .unwrap_or_default();
+        let l_val = mos.l.unwrap_or(m.l_default);
+        if l_val == 0.0 {
+            return Err(SimError::TopologyError(format!(
+                "MOSFET `{}` has zero channel length L=0",
+                mos.name
+            )));
+        }
+        if m.phi <= 0.0 {
+            return Err(SimError::TopologyError(format!(
+                "MOSFET model `{}` has non-positive surface potential PHI={}",
+                m.name, m.phi
+            )));
+        }
         let gm_idx = soa.cond_buf.len() as u32;
         soa.cond_buf.push(0.0);
         let gds_idx = soa.cond_buf.len() as u32;
@@ -876,11 +1119,13 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
             node_has_dc_device[m.n_source - 1] = true;
         }
     }
+    let mut dc_floating_diag_idx = Vec::new();
     for (d, &has_dc) in node_has_dc_device.iter().enumerate() {
         if !has_dc {
             let diag = jacobian.diag_idx[d];
             if diag < nnz {
                 static_linear_csc_values[diag] += soa.gmin;
+                dc_floating_diag_idx.push(diag);
             }
         }
     }
@@ -896,6 +1141,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     soa.gather_table = build_gather_table(&full_nnz_buckets, &rhs_buckets);
     soa.dynamic_gather_table = build_gather_table(&dyn_nnz_buckets, &rhs_buckets);
     soa.static_linear_csc_values = static_linear_csc_values;
+    soa.dc_floating_diag_idx = dc_floating_diag_idx;
     soa.linear_dirty = false;
 
     Ok(CompiledTopology { soa, jacobian })

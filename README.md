@@ -22,28 +22,36 @@ Part of **[RustEDA](https://github.com/lab-emi/RustEDA)**, infrastructure for ch
 
 ## Benchmarks
 
-**Host: Linux x86_64 (32 hardware threads, AVX-512/AVX2 + NVIDIA GeForce RTX 4090 Laptop GPU)** · Reference baseline: **`ngspice-47` compiled with the KLU direct sparse solver (`ngspice -b`)**.
+**Host: 13th Gen Intel(R) Core(TM) i9-13900HX (32 hardware threads) · Reference: `ngspice-47` (SPARSE 1.3 by default, KLU with `.options klu`; every row compares with the faster of the two).**
 
-One warm-up and multiple measured runs; end-to-end wall times include SPICE deck parsing, topology compilation, Compressed Sparse Column (CSC) construction, symbolic factorization, device stamping, and numerical solve. Solver kernel times compare the core simulation loop against `ngspice` internal `rusage` analysis time.
+Both tools run as subprocesses (`rustspice run --raw`, `ngspice -b -r`) with the rawfile on tmpfs, the single-core benchmarks pinned to one idle core: one warm-up, nine interleaved repetitions, end to end (process start-up, parsing, topology compilation, symbolic factorisation, device stamping, the solve and the output). Accuracy is the maximum error over the full waveform or sweep against an independent oracle where one exists, otherwise against a tightly converged ngspice (`reltol=1e-9`, `vntol=1e-12`, `abstol=1e-15`).
 
 <!-- rustspice-ngspice-benchmark:start -->
 
-| Benchmark suite | Circuit scale | `ngspice-47`<br>Wall, ms ↓ | `ngspice-47`<br>Solver, ms ↓ | `RustSpice`<br>Total, ms ↓ | `RustSpice`<br>Solver, ms ↓ | Max \|ΔV\|,<br>V ↓ | End-to-end<br>Speedup ↑ | Solver kernel<br>Speedup ↑ |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **1. 5,000-Node Power Grid (DC OP)** | 10,000 Resistors, 5,002 MNA variables | 58.47 | 50.00 | **11.053** | **0.206** | `2.16e-45` | **5.3×** | **243.2×** |
-| **2. 2,000-Node RC Line (500-Step Tran)** | 4,000 R/C elements, 500 time steps | 244.81 | 238.00 | **32.218** | **27.836** | `0.00e0` | **7.6×** | **8.6×** |
-| **3. 64-Diode Nonlinear Array (201-Pt DC Sweep)** | 64 Diodes + 128 Resistors, 201 sweep points | 8.71 | 5.00 | **2.898** | **2.664** | `2.15e-14` | **3.0×** | **1.9×** |
-| **4. 100-Stage CMOS Inverter Chain (Tran)** | 200 NMOS/PMOS + 100 Caps, 400 time steps | 42.14 | 39.00 | **16.265** | **15.857** | `3.31e-12` | **2.6×** | **2.5×** |
-| **5. 200-Param Sensitivity (Adjoint vs. FD)** | 200 Resistor Gradients (1 Adjoint Solve vs. 400 FD) | 2,167.17 | 800.00 | **0.345** | **0.081** | `1.50e-11` | **6,284.9×** | **9,867.0×** |
-| **6. 128-Corner PVT Batch (Rayon Parallel)** | 128 Nonlinear 32-Diode Corners in Parallel | 686.08 | 256.00 | **2.136** | **1.940** | `0.00e0` | **321.1×** | **131.9×** |
+| Benchmark | Circuit scale | `ngspice-47`<br>end to end ↓ | `RustSpice`<br>end to end ↓ | Speedup ↑ | Max error: `RustSpice` / `ngspice` default ↓ |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| **1. Resistor ladder (DC OP)** | 10,000 resistors, 5,002 MNA unknowns (DC operating point) | 40.20 ms | 16.40 ms | **2.45×** | `1.91e-13` / `1.93e-13` V |
+| **2. RC line (transient)** | 4,000 R/C elements, `.tran 10p 5n` (500 steps) | 163 ms | 39.90 ms | **4.08×** at 32.8× the error of ngspice default | `5.40e-2` / `1.65e-3` of swing (vs tight ngspice) |
+| **3. Diode array (DC sweep)** | 64 diodes + 128 resistors, 201-point DC sweep | 7.80 ms | 4.72 ms | **1.65×** | `5.89e-11` / `5.44e-5` V |
+| **4. CMOS inverter chain (transient)** | 200 MOSFETs + 100 capacitors, `.tran 5p 2n` (400 steps) | 52.81 ms | 30.93 ms | **1.71×** | `4.14e-1` / `3.86e-1` of swing (vs tight ngspice) |
+| **5. Sensitivity (adjoint vs. ngspice `.sens`)** | 200 resistor gradients (one adjoint solve) | 11.44 ms | 1.20 ms | **9.55×** vs `.sens` | `9.33e-15` / `1.00e-6` (normalised) |
+| **6. PVT batch (128 corners)** | 128 PVT corners of a 32-diode nonlinear net (Rayon) | 3.71 ms | 3.65 ms | **1.02×** (parallel workload; **2.62×** via `.dc` sweep) | `2.47e-11` / `1.63e-5` V |
 
 <!-- rustspice-ngspice-benchmark:end -->
 
-Every benchmark verifies numerical agreement against `ngspice-47` (`set numdgt=12`, `reltol=1e-9`, `vntol=1e-12`, `abstol=1e-14`) or central finite differences (`Max |ΔV| ≤ 3.31e-12 V`).
+Speedup = `ngspice-47` / `RustSpice`, median of 9 interleaved repetitions against the faster of ngspice's SPARSE 1.3 and KLU solvers; both tools run as subprocesses with rawfile output on tmpfs, the single-core benchmarks pinned to one idle core (the parallel batch, benchmark 6, is not pinned). The previously published 5.3×, 7.6×, 3.0×, 2.6×, 6,285× and 321× came from a harness with known defects (1 ms-quantised solver times, a cold process compared with a warm in-process call, hard-coded zero errors, single runs multiplied by 128 or 400, a transient compared at t = 0 only) and are withdrawn; the report lists each one with its replacement.
 
-- **Zero-indirection symbolic LU & Cranelift JIT (`rustspice-backend-cpu::jit`)**: compiles circuit-specific sparse LU factorization and triangular solves directly into unrolled native machine code, eliminating sparse row/column index lookups inside the Newton-Raphson loop.
+- Benchmark 2 is not at equal accuracy: RustSpice's error at its fixed 10 ps step is 32.8× ngspice default's (both against a tightly converged ngspice).
+- Benchmark 4: at the legacy 5 ps step both tools are about 0.4 of the swing away from the converged reference (RustSpice 0.41, ngspice default 0.39); the 20 ps edges make this comparison one of speed at comparable, not good, accuracy.
+- Benchmark 5 compares one adjoint solve with the best ngspice alternative (`.sens`, which computes 24 sensitivities per requested gradient); against the finite-difference loop that delivers only the 200 requested gradients the ratio is 348×.
+- Benchmark 6 is a parallel workload (32 threads vs ngspice's 1-thread `.dc` sweep; against `ngspice-control-loop-sparse` the ratio is 5.87×, and against `ngspice-par-launches` 9.34×).
+
+Beyond these six circuits, `rustspice bench-suite` runs 951 cases against ngspice-47 (**635 pass**, **237 documented RustSpice gaps**, **77 informational**, **1 unverified** without timing, **0 failing**, plus 400/400 random fuzz decks passing and 200/200 hostile mutants handled without a panic) and times 110 of them: RustSpice is faster end to end in **101 of 110**, with a geometric-mean speedup of **2.51×**. All 2-D and 3-D linear meshes, shuffled ladders and LC ladders are faster than ngspice; 9 nonlinear 2-D MOS/SRAM/diode array and mesh cases remain 1.03×–24.4× slower than ngspice-KLU. See [`benchmarks/README.md`](benchmarks/README.md).
+
+- **Three-tier adaptive sparse linear solver (`rustspice-solver::linear`)**: combines symmetric minimum-degree ordering, diagonal-preferring threshold Markowitz pivoting (`0.1`) and factor-growth monitoring on the unrolled symbolic / Cranelift JIT tier with cached symbolic-once `faer` sparse LU (`FaerLuCache`), dense partial-pivoting LU for small ill-conditioned topologies, and Jacobi-preconditioned conjugate gradient (PCG).
 - **Conflict-free static gather table (`CscGatherTable`)**: pre-stamps linear conductances once during compilation and gathers only active dynamic/nonlinear entries via contiguous offsets with zero atomic contention or binary search.
-- **Constant-step LU caching & secant predictor (`rustspice-solver`)**: reuses factored `L`/`U` matrices across fixed-step linear transient intervals and extrapolates nonlinear initial guesses across `.dc` sweeps and `.tran` steps.
+- **Constant-step LU caching, integer-counted grids & homotopy (`rustspice-solver`)**: reuses factored `L`/`U` matrices across constant-step linear transient intervals, subdivides the initial BDF-1 startup interval into 16 sub-steps before trapezoidal integration, and pairs `pnjlim`/`fetlim` step-delta checks with adaptive `Gmin` and source-stepping homotopy.
+- **Structured reader diagnostics & resource budgets (`rustspice-core`)**: reports unimplemented SPICE directives, model parameters and waveform approximations via structured `Diagnostic` warnings (`--strict` promotes warnings to errors) and enforces configurable `ResourceLimits` (`--max-elements`, `--max-nodes`, `--max-subckt-depth`, `--max-sweep-points`, `--max-tran-steps`, `--max-newton-iters`).
 - **Discrete adjoint sensitivity (`AdjointSensitivityEngine`)**: computes exact gradients with respect to `P` parameters in a single transposed solve (`J^T λ = ∂L/∂V`) rather than `2P` perturbed simulations.
 
 [Complete benchmark report](docs/benchmark_report.md) · [Architecture guide](docs/architecture.md).

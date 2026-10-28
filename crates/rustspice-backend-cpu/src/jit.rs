@@ -60,9 +60,26 @@ pub struct UnrolledSymbolicLu {
 }
 
 impl UnrolledSymbolicLu {
+    /// Relative pivot tolerance for threshold Markowitz pivoting (`0.1` instead of `1e-3`).
+    pub const PIVOT_REL_TOL: f64 = 0.1;
+    /// Diagonal preference threshold: when the structural diagonal `(k, k)` is unused and
+    /// `|A[k, k]| >= DIAG_PREF_TOL * max_col_val`, prefer keeping `(k, k)` on the diagonal
+    /// before searching off-diagonal rows.
+    pub const DIAG_PREF_TOL: f64 = 0.5;
+    /// Maximum tolerable growth ratio `max(|L|, |U|) / max(|A|)` before a static pivot
+    /// factorization is declared numerically unstable and handed to a dynamic-pivoting fallback.
+    pub const MAX_FACTOR_GROWTH: f64 = 1e12;
+
     /// Performs symbolic Gaussian elimination with numerical static pivoting on `initial_csc`
     /// to synthesize a zero-indirection [`UnrolledSymbolicLu`] execution plan.
     pub fn compile(initial_csc: &CscMatrix<f64>) -> SimResult<Self> {
+        Self::compile_with_budget(initial_csc, usize::MAX)
+    }
+
+    /// Performs symbolic Gaussian elimination with an explicit upper bound `max_ops` on the
+    /// number of elimination micro-operations. If fill-in causes the operation count to exceed
+    /// `max_ops`, returns `Err` early without allocating the multi-hundred-megabyte `factor_ops` vector.
+    pub fn compile_with_budget(initial_csc: &CscMatrix<f64>, max_ops: usize) -> SimResult<Self> {
         let n = initial_csc.nrows;
         if n != initial_csc.ncols || n == 0 {
             return Err(SimError::TopologyError(
@@ -70,7 +87,9 @@ impl UnrolledSymbolicLu {
             ));
         }
 
-        // Build mutable sparse rows and column-to-row index lists for O(NNZ) Markowitz pivot discovery
+        // Build mutable sparse rows and column-to-row index lists for O(NNZ) Markowitz pivot discovery.
+        // Register all structural entries (including entries whose DC seed value is 0.0, such as
+        // unactivated MOSFET gm/gds or transient capacitor/inductor slots) so column structure is complete.
         let mut sim_rows: Vec<FxHashMap<usize, f64>> = vec![FxHashMap::default(); n];
         let mut col_to_rows: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (col, col_rows) in col_to_rows.iter_mut().enumerate().take(n) {
@@ -78,9 +97,7 @@ impl UnrolledSymbolicLu {
                 let row = initial_csc.row_idx[idx];
                 let val = initial_csc.values[idx];
                 sim_rows[row].insert(col, val);
-                if val.abs() > 0.0 {
-                    col_rows.push(row);
-                }
+                col_rows.push(row);
             }
         }
 
@@ -88,19 +105,23 @@ impl UnrolledSymbolicLu {
         let mut used = vec![false; n];
 
         // Pre-pair grounded voltage-source singleton branches `(p, br)`:
-        // When row `br` has only 1 entry at column `p` and column `br` has only 1 entry at row `p`,
-        // pairing `row_perm[p] = br` and `row_perm[br] = p` places the degree-1 branch equation
-        // at `new_row = p` (producing zero fill-in when eliminating node `p`) and moves the
-        // high-degree KCL equation of node `p` to `new_row = br` at the bottom of the matrix.
+        // Only pair when `col_to_rows[br]` has a single *off-diagonal* structural entry `p != br`
+        // and the `(br, br)` diagonal is zero (pure voltage source branch, not an inductor with R_eq).
         for br in 0..n {
-            if col_to_rows[br].len() == 1 && sim_rows[br].len() == 1 {
-                let p = col_to_rows[br][0];
-                if p != br
-                    && !used[p]
-                    && !used[br]
-                    && sim_rows[br].get(&p).copied().unwrap_or(0.0).abs() > 1e-9
-                    && sim_rows[p].get(&br).copied().unwrap_or(0.0).abs() > 1e-9
-                {
+            let br_diag = sim_rows[br].get(&br).copied().unwrap_or(0.0).abs();
+            let off_diag_rows: Vec<usize> = col_to_rows[br]
+                .iter()
+                .copied()
+                .filter(|&r| r != br && sim_rows[r].get(&br).copied().unwrap_or(0.0).abs() > 1e-9)
+                .collect();
+            let off_diag_cols: Vec<usize> = sim_rows[br]
+                .iter()
+                .filter(|&(&c, &v)| c != br && v.abs() > 1e-9)
+                .map(|(&c, _)| c)
+                .collect();
+            if br_diag <= 1e-15 && off_diag_rows.len() == 1 && off_diag_cols.len() == 1 {
+                let p = off_diag_rows[0];
+                if p == off_diag_cols[0] && p != br && !used[p] && !used[br] {
                     row_perm[p] = br;
                     row_perm[br] = p;
                     used[br] = true;
@@ -114,7 +135,9 @@ impl UnrolledSymbolicLu {
             }
         }
 
-        // Perform O(NNZ) Markowitz + Threshold Partial Pivoting to determine remaining `row_perm`
+        let mut ops_lb: usize = 0;
+
+        // Perform O(NNZ) Markowitz + Diagonal-Preferring Threshold Partial Pivoting to determine remaining `row_perm`
         for k in 0..n {
             if row_perm[k] != usize::MAX {
                 continue;
@@ -131,25 +154,45 @@ impl UnrolledSymbolicLu {
                 return Err(SimError::SingularMatrix { index: k });
             }
 
-            let threshold = 1e-3 * max_col_val;
-            let mut best_orig_row = usize::MAX;
-            let mut best_deg = usize::MAX;
-            let mut best_val = -1.0_f64;
+            // Prefer the structural diagonal `(k, k)` when it is unused and within `DIAG_PREF_TOL`
+            // of the column maximum. MNA nodal rows are diagonally dominant when conductive paths
+            // or transient companion conductances `2C/h` are active; keeping `(k, k)` on the diagonal
+            // avoids freezing an off-diagonal coupling pivot that becomes tiny in `.tran`.
+            let diag_val = if !used[k] {
+                sim_rows[k].get(&k).copied().unwrap_or(0.0).abs()
+            } else {
+                0.0
+            };
 
-            for &r_orig in &col_to_rows[k] {
-                if used[r_orig] {
-                    continue;
-                }
-                let v = sim_rows[r_orig].get(&k).copied().unwrap_or(0.0).abs();
-                if v >= threshold {
-                    let deg = sim_rows[r_orig].len();
-                    if deg < best_deg || (deg == best_deg && v > best_val) {
-                        best_deg = deg;
-                        best_val = v;
-                        best_orig_row = r_orig;
+            let best_orig_row = if !used[k] && diag_val >= Self::DIAG_PREF_TOL * max_col_val {
+                k
+            } else {
+                let threshold = Self::PIVOT_REL_TOL * max_col_val;
+                let mut chosen = usize::MAX;
+                let mut best_deg = usize::MAX;
+                let mut best_val = -1.0_f64;
+
+                for &r_orig in &col_to_rows[k] {
+                    if used[r_orig] {
+                        continue;
+                    }
+                    let v = sim_rows[r_orig].get(&k).copied().unwrap_or(0.0).abs();
+                    if v >= threshold {
+                        let deg = sim_rows[r_orig].len();
+                        let is_diag = r_orig == k;
+                        let chosen_is_diag = chosen == k;
+                        if deg < best_deg
+                            || (deg == best_deg && is_diag && !chosen_is_diag)
+                            || (deg == best_deg && is_diag == chosen_is_diag && v > best_val)
+                        {
+                            best_deg = deg;
+                            best_val = v;
+                            chosen = r_orig;
+                        }
                     }
                 }
-            }
+                chosen
+            };
 
             if best_orig_row == usize::MAX {
                 return Err(SimError::SingularMatrix { index: k });
@@ -173,6 +216,12 @@ impl UnrolledSymbolicLu {
                 if let Some(&lik) = sim_rows[r_orig].get(&k) {
                     if lik.abs() == 0.0 {
                         continue;
+                    }
+                    ops_lb = ops_lb.saturating_add(1 + piv_upper.len());
+                    if ops_lb > max_ops {
+                        return Err(SimError::TopologyError(
+                            "Symbolic LU operation budget exceeded during pivot search".to_string(),
+                        ));
                     }
                     let mult = lik / piv_val;
                     sim_rows[r_orig].remove(&k);
@@ -212,13 +261,21 @@ impl UnrolledSymbolicLu {
         }
 
         let mut row_upper_cols: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut ops_exact: usize = n;
         for k in 0..n {
             let split_idx = active_rows[k].partition_point(|&c| c <= k);
             let upper_cols: Vec<usize> = active_rows[k][split_idx..].to_vec();
+            let mut lower_rows = sym_col_rows[k].clone();
+            lower_rows.sort_unstable();
+            lower_rows.dedup();
+            let num_lower = lower_rows.iter().filter(|&&i| i > k).count();
+            ops_exact = ops_exact.saturating_add(num_lower * (1 + upper_cols.len()));
+            if ops_exact > max_ops {
+                return Err(SimError::TopologyError(
+                    "Symbolic LU operation budget exceeded during symbolic fill-in".to_string(),
+                ));
+            }
             if !upper_cols.is_empty() {
-                let mut lower_rows = sym_col_rows[k].clone();
-                lower_rows.sort_unstable();
-                lower_rows.dedup();
                 for i in lower_rows {
                     if i > k {
                         for &c in &upper_cols {
@@ -354,7 +411,7 @@ impl UnrolledSymbolicLu {
             match *op {
                 SymbolicLuOp::InvertPivot { diag_idx } => {
                     let piv = lu_buf[diag_idx as usize];
-                    if piv.abs() < 1e-14 || !piv.is_finite() {
+                    if piv.abs() < 1e-30 || !piv.is_finite() {
                         return Err(SimError::SingularMatrix {
                             index: diag_idx as usize,
                         });
@@ -377,7 +434,55 @@ impl UnrolledSymbolicLu {
                 }
             }
         }
+        if !self.factors_are_stable(csc_values, lu_buf) {
+            return Err(SimError::SingularMatrix { index: 0 });
+        }
         Ok(())
+    }
+
+    /// Verifies that the computed `lu_buf` factors did not suffer catastrophic element growth
+    /// (`max(|L|, |U|) / max(|A|) <= MAX_FACTOR_GROWTH`) or near-zero pivots relative to `||A||_max`.
+    #[inline]
+    pub fn factors_are_stable(&self, csc_values: &[f64], lu_buf: &[f64]) -> bool {
+        let mut max_a = 0.0_f64;
+        for &v in csc_values {
+            if !v.is_finite() {
+                return false;
+            }
+            max_a = max_a.max(v.abs());
+        }
+        if max_a == 0.0 {
+            return false;
+        }
+        // Check diagonal pivots (stored as 1.0 / U[k, k] in diag_lu_idx)
+        let mut max_u_diag = 0.0_f64;
+        let mut min_piv = f64::INFINITY;
+        for &d_idx in &self.diag_lu_idx {
+            let inv_piv = lu_buf[d_idx as usize];
+            if !inv_piv.is_finite() || inv_piv == 0.0 {
+                return false;
+            }
+            let piv_abs = (1.0 / inv_piv).abs();
+            max_u_diag = max_u_diag.max(piv_abs);
+            min_piv = min_piv.min(piv_abs);
+        }
+        // Check off-diagonal L multipliers and U entries
+        let mut max_lu = max_u_diag;
+        for term in &self.l_terms {
+            let v = lu_buf[term.lu_idx as usize];
+            if !v.is_finite() {
+                return false;
+            }
+            max_lu = max_lu.max(v.abs());
+        }
+        for term in &self.u_terms {
+            let v = lu_buf[term.lu_idx as usize];
+            if !v.is_finite() {
+                return false;
+            }
+            max_lu = max_lu.max(v.abs());
+        }
+        max_lu <= Self::MAX_FACTOR_GROWTH * max_a && min_piv >= 1e-12 * max_a
     }
 
     /// Solves $A x = b$ using the pre-factored `lu_buf`.
@@ -475,12 +580,19 @@ unsafe impl Sync for CraneliftTopologyJit {}
 
 impl CraneliftTopologyJit {
     /// Maximum number of symbolic LU micro-ops to unroll into a single native JIT function
-    /// (keeps generated machine code inside L1 instruction cache and compile time < 0.5 ms).
-    pub const MAX_JIT_OPS: usize = 256;
+    /// (keeps generated machine code inside L1 instruction cache and compile time < 0.2 ms;
+    /// larger circuits use the zero-compile-overhead `UnrolledSymbolicLu` stream).
+    pub const MAX_JIT_OPS: usize = 32;
 
     /// Compiles a topology-specialized native machine code solver from `initial_csc`.
     pub fn compile(initial_csc: &CscMatrix<f64>) -> SimResult<Self> {
-        let symbolic = UnrolledSymbolicLu::compile(initial_csc)?;
+        Self::compile_with_budget(initial_csc, usize::MAX)
+    }
+
+    /// Compiles a topology-specialized solver with an explicit upper bound `max_ops` on
+    /// symbolic elimination micro-operations.
+    pub fn compile_with_budget(initial_csc: &CscMatrix<f64>, max_ops: usize) -> SimResult<Self> {
+        let symbolic = UnrolledSymbolicLu::compile_with_budget(initial_csc, max_ops)?;
         if symbolic.factor_ops.len() > Self::MAX_JIT_OPS {
             return Ok(Self {
                 symbolic,
@@ -696,7 +808,7 @@ impl CraneliftTopologyJit {
                     x.as_mut_ptr(),
                 );
             }
-            if x.iter().all(|v| v.is_finite()) {
+            if self.symbolic.factors_are_stable(csc_values, lu_buf) {
                 return Ok(());
             }
         }
