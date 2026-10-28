@@ -229,25 +229,41 @@ struct RawPlotOut {
     rows: Vec<Vec<f64>>,
 }
 
-/// `v(node)` / `i(vsrc)` / `i(lname)` labels of the MNA unknowns, lower-case like ngspice.
-fn mna_labels(sim: &Simulator) -> Vec<String> {
+/// `v(node)` / `i(vsrc)` / `i(lname)` / `i(ename)` labels of the written MNA unknowns, lower-case like ngspice, and
+/// their indices in the solution vector. Device-internal nodes (series resistances) are not written.
+fn mna_labels(sim: &Simulator) -> (Vec<String>, Vec<usize>) {
     let soa = &sim.topology.soa;
-    let mut l: Vec<String> = vec![String::new(); soa.mna_dim];
+    let mut l: Vec<Option<String>> = vec![None; soa.mna_dim];
     for (i, n) in sim.netlist.node_names.iter().enumerate().skip(1) {
-        l[i - 1] = format!("v({})", n.to_ascii_lowercase());
+        l[i - 1] = Some(format!("v({})", n.to_ascii_lowercase()));
     }
-    for (k, name) in soa.vsrc_names.iter().enumerate() {
-        l[soa.vsrc_branch_idx[k]] = format!("i({})", name.to_ascii_lowercase());
+    let branches = (soa.vsrc_names.iter().zip(&soa.vsrc_branch_idx))
+        .chain(soa.ind_names.iter().zip(&soa.ind_branch_idx))
+        .chain(soa.ctl_names.iter().zip(&soa.ctl_branch_idx));
+    for (name, &br) in branches {
+        l[br] = Some(format!("i({})", name.to_ascii_lowercase()));
     }
-    for (k, name) in soa.ind_names.iter().enumerate() {
-        l[soa.ind_branch_idx[k]] = format!("i({})", name.to_ascii_lowercase());
-    }
-    for (i, s) in l.iter_mut().enumerate() {
-        if s.is_empty() {
-            *s = format!("x({i})");
+    let internal = sim.netlist.num_nodes()..soa.num_nodes;
+    let mut labels = Vec::with_capacity(l.len());
+    let mut cols = Vec::with_capacity(l.len());
+    for (i, s) in l.into_iter().enumerate() {
+        if internal.contains(&i) {
+            continue;
         }
+        labels.push(s.unwrap_or_else(|| format!("x({i})")));
+        cols.push(i);
     }
-    l
+    (labels, cols)
+}
+
+/// The written columns of solution rows (all of them unless device-internal nodes exist).
+fn visible_rows(rows: Vec<Vec<f64>>, cols: &[usize]) -> Vec<Vec<f64>> {
+    if rows.first().is_none_or(|r| r.len() == cols.len()) {
+        return rows;
+    }
+    rows.into_iter()
+        .map(|r| cols.iter().map(|&c| r[c]).collect())
+        .collect()
 }
 
 fn raw_vars(labels: &[String]) -> Vec<bench::rawfile::Var> {
@@ -387,7 +403,7 @@ fn run_deck_inner(
         compile_us
     );
 
-    let labels = mna_labels(&sim);
+    let (labels, cols) = mna_labels(&sim);
     let mut plots: Vec<RawPlotOut> = Vec::new();
     let analyses = sim.netlist.analyses.clone();
     let mut total_us = 0.0;
@@ -420,7 +436,7 @@ fn run_deck_inner(
                         plotname: "Operating Point",
                         vars: raw_vars(&labels),
                         axis: None,
-                        rows: vec![res.solution],
+                        rows: visible_rows(vec![res.solution], &cols),
                     });
                 }
             }
@@ -487,7 +503,7 @@ fn run_deck_inner(
                         plotname: "DC transfer characteristic",
                         vars,
                         axis: Some(res.sweep_values),
-                        rows: res.solutions,
+                        rows: visible_rows(res.solutions, &cols),
                     });
                 }
             }
@@ -536,7 +552,7 @@ fn run_deck_inner(
                         plotname: "Transient Analysis",
                         vars,
                         axis: Some(res.time_points),
-                        rows: res.waveforms,
+                        rows: visible_rows(res.waveforms, &cols),
                     });
                 }
             }

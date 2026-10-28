@@ -6,6 +6,7 @@ pub mod backend;
 pub mod diag;
 pub mod error;
 pub mod expr;
+pub mod ext;
 pub mod include;
 pub mod limits;
 pub mod netlist;
@@ -18,6 +19,7 @@ pub mod temperature;
 pub use backend::ComputeBackend;
 pub use diag::{Diagnostic, Severity};
 pub use error::{SimError, SimResult};
+pub use ext::ExtDevices;
 pub use limits::ResourceLimits;
 pub use netlist::{
     parse_netlist, parse_netlist_file, parse_netlist_with_limits, parse_spice_number, AnalysisCmd,

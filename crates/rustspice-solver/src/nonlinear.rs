@@ -165,7 +165,7 @@ impl NonlinearSolver {
                 )));
             }
         }
-        Ok(())
+        soa.ext.check_exponent_range(x, soa.temp_vt)
     }
 
     /// Synchronizes internal diode junction voltages `diode_vd` with a node voltage vector `x`
@@ -177,6 +177,7 @@ impl NonlinearSolver {
             let vc = rustspice_core::DeviceSoaBuffer::node_voltage(x, topo.soa.diode_cathode[i]);
             topo.soa.diode_vd[i] = va - vc;
         }
+        topo.soa.ext.sync_limiter(x);
     }
 
     /// Largest contraction `|dx_k| / |dx_(k-1)|` (in units of the step tolerance) for which a transient Newton

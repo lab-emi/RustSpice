@@ -7,7 +7,8 @@ use rustspice_macros::spice_device;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{SimError, SimResult};
-use crate::netlist::{Netlist, SourceWaveform};
+use crate::ext::{ExtDevices, Junction, MeyerCaps, Mutual, PolySource};
+use crate::netlist::{Netlist, ResistorInstance, SourceWaveform};
 use crate::sparse::{CscGatherTable, CscMatrix, GatherTerm, JaggedTerms};
 
 /// 64-byte cache-line aligned contiguous array for AVX-512 / AVX2 / NEON and GPU DMA transfers.
@@ -262,6 +263,17 @@ pub struct DeviceSoaBuffer {
     pub mos_rev_gmbs_buf_idx: Vec<u32>,
     pub mos_rhs_buf_idx: Vec<u32>,
 
+    // --- Controlled sources: `E` / `H` branch rows (after the inductor branches) and current outputs ---
+    pub ctl_names: Vec<String>,
+    pub ctl_n_pos: Vec<usize>,
+    pub ctl_n_neg: Vec<usize>,
+    pub ctl_branch_idx: Vec<usize>,
+    /// Output nodes `(n+, n-)` of the `F` and `G ... POLY` sources (current outputs, like a VCCS).
+    pub ctl_current_nodes: Vec<(usize, usize)>,
+
+    // --- Couplings, polynomial sources, full junctions and Meyer capacitances (see `ext`) ---
+    pub ext: ExtDevices,
+
     // --- Flat Conflict-Free Gather Buffers ---
     pub cond_buf: AlignedVec<f64>,
     pub rhs_buf: AlignedVec<f64>,
@@ -291,10 +303,11 @@ impl DeviceSoaBuffer {
         resistor_conductance(r)
     }
 
-    /// Returns `true` if the circuit contains no nonlinear devices (Diodes or MOSFETs).
+    /// Returns `true` if the circuit contains no nonlinear devices (diodes, MOSFETs, junctions, polynomial
+    /// sources).
     #[inline]
     pub fn is_linear(&self) -> bool {
-        self.diode_names.is_empty() && self.mos_names.is_empty()
+        self.diode_names.is_empty() && self.mos_names.is_empty() && !self.ext.is_nonlinear()
     }
 
     /// Reads the voltage of a 1-based node ID (`0` returns `0.0` for Ground).
@@ -510,6 +523,15 @@ impl DeviceSoaBuffer {
                 union(&mut parent, self.vccs_n_pos[i], self.vccs_n_neg[i]);
             }
         }
+        for i in 0..self.ctl_names.len() {
+            union(&mut parent, self.ctl_n_pos[i], self.ctl_n_neg[i]);
+        }
+        for &(p, q) in &self.ctl_current_nodes {
+            union(&mut parent, p, q);
+        }
+        for (a, c) in self.ext.junction_terminals() {
+            union(&mut parent, a, c);
+        }
 
         let mut net_isrc = vec![0.0_f64; total];
         let mut scale_isrc = vec![0.0_f64; total];
@@ -616,6 +638,12 @@ pub fn find_dc_current_cutset(soa: &DeviceSoaBuffer) -> Option<(Vec<usize>, f64)
     for i in 0..soa.mos_names.len() {
         union(soa.mos_drain[i], soa.mos_source[i], &mut parent);
     }
+    for i in 0..soa.ctl_names.len() {
+        union(soa.ctl_n_pos[i], soa.ctl_n_neg[i], &mut parent);
+    }
+    for (a, c) in soa.ext.junction_terminals() {
+        union(a, c, &mut parent);
+    }
     let mut injected = vec![0.0_f64; n];
     let mut magnitude = vec![0.0_f64; n];
     let mut indeterminate = vec![false; n];
@@ -628,11 +656,11 @@ pub fn find_dc_current_cutset(soa: &DeviceSoaBuffer) -> Option<(Vec<usize>, f64)
         magnitude[rp] += v.abs();
         magnitude[rq] += v.abs();
     }
-    for i in 0..soa.vccs_names.len() {
-        let (rp, rq) = (
-            find(&mut parent, soa.vccs_n_pos[i]),
-            find(&mut parent, soa.vccs_n_neg[i]),
-        );
+    let current_outputs = (0..soa.vccs_names.len())
+        .map(|i| (soa.vccs_n_pos[i], soa.vccs_n_neg[i]))
+        .chain(soa.ctl_current_nodes.iter().copied());
+    for (p, q) in current_outputs {
+        let (rp, rq) = (find(&mut parent, p), find(&mut parent, q));
         indeterminate[rp] = true;
         indeterminate[rq] = true;
     }
@@ -701,71 +729,321 @@ fn diode_at_temperature(
     Ok((is, n_eff, cjo, vj))
 }
 
+/// Appends a device-internal node and returns its 1-based id.
+fn internal_node(node_names: &mut Vec<String>, name: String) -> usize {
+    node_names.push(name);
+    node_names.len() - 1
+}
+
+/// Level-1 parameters of one MOSFET as its kernel sees them.
+#[derive(Clone, Debug, Default)]
+struct MosCompiled {
+    /// `KP`, `VTO`, `PHI` at the device temperature.
+    kp: f64,
+    vto: f64,
+    gamma: f64,
+    phi: f64,
+    phi_nominal: f64,
+    /// Effective channel length `L - 2 LD`.
+    leff: f64,
+    temperature: f64,
+}
+
+/// Level-1 electrical parameters after the derivations from the process parameters.
+struct Level1Params {
+    kp: f64,
+    vto: f64,
+    gamma: f64,
+    phi: f64,
+    /// Oxide capacitance per area (F/m^2; 0 without `TOX`).
+    cox: f64,
+}
+
+/// Vacuum permittivity of the oxide / silicon permittivities (F/m).
+const EPS0: f64 = 8.854214871e-12;
+/// Elementary charge (C) and intrinsic carrier density of silicon (m^-3).
+const Q_ELECTRON: f64 = 1.602_176_634e-19;
+const NI_SILICON: f64 = 1.45e16;
+
+/// SPICE level-1 derivations at the nominal temperature `tnom` (K): `KP = UO Cox` without `KP` (with `TOX`);
+/// with `NSUB` and `TOX`, `PHI = 2 Vt ln(NSUB / ni)`, `GAMMA = sqrt(2 q eps_si NSUB) / Cox` and
+/// `VTO = Vfb + type (PHI + GAMMA sqrt(PHI))` from the gate work-function difference (`TPG`) and `NSS`, each only
+/// where the card does not give it.
+fn level1_effective(m: &crate::netlist::MosfetModelParams, tnom: f64) -> SimResult<Level1Params> {
+    let pr = &m.process;
+    let cox = pr.tox.map_or(0.0, |tox| 3.9 * EPS0 / tox);
+    let kp = if pr.kp_given || cox == 0.0 {
+        m.kp
+    } else {
+        pr.uo.unwrap_or(600.0) * 1e-4 * cox
+    };
+    let (mut vto, mut gamma, mut phi) = (m.vto, m.gamma, m.phi);
+    if let Some(nsub) = pr.nsub.filter(|_| cox > 0.0) {
+        let n = nsub * 1e6;
+        if !pr.phi_given {
+            phi = 2.0 * crate::temperature::thermal_voltage(tnom) * (n / NI_SILICON).ln();
+            if phi <= 0.0 {
+                return Err(SimError::TopologyError(format!(
+                    "MOSFET model `{}`: NSUB={nsub:e} cm^-3 is below the intrinsic density (PHI={phi:.4})",
+                    m.name
+                )));
+            }
+        }
+        if !pr.gamma_given {
+            gamma = (2.0 * Q_ELECTRON * 11.7 * EPS0 * n).sqrt() / cox;
+        }
+        if !pr.vto_given {
+            let typ = m.mos_type.sign();
+            let tpg = pr.tpg.unwrap_or(1.0);
+            let half_gap = 0.5 * crate::temperature::silicon_gap(tnom);
+            let fermi = typ * 0.5 * phi;
+            // gate - substrate work-function difference: poly gate of the opposite / same type, or aluminium
+            let phi_ms = if tpg == 0.0 {
+                -0.05 - half_gap - fermi
+            } else {
+                -tpg.signum() * typ * half_gap - fermi
+            };
+            let vfb = phi_ms - pr.nss.unwrap_or(0.0) * 1e4 * Q_ELECTRON / cox;
+            vto = vfb + typ * (phi + gamma * phi.sqrt());
+        }
+    }
+    Ok(Level1Params {
+        kp,
+        vto,
+        gamma,
+        phi,
+        cox,
+    })
+}
+
 /// Compiles a parsed [`Netlist`] into a 64-byte aligned [`DeviceSoaBuffer`] and a conflict-free
 /// [`CscGatherTable`] + [`CscMatrix`].
 pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
-    let num_nodes = netlist.num_nodes();
     let mut netlist_expanded = netlist.clone();
+    // device-internal nodes follow the circuit nodes: `node_names[num_nodes(netlist)+1..]`
+    let mut node_names = netlist.node_names.clone();
+    let vt = crate::temperature::thermal_voltage(
+        netlist.temp.unwrap_or(crate::temperature::DEFAULT_TEMP_C) + crate::temperature::KELVIN,
+    );
+    let mut ext = ExtDevices::default();
 
-    // Synthesize MOSFET gate-source / gate-drain / gate-bulk overlap capacitors when Cgso/Cgdo/Cgbo > 0
-    for mos in &netlist.mosfets {
+    // Diodes beyond the ideal Shockley equation become full junctions (behind an internal node for RS)
+    let mut plain_diodes = Vec::with_capacity(netlist.diodes.len());
+    for d in &netlist.diodes {
+        let m = netlist
+            .diode_models
+            .get(&d.model)
+            .cloned()
+            .unwrap_or_default();
+        if !m.is_extended() {
+            plain_diodes.push(d.clone());
+            continue;
+        }
+        let (is_t, n_eff, cjo_t, vj_t) = diode_at_temperature(netlist, d, &m)?;
+        let mut anode = d.n_anode;
+        if m.rs > 0.0 {
+            anode = internal_node(&mut node_names, format!("{}#internal", d.name));
+            netlist_expanded.resistors.push(ResistorInstance {
+                name: format!("{}#rs", d.name),
+                n_pos: d.n_anode,
+                n_neg: anode,
+                resistance: m.rs / d.area,
+            });
+        }
+        let is = is_t * d.area;
+        ext.junctions.push(Junction {
+            name: d.name.clone(),
+            anode,
+            cathode: d.n_cathode,
+            is,
+            n: n_eff,
+            xbv: Junction::fit_breakdown(m.bv, m.ibv.unwrap_or(1e-3) * d.area, is, n_eff, vt),
+            ikf: m.ikf.map_or(f64::INFINITY, |v| v * d.area),
+            isr: m.isr.map_or(0.0, |v| v * d.area),
+            nr: m.nr.unwrap_or(2.0),
+            cj0: cjo_t * d.area,
+            vj: vj_t,
+            m: m.m,
+            fc: m.fc.unwrap_or(0.5),
+            tt: m.tt,
+            cubic_reverse: true,
+            ..Default::default()
+        });
+    }
+    netlist_expanded.diodes = plain_diodes;
+
+    // Level-1 MOSFETs: derived parameters, series resistances, bulk junctions, gate capacitances
+    let mut mos_params: Vec<MosCompiled> = Vec::with_capacity(netlist.mosfets.len());
+    for (mos_idx, mos) in netlist_expanded.mosfets.iter_mut().enumerate() {
+        let m = &netlist
+            .mosfet_models
+            .get(&mos.model)
+            .cloned()
+            .unwrap_or_default();
+        let (t, tnom) = device_temperatures(netlist, &mos.name, mos.temp, mos.dtemp, m.tnom)?;
+        let lv = level1_effective(m, tnom)?;
+        let par = &m.parasitics;
+        let w = mos.w.unwrap_or(m.w_default) * mos.m;
+        let leff = mos.l.unwrap_or(m.l_default) - 2.0 * par.ld.unwrap_or(0.0);
+        if leff <= 0.0 && mos.l.unwrap_or(m.l_default) != 0.0 {
+            return Err(SimError::TopologyError(format!(
+                "MOSFET `{}`: effective channel length L - 2 LD = {leff:e} m is not positive",
+                mos.name
+            )));
+        }
+        let rsh = par.rsh.unwrap_or(0.0);
+        let series = |r: Option<f64>, squares: Option<f64>| {
+            r.filter(|&r| r > 0.0)
+                .or_else(|| squares.map(|n| n * rsh).filter(|&r| r > 0.0))
+        };
+        let (n_drain, n_source) = (mos.n_drain, mos.n_source);
+        if let Some(rd) = series(par.rd, mos.geom.nrd) {
+            mos.n_drain = internal_node(&mut node_names, format!("{}#drain", mos.name));
+            netlist_expanded.resistors.push(ResistorInstance {
+                name: format!("{}#rd", mos.name),
+                n_pos: n_drain,
+                n_neg: mos.n_drain,
+                resistance: rd / mos.m,
+            });
+        }
+        if let Some(rs) = series(par.rs, mos.geom.nrs) {
+            mos.n_source = internal_node(&mut node_names, format!("{}#source", mos.name));
+            netlist_expanded.resistors.push(ResistorInstance {
+                name: format!("{}#rs", mos.name),
+                n_pos: n_source,
+                n_neg: mos.n_source,
+                resistance: rs / mos.m,
+            });
+        }
+        // bulk-drain and bulk-source junctions (the diode points from the bulk for an NMOS)
+        let is_bulk = par.is.unwrap_or(1e-14);
+        let js = par.js.unwrap_or(0.0);
+        let pb = par.pb.unwrap_or(0.8);
+        let t_circuit =
+            netlist.temp.unwrap_or(crate::temperature::DEFAULT_TEMP_C) + crate::temperature::KELVIN;
+        let n_eff = if t == t_circuit { 1.0 } else { t / t_circuit };
+        let pb_t = crate::temperature::junction_potential(pb, t, tnom);
+        let (mj, mjsw) = (par.mj.unwrap_or(0.5), par.mjsw.unwrap_or(0.33));
+        let cap_t = |c: f64, grading: f64| {
+            crate::temperature::junction_capacitance(c, grading, pb, t, tnom)
+        };
+        let nmos = m.mos_type == crate::netlist::MosfetType::Nmos;
+        for (node, other, area, perim, cb) in [
+            (mos.n_drain, mos.n_source, mos.geom.ad, mos.geom.pd, par.cbd),
+            (
+                mos.n_source,
+                mos.n_drain,
+                mos.geom.as_,
+                mos.geom.ps,
+                par.cbs,
+            ),
+        ] {
+            if node == mos.n_bulk {
+                continue;
+            }
+            // with the bulk tied to the other channel terminal the junction lies across drain-source
+            let fold_mos = (other == mos.n_bulk).then_some(mos_idx);
+            let area = area.unwrap_or(0.0);
+            let is0 = if js > 0.0 && area > 0.0 {
+                js * area
+            } else {
+                is_bulk
+            };
+            let is_t =
+                crate::temperature::diode_saturation_current(is0, 1.0, 1.11, 3.0, t, tnom) * mos.m;
+            let cj0 = cb.unwrap_or(par.cj.unwrap_or(0.0) * area) * mos.m;
+            let cjsw = par.cjsw.unwrap_or(0.0) * perim.unwrap_or(0.0) * mos.m;
+            let (anode, cathode) = if nmos {
+                (mos.n_bulk, node)
+            } else {
+                (node, mos.n_bulk)
+            };
+            let fold_sign = if anode == mos.n_drain { 1.0 } else { -1.0 };
+            ext.junctions.push(Junction {
+                name: format!("{}#bulk", mos.name),
+                anode,
+                cathode,
+                is: is_t,
+                n: n_eff,
+                xbv: f64::INFINITY,
+                ikf: f64::INFINITY,
+                nr: 2.0,
+                cj0: cap_t(cj0, mj),
+                vj: pb_t,
+                m: mj,
+                fc: par.fc.unwrap_or(0.5),
+                cjsw: cap_t(cjsw, mjsw),
+                mjsw,
+                fold_mos,
+                fold_sign,
+                ..Default::default()
+            });
+        }
+        let (kp_t, vto_t, phi_t) = crate::temperature::level1_at(
+            lv.kp,
+            lv.vto,
+            lv.phi,
+            lv.gamma,
+            m.mos_type.sign(),
+            t,
+            tnom,
+        );
+        if lv.cox > 0.0 {
+            ext.meyer.push(MeyerCaps {
+                name: mos.name.clone(),
+                drain: mos.n_drain,
+                gate: mos.n_gate,
+                source: mos.n_source,
+                bulk: mos.n_bulk,
+                polarity: m.mos_type.sign(),
+                vto: m.mos_type.sign() * vto_t,
+                gamma: lv.gamma,
+                phi: phi_t,
+                cox: lv.cox * w * leff,
+                ..Default::default()
+            });
+        }
+        mos_params.push(MosCompiled {
+            kp: kp_t,
+            vto: vto_t,
+            gamma: lv.gamma,
+            phi: phi_t,
+            phi_nominal: lv.phi,
+            leff,
+            temperature: t,
+        });
+    }
+
+    // Overlap capacitances: CGSO / CGDO per unit width, CGBO per unit (effective) length
+    for (mos, mc) in netlist_expanded.mosfets.clone().iter().zip(&mos_params) {
         if let Some(m) = netlist.mosfet_models.get(&mos.model) {
             let w = mos.w.unwrap_or(m.w_default) * mos.m;
-            if m.cgso > 0.0 {
-                netlist_expanded
-                    .capacitors
-                    .push(crate::netlist::CapacitorInstance {
-                        name: format!("c_gs_{}", mos.name),
-                        n_pos: mos.n_gate,
-                        n_neg: mos.n_source,
-                        capacitance: m.cgso * w,
-                        ic: None,
-                    });
-            }
-            if m.cgdo > 0.0 {
-                netlist_expanded
-                    .capacitors
-                    .push(crate::netlist::CapacitorInstance {
-                        name: format!("c_gd_{}", mos.name),
-                        n_pos: mos.n_gate,
-                        n_neg: mos.n_drain,
-                        capacitance: m.cgdo * w,
-                        ic: None,
-                    });
-            }
-            if m.cgbo > 0.0 {
-                netlist_expanded
-                    .capacitors
-                    .push(crate::netlist::CapacitorInstance {
-                        name: format!("c_gb_{}", mos.name),
-                        n_pos: mos.n_gate,
-                        n_neg: mos.n_bulk,
-                        capacitance: m.cgbo * w,
-                        ic: None,
-                    });
+            for (tag, other, c) in [
+                ("gs", mos.n_source, m.cgso * w),
+                ("gd", mos.n_drain, m.cgdo * w),
+                ("gb", mos.n_bulk, m.cgbo * mc.leff * mos.m),
+            ] {
+                if c > 0.0 {
+                    netlist_expanded
+                        .capacitors
+                        .push(crate::netlist::CapacitorInstance {
+                            name: format!("c_{tag}_{}", mos.name),
+                            n_pos: mos.n_gate,
+                            n_neg: other,
+                            capacitance: c,
+                            ic: None,
+                        });
+                }
             }
         }
     }
 
-    // Synthesize Diode zero-bias junction capacitors when CJO > 0
-    for d in &netlist.diodes {
-        if let Some(m) = netlist.diode_models.get(&d.model) {
-            if m.cjo > 0.0 {
-                let (_, _, cjo, _) = diode_at_temperature(netlist, d, m)?;
-                netlist_expanded
-                    .capacitors
-                    .push(crate::netlist::CapacitorInstance {
-                        name: format!("c_j_{}", d.name),
-                        n_pos: d.n_anode,
-                        n_neg: d.n_cathode,
-                        capacitance: cjo * d.area,
-                        ic: None,
-                    });
-            }
-        }
-    }
-
-    let mna_dim = num_nodes + netlist_expanded.v_sources.len() + netlist_expanded.inductors.len();
+    let num_nodes = node_names.len() - 1;
+    let mna_dim = num_nodes
+        + netlist_expanded.v_sources.len()
+        + netlist_expanded.inductors.len()
+        + netlist_expanded.vcvs.len()
+        + netlist_expanded.ccvs.len();
     if mna_dim == 0 {
         return Err(SimError::TopologyError(
             "Circuit contains no non-ground nodes or branches".to_string(),
@@ -783,7 +1061,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         ),
         is_transient: false,
         transient_g_scale: 0.0,
-        node_names: netlist.node_names.clone(),
+        node_names,
         ..Default::default()
     };
 
@@ -955,6 +1233,155 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         rhs_stamps.push((br, rhs_idx, 1.0));
     }
 
+    // 5b. Controlled sources. `E` / `H` rows follow the inductor branches: `v(n+) - v(n-) - f = 0`.
+    let vsrc_branch = |name: &str| -> SimResult<usize> {
+        netlist_expanded
+            .v_sources
+            .iter()
+            .position(|v| v.name.eq_ignore_ascii_case(name))
+            .map(|k| num_nodes + k)
+            .ok_or_else(|| {
+                SimError::TopologyError(format!(
+                    "`{name}` is not an independent voltage source of the circuit"
+                ))
+            })
+    };
+    let mut br = num_nodes + netlist_expanded.v_sources.len() + netlist_expanded.inductors.len();
+    let mut push_branch = |soa: &mut DeviceSoaBuffer,
+                           stamps: &mut Vec<(usize, usize, u32, f64, bool)>,
+                           name: &str,
+                           n_pos: usize,
+                           n_neg: usize|
+     -> usize {
+        let one = soa.cond_buf.len() as u32;
+        soa.cond_buf.push(1.0);
+        if n_pos > 0 {
+            stamps.push((n_pos - 1, br, one, 1.0, true));
+            stamps.push((br, n_pos - 1, one, 1.0, true));
+        }
+        if n_neg > 0 {
+            stamps.push((n_neg - 1, br, one, -1.0, true));
+            stamps.push((br, n_neg - 1, one, -1.0, true));
+        }
+        soa.ctl_names.push(name.to_string());
+        soa.ctl_n_pos.push(n_pos);
+        soa.ctl_n_neg.push(n_neg);
+        soa.ctl_branch_idx.push(br);
+        br += 1;
+        br - 1
+    };
+    for e in &netlist_expanded.vcvs {
+        let row = push_branch(&mut soa, &mut matrix_stamps, &e.name, e.n_pos, e.n_neg);
+        let linear = e.coeffs.len() <= 2;
+        let g_idx = soa.cond_buf.len() as u32;
+        soa.cond_buf.push(e.coeffs.get(1).copied().unwrap_or(0.0));
+        let rhs_idx = soa.rhs_buf.len() as u32;
+        soa.rhs_buf.push(e.coeffs.first().copied().unwrap_or(0.0));
+        if e.nc_pos > 0 {
+            matrix_stamps.push((row, e.nc_pos - 1, g_idx, -1.0, linear));
+        }
+        if e.nc_neg > 0 {
+            matrix_stamps.push((row, e.nc_neg - 1, g_idx, 1.0, linear));
+        }
+        rhs_stamps.push((row, rhs_idx, 1.0));
+        if !linear {
+            ext.poly.push(PolySource {
+                name: e.name.clone(),
+                nc_pos: e.nc_pos,
+                nc_neg: e.nc_neg,
+                coeffs: e.coeffs.clone(),
+                cond_buf_idx: g_idx,
+                rhs_buf_idx: rhs_idx,
+            });
+        }
+    }
+    for h in &netlist_expanded.ccvs {
+        let ctrl = vsrc_branch(&h.control)?;
+        let row = push_branch(&mut soa, &mut matrix_stamps, &h.name, h.n_pos, h.n_neg);
+        let r_idx = soa.cond_buf.len() as u32;
+        soa.cond_buf.push(h.r);
+        matrix_stamps.push((row, ctrl, r_idx, -1.0, true));
+    }
+    // `F`: `gain * i(control)` leaves n+ and enters n-
+    for f in &netlist_expanded.cccs {
+        let ctrl = vsrc_branch(&f.control)?;
+        let g_idx = soa.cond_buf.len() as u32;
+        soa.cond_buf.push(f.gain);
+        if f.n_pos > 0 {
+            matrix_stamps.push((f.n_pos - 1, ctrl, g_idx, 1.0, true));
+        }
+        if f.n_neg > 0 {
+            matrix_stamps.push((f.n_neg - 1, ctrl, g_idx, -1.0, true));
+        }
+        soa.ctl_current_nodes.push((f.n_pos, f.n_neg));
+    }
+    // `G ... POLY(1)`: the VCCS stamps with a slope and an offset current
+    for g in &netlist_expanded.poly_vccs {
+        let linear = g.coeffs.len() <= 2;
+        let g_idx = soa.cond_buf.len() as u32;
+        soa.cond_buf.push(g.coeffs.get(1).copied().unwrap_or(0.0));
+        let rhs_idx = soa.rhs_buf.len() as u32;
+        soa.rhs_buf.push(g.coeffs.first().copied().unwrap_or(0.0));
+        for (row, sign) in [(g.n_pos, 1.0), (g.n_neg, -1.0)] {
+            if row == 0 {
+                continue;
+            }
+            if g.nc_pos > 0 {
+                matrix_stamps.push((row - 1, g.nc_pos - 1, g_idx, sign, linear));
+            }
+            if g.nc_neg > 0 {
+                matrix_stamps.push((row - 1, g.nc_neg - 1, g_idx, -sign, linear));
+            }
+            rhs_stamps.push((row - 1, rhs_idx, -sign));
+        }
+        soa.ctl_current_nodes.push((g.n_pos, g.n_neg));
+        if !linear {
+            ext.poly.push(PolySource {
+                name: g.name.clone(),
+                nc_pos: g.nc_pos,
+                nc_neg: g.nc_neg,
+                coeffs: g.coeffs.clone(),
+                cond_buf_idx: g_idx,
+                rhs_buf_idx: rhs_idx,
+            });
+        }
+    }
+    // `K`: `-M a0` between the two branch equations (zero at DC)
+    for k in &netlist_expanded.mutuals {
+        let find = |name: &str| {
+            netlist_expanded
+                .inductors
+                .iter()
+                .position(|l| l.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| {
+                    SimError::TopologyError(format!(
+                        "{}: `{name}` is not an inductor of the circuit",
+                        k.name
+                    ))
+                })
+        };
+        let (a, b) = (find(&k.l1)?, find(&k.l2)?);
+        if a == b {
+            return Err(SimError::TopologyError(format!(
+                "{}: an inductor cannot be coupled to itself",
+                k.name
+            )));
+        }
+        let m = k.k * (soa.ind_inductance[a] * soa.ind_inductance[b]).sqrt();
+        let idx = soa.cond_buf.len() as u32;
+        soa.cond_buf.push(0.0);
+        let (br_a, br_b) = (soa.ind_branch_idx[a], soa.ind_branch_idx[b]);
+        matrix_stamps.push((br_a, br_b, idx, -1.0, false));
+        matrix_stamps.push((br_b, br_a, idx, -1.0, false));
+        ext.mutual.push(Mutual {
+            name: k.name.clone(),
+            ind_a: a,
+            ind_b: b,
+            m,
+            cond_buf_idx: idx,
+        });
+    }
+
     // 6. Independent Current Sources (flowing from n_pos to n_neg inside the source)
     for isrc in &netlist_expanded.i_sources {
         let rhs_idx = soa.rhs_buf.len() as u32;
@@ -1018,7 +1445,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     }
 
     // 8. MOSFETs
-    for mos in &netlist_expanded.mosfets {
+    for (mos, mc) in netlist_expanded.mosfets.iter().zip(&mos_params) {
         let m = netlist_expanded
             .mosfet_models
             .get(&mos.model)
@@ -1031,10 +1458,10 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
                 mos.name
             )));
         }
-        if m.phi <= 0.0 {
+        if mc.phi_nominal <= 0.0 {
             return Err(SimError::TopologyError(format!(
                 "MOSFET model `{}` has non-positive surface potential PHI={}",
-                m.name, m.phi
+                m.name, mc.phi_nominal
             )));
         }
         let gm_idx = soa.cond_buf.len() as u32;
@@ -1057,21 +1484,18 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         soa.mos_bulk.push(mos.n_bulk);
         soa.mos_polarity.push(m.mos_type.sign());
         soa.mos_level.push(m.level);
-        let (t, tnom) = device_temperatures(netlist, &mos.name, mos.temp, mos.dtemp, m.tnom)?;
-        let (kp_t, vto_t, phi_t) =
-            crate::temperature::level1_at(m.kp, m.vto, m.phi, m.gamma, m.mos_type.sign(), t, tnom);
-        if phi_t <= 0.0 {
+        if mc.phi <= 0.0 {
             return Err(SimError::TopologyError(format!(
-                "MOSFET `{}`: surface potential PHI={phi_t:.4} V at {:.2} K is not positive",
-                mos.name, t
+                "MOSFET `{}`: surface potential PHI={:.4} V at {:.2} K is not positive",
+                mos.name, mc.phi, mc.temperature
             )));
         }
-        soa.mos_kp.push(kp_t);
+        soa.mos_kp.push(mc.kp);
         soa.mos_w.push(mos.w.unwrap_or(m.w_default) * mos.m);
-        soa.mos_l.push(mos.l.unwrap_or(m.l_default));
-        soa.mos_vto.push(vto_t);
-        soa.mos_gamma.push(m.gamma);
-        soa.mos_phi.push(phi_t);
+        soa.mos_l.push(mc.leff);
+        soa.mos_vto.push(mc.vto);
+        soa.mos_gamma.push(mc.gamma);
+        soa.mos_phi.push(mc.phi);
         soa.mos_lambda.push(m.lambda);
         soa.mos_vgs.push(0.0);
         soa.mos_vds.push(0.0);
@@ -1163,6 +1587,61 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         }
         if mos.n_source > 0 {
             rhs_stamps.push((mos.n_source - 1, rhs_idx, 1.0));
+        }
+    }
+
+    // 8b. Full junctions and Meyer gate capacitances: a conductance and a Norton current per branch
+    let mut full = Vec::with_capacity(ext.junctions.len());
+    for mut j in std::mem::take(&mut ext.junctions) {
+        j.prepare(soa.temp_vt);
+        if let Some(k) = j.fold_mos {
+            j.cond_buf_idx = soa.mos_gds_buf_idx[k];
+            j.rhs_buf_idx = soa.mos_rhs_buf_idx[k];
+        } else {
+            j.cond_buf_idx = soa.cond_buf.len() as u32;
+            soa.cond_buf.push(0.0);
+            j.rhs_buf_idx = soa.rhs_buf.len() as u32;
+            soa.rhs_buf.push(0.0);
+            add_2pin_conductance(
+                j.anode,
+                j.cathode,
+                j.cond_buf_idx,
+                false,
+                &mut matrix_stamps,
+            );
+            if j.anode > 0 {
+                rhs_stamps.push((j.anode - 1, j.rhs_buf_idx, -1.0));
+            }
+            if j.cathode > 0 {
+                rhs_stamps.push((j.cathode - 1, j.rhs_buf_idx, 1.0));
+            }
+        }
+        if j.is_plain() {
+            ext.bulk.push(&j);
+        } else {
+            full.push(j);
+        }
+    }
+    ext.junctions = full;
+    for mc in &mut ext.meyer {
+        for (k, other) in [mc.source, mc.drain, mc.bulk].into_iter().enumerate() {
+            mc.cond_buf_idx[k] = soa.cond_buf.len() as u32;
+            soa.cond_buf.push(0.0);
+            mc.rhs_buf_idx[k] = soa.rhs_buf.len() as u32;
+            soa.rhs_buf.push(0.0);
+            add_2pin_conductance(
+                mc.gate,
+                other,
+                mc.cond_buf_idx[k],
+                false,
+                &mut matrix_stamps,
+            );
+            if mc.gate > 0 {
+                rhs_stamps.push((mc.gate - 1, mc.rhs_buf_idx[k], -1.0));
+            }
+            if other > 0 {
+                rhs_stamps.push((other - 1, mc.rhs_buf_idx[k], 1.0));
+            }
         }
     }
 
@@ -1277,6 +1756,13 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
             node_has_dc_device[m.n_source - 1] = true;
         }
     }
+    let junction_nodes = ext.junction_terminals().flat_map(|(a, c)| [a, c]);
+    let branch_nodes = (0..soa.ctl_names.len()).flat_map(|i| [soa.ctl_n_pos[i], soa.ctl_n_neg[i]]);
+    for node in junction_nodes.chain(branch_nodes) {
+        if node > 0 {
+            node_has_dc_device[node - 1] = true;
+        }
+    }
     let mut dc_floating_diag_idx = Vec::new();
     for (d, &has_dc) in node_has_dc_device.iter().enumerate() {
         if !has_dc {
@@ -1301,6 +1787,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     soa.static_linear_csc_values = static_linear_csc_values;
     soa.dc_floating_diag_idx = dc_floating_diag_idx;
     soa.linear_dirty = false;
+    soa.ext = ext;
 
     Ok(CompiledTopology { soa, jacobian })
 }

@@ -86,7 +86,7 @@ const R_SER: f64 = 10.0;
 /// Shunt resistance of the legacy ladder (ohm).
 const R_SH_LEGACY: f64 = 10_000.0;
 /// Step policy as stated in the report (what each tool writes, and what the comparison does afterwards).
-const STEP_POLICY: &str = "RustSpice: fixed step equal to the `.tran` tstep (first step backward Euler, then trapezoid; no local-error control, no breakpoints), one rawfile row per step. ngspice: default adaptive step control with maximum step tstep; `ngspice -b -r` writes ITS OWN internal time points (not a uniform grid), so the row counts of the two tools differ (see the transient tables). The comparison interpolates RustSpice, ngspice and the reference linearly onto the nominal `k * tstep` grid afterwards; the ngspice error reported therefore depends on that comparison grid.";
+const STEP_POLICY: &str = "RustSpice: adaptive step control (local truncation error from divided differences, trapezoid with backward-Euler / BDF-2 restarts at waveform breakpoints, maximum step `min(tstep, tmax, (tstop - tstart) / 50)`), one rawfile row per nominal `k * tstep` point. ngspice: default adaptive step control with maximum step tstep; `ngspice -b -r` writes ITS OWN internal time points (not a uniform grid), so the row counts of the two tools differ (see the transient tables). The comparison interpolates RustSpice, ngspice and the reference linearly onto the nominal `k * tstep` grid afterwards; the ngspice error reported therefore depends on that comparison grid.";
 /// Resident-memory cap per child (KiB).
 const CHILD_RSS_CAP_KIB: u64 = 3 * 1024 * 1024;
 /// Corner supply start / step of the legacy batch benchmark.
@@ -4746,7 +4746,7 @@ pub fn render_markdown(r: &Report) -> String {
     let _ = writeln!(s, "- The host is shared and noisy; `noisy` marks series whose spread exceeds 20 % of the median. Re-run on a quiet machine before quoting absolute times.");
     let _ = writeln!(s, "- Hybrid or frequency-scaling CPUs (performance and efficiency cores, turbo) make short processes bimodal: the same ngspice launch can take 30 ms or 60 ms depending on the core it lands on. Series are interleaved and repeated so both sides see the same mix, but the medians still carry that spread; `--pin-cpu N` pins the sequential children to one core for steadier numbers (parallel workloads are never pinned).");
     let _ = writeln!(s, "- The like-for-like analysis ratio pairs ngspice `Total analysis time` with RustSpice `compile_us + analysis_us`: the closest comparable pair the two tools report, not an exact phase match (their phase boundaries differ; ngspice's figure includes its matrix setup, RustSpice's compile its symbolic analysis / JIT). The end-to-end ratio is the only one that needs no assumption about phase boundaries.");
-    let _ = writeln!(s, "- RustSpice's transient is fixed-step (no local-error control, no breakpoints); ngspice's default transient is adaptive. Their errors at the same nominal step are therefore not the same quantity, which is why the accuracy columns are measured against a converged reference and the b2 step ladder shows time versus accuracy.");
+    let _ = writeln!(s, "- Both transients are adaptive, but with different error controls and output points (RustSpice writes the nominal `k * tstep` rows, ngspice its own internal time points). Their errors at the same nominal step are therefore not the same quantity, which is why the accuracy columns are measured against a converged reference and the b2 step ladder shows time versus accuracy.");
     let _ = writeln!(s, "- The b5 / b6 ngspice multi-launch variants write their decks before timing (deck generation is not timed); the process launches themselves are.");
     s
 }
@@ -5151,7 +5151,7 @@ pub fn run(args: LegacyArgs) -> i32 {
             ngspice_asis_tolerances: "defaults (reltol 1e-3, vntol 1e-6 V, abstol 1e-12 A), SPARSE and KLU".to_string(),
             ngspice_reference_op_dc: format!("`.options {TIGHT_OPTIONS}` (SPARSE)"),
             ngspice_reference_tran: format!("`.options {TRAN_REF_OPTIONS}` and tmax = tstep / 20 (SPARSE)"),
-            rustspice_tolerances: "fixed internally (the audit found `.options` ignored: reltol 1e-6, vntol 1e-10 V, abstol 1e-12 A)".to_string(),
+            rustspice_tolerances: "fixed internally (`.options reltol/vntol/abstol` warn and are ignored): Newton reltol 1e-6, vntol 1e-10 V, abstol 1e-12 A; transient LTE reltol 1e-3, vntol 1e-6 V, abstol 1e-12 A, trtol 7".to_string(),
             step_policy: STEP_POLICY.to_string(),
             reps_requested: ctx.reps,
             timing_enabled: ctx.timing,

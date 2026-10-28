@@ -88,8 +88,8 @@ def check_deck(rep, stem, targets, args, tmp):
         orc.solve()
         ng_v = ngspice_op(text, tmp, tag="base", ngspice=args.ngspice)[f"v({node})"]
         d_v = abs(float(orc.v(node)) - ng_v)
-        # RustSpice (and so the oracle) has no bulk-junction leakage; ngspice does (pA at a reverse-biased body diode):
-        # up to ~1e-8 V on high-impedance MOS nodes. It limits how closely ngspice's FD can confirm a sensitivity.
+        # any difference between the oracle's and ngspice's operating point (e.g. a junction law that differs far in
+        # reverse bias) limits how closely ngspice's FD can confirm a sensitivity
         model_gap = d_v / max(1.0, abs(ng_v))
         if d_v > 1e-7:
             rep.add(f"{stem}/{node}/oracle_vs_ngspice_op", "FAIL", f"oracle V={float(orc.v(node))!r} ngspice V={ng_v!r}")

@@ -587,14 +587,20 @@ pub(crate) fn audit_model_params(
     line: usize,
     sink: &mut DiagSink,
 ) {
-    let honored: &[&str] = if mtype == "D" {
-        &["is", "n", "cjo", "eg", "xti", "tnom"]
-    } else {
-        &[
+    let honored: &[&str] = match mtype {
+        "D" => &[
+            "is", "n", "rs", "cjo", "cj0", "vj", "m", "tt", "eg", "xti", "tnom", "bv", "ibv",
+            "ikf", "isr", "nr", "fc",
+        ],
+        "R" => &["rsh", "narrow", "short", "defw"],
+        "C" => &["cj", "cjsw", "narrow", "short", "defw"],
+        _ => &[
             "level", "vto", "vt0", "kp", "gamma", "phi", "lambda", "cgso", "cgdo", "cgbo", "w",
-            "l", "tnom",
-        ]
+            "l", "tnom", "tox", "uo", "u0", "nsub", "nss", "tpg", "ld", "rd", "rs", "rsh", "is",
+            "js", "cbd", "cbs", "cj", "cjsw", "mj", "mjsw", "pb", "fc",
+        ],
     };
+    let is_mos = mtype == "NMOS" || mtype == "PMOS";
     let mut unmodelled: Vec<String> = Vec::new();
     for p in pairs {
         if p.key.is_empty() {
@@ -631,32 +637,17 @@ pub(crate) fn audit_model_params(
             sink,
         );
         let up = p.key.to_ascii_uppercase();
-        if k == "uo" && mtype != "D" && pairs.iter().any(|q| q.key == "kp") {
-            // KP wins over UO in the reader: UO is simply not used
-            unmodelled.push(up);
-        } else if k == "uo" && mtype != "D" {
+        if k == "tpg" && is_mos && p.val.is_some_and(|v| v != 0.0 && v.abs() != 1.0) {
             sink.warn(
                 line,
-                code::IGNORED_MODEL_PARAM,
-                format!("model `{model}`: UO={} is read as the transconductance KP (A/V^2); SPICE derives KP = UO*Cox from TOX", p.raw),
+                code::MALFORMED_INPUT,
+                format!(
+                    "model `{model}`: TPG={} is not +1, -1 or 0; its sign is used",
+                    p.raw
+                ),
             );
-        } else if k == "cjo" && mtype == "D" {
-            if p.val.unwrap_or(0.0) > 0.0 {
-                sink.warn(
-                    line,
-                    code::IGNORED_MODEL_PARAM,
-                    format!("model `{model}`: CJO={} is applied as a constant capacitance; its bias dependence (VJ, M, FC) is not modelled", p.raw),
-                );
-            }
-        } else if k == "cgbo" && mtype != "D" {
-            if p.val.unwrap_or(0.0) > 0.0 {
-                sink.warn(
-                    line,
-                    code::IGNORED_MODEL_PARAM,
-                    format!("model `{model}`: CGBO={} is multiplied by the channel width W (SPICE scales it with the channel length)", p.raw),
-                );
-            }
-        } else if k == "level" && mtype != "D" {
+        }
+        if k == "level" && is_mos {
             if p.val.unwrap_or(1.0) >= 2.0 {
                 sink.fatal(
                     line,
@@ -666,7 +657,7 @@ pub(crate) fn audit_model_params(
                     ),
                 );
             }
-        } else if k == "phi" && mtype != "D" {
+        } else if k == "phi" && is_mos {
             if p.val.unwrap_or(1.0) <= 0.0 {
                 sink.warn(
                     line,
@@ -703,16 +694,22 @@ pub(crate) enum Elem {
     G,
     D,
     M,
+    /// Controlled sources `E`, `F`, `H` and the coupling `K`: no instance parameters.
+    Controlled,
 }
 
 impl Elem {
     fn honored(self) -> &'static [&'static str] {
         match self {
-            Elem::R => &["r", "m", "tc1", "tc2", "temp", "dtemp"],
-            Elem::C | Elem::L => &["m", "tc1", "tc2", "temp", "dtemp"],
+            Elem::R => &["r", "w", "l", "m", "tc1", "tc2", "temp", "dtemp"],
+            Elem::C => &["w", "l", "m", "tc1", "tc2", "temp", "dtemp"],
+            Elem::L => &["m", "tc1", "tc2", "temp", "dtemp"],
             Elem::G => &["m"],
             Elem::D => &["area", "m", "temp", "dtemp"],
-            Elem::M => &["w", "l", "m", "temp", "dtemp"],
+            Elem::M => &[
+                "w", "l", "m", "temp", "dtemp", "ad", "as", "pd", "ps", "nrd", "nrs",
+            ],
+            Elem::Controlled => &[],
         }
     }
 
@@ -725,19 +722,8 @@ impl Elem {
             Elem::D => &[
                 "off", "pj", "sens", "thermal", "lm", "lp", "wm", "wp", "xm", "xp",
             ],
-            Elem::M => &[
-                "ad",
-                "as",
-                "pd",
-                "ps",
-                "nrd",
-                "nrs",
-                "off",
-                "geo",
-                "delvto",
-                "sens",
-                "dtemp_off",
-            ],
+            Elem::M => &["off", "geo", "delvto", "sens", "dtemp_off"],
+            Elem::Controlled => &[],
         }
     }
 }
@@ -895,7 +881,7 @@ mod tests {
             ("R3 out 0 1x\n.op", "misparse"),
             (".model QX NPN(BF=100)\n.op", "ignored-directive"),
             (
-                ".model DM D(RS=10 BV=5)\nD9 out 0 DM\n.op",
+                ".model DM D(KF=1e-12 AF=1)\nD9 out 0 DM\n.op",
                 "ignored-model-param",
             ),
             ("V9 a 0 PULSE(0 1 0 1n 1n 1u\n.op", "malformed-input"),

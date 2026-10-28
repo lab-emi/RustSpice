@@ -2,7 +2,7 @@
 
 Dependencies: python3 stdlib, numpy, mpmath.  ngspice is used ONLY as a black-box executable (AGENTS.md Rule 1):
 its observable output (rawfile) is read, nothing else.  The independent oracle is a 50-digit mpmath Newton solve of
-the textbook MNA equations of the deck (R, V, I, diode with SPICE3 reverse-bias branch, level-1 MOSFET) with
+the textbook MNA equations of the deck (R, V, I, diode with SPICE3 reverse-bias branch, level-1 MOSFET with its bulk junctions) with
 implicit-function-theorem parameter sensitivities; it shares no code and no numerical method with RustSpice or ngspice.
 """
 from __future__ import annotations
@@ -349,9 +349,12 @@ class Oracle:
                 add(e.nodes[0], cur)
                 add(e.nodes[1], -cur)
             elif e.kind == "m":
-                add_d, add_s, cur = self.mos(e, V)
+                cur, j_bd, j_bs = self.mos(e, V)
                 add(e.nodes[0], cur)
                 add(e.nodes[2], -cur)
+                add(e.nodes[3], j_bd + j_bs)
+                add(e.nodes[0], -j_bd)
+                add(e.nodes[2], -j_bs)
             else:
                 raise ValueError(e.kind)
         return F
@@ -386,8 +389,17 @@ class Oracle:
             cd = beta * vds * (vov - vds / 2) * (1 + lam * vds)
         else:
             cd = beta / 2 * vov**2 * (1 + lam * vds)
-        cur = pol * mode * cd + self.gmin * (vd - vs)
-        return None, None, cur
+        # bulk-drain and bulk-source junctions (anode = bulk for NMOS): ideal diodes of saturation current IS with
+        # gmin in parallel; level-1 MOS has no other gmin (none between drain and source)
+        if any(p in mdl for p in ("js", "cbd", "cbs", "cj", "cjsw")) or any(p in e.params for p in ("ad", "as", "pd", "ps")):
+            raise ValueError("oracle: junction area/capacitance parameters are outside the modelled domain")
+        isat = self.val(e, "is", "1e-14")
+
+        def junction(v):
+            return pol * (isat * (mp.exp(v / self.vt) - 1) + self.gmin * v)
+
+        cur = pol * mode * cd
+        return cur, junction(pol * (vb - vd)), junction(pol * (vb - vs))
 
     # ------------------------------------------------------------------------------------------ solve / derivs
     def jac(self, x, f0=None):

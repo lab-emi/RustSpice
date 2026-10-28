@@ -67,14 +67,14 @@ R2 a b
 .end
 ";
 
-const CLAMP_STACK: &str = "Two stacked 5 V sources feeding R + VCVS
+const CLAMP_STACK: &str = "Two stacked 5 V sources feeding R + behavioural source
 * bench.id: clamp_rail
 * bench.group: capability
 * bench.known_gap: clamp-rail
 * bench.gap.note: Newton clamps node voltages to the DC source range
 V1 a 0 DC 5
 V2 b a DC 5
-E1 c 0 b 0 1.0
+B1 c 0 V=v(b)
 R1 c 0 1k
 .op
 .end

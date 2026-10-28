@@ -4,27 +4,7 @@
 use pulp::Arch;
 use rustspice_core::{ComputeBackend, CscMatrix, DeviceSoaBuffer, SimResult};
 
-/// SPICE3f5 / `ngspice` PN-junction logarithmic voltage step limiter (`pnjlim`).
-///
-/// Prevents exponential numerical overflow in Newton-Raphson iterations when a PN junction
-/// transitions abruptly into forward bias.
-#[inline]
-pub fn pnjlim(vnew: f64, vold: f64, vt: f64, vcrit: f64) -> f64 {
-    if vnew > vcrit && (vnew - vold).abs() > (vt + vt) {
-        if vold > 0.0 {
-            let arg = 1.0 + (vnew - vold) / vt;
-            if arg > 0.0 {
-                vold + vt * arg.ln()
-            } else {
-                vcrit
-            }
-        } else {
-            vt * (vnew / vt).ln()
-        }
-    } else {
-        vnew
-    }
-}
+pub use rustspice_core::ext::{diode_exp, pnjlim, DIODE_EXP_ARG_MAX};
 
 /// SPICE3f5 / `ngspice` MOSFET gate-to-channel voltage step limiter (`fetlim`).
 #[inline]
@@ -73,33 +53,6 @@ pub fn fetlim(vnew: f64, vold: f64, vto: f64) -> f64 {
         } else {
             vtemp
         }
-    }
-}
-
-/// Maximum Shockley diode exponent argument $V_D / (N V_T)$ evaluated with exact `f64::exp()`.
-///
-/// IEEE-754 `f64::exp(x)` overflows at $x \approx 709.78$. Choosing `600.0` ($\exp(600) \approx
-/// 3.773\times 10^{260}$) keeps every diode up to $\sim 15.5\text{ V}$ forward bias (at $N=1$,
-/// $T=300.15\text{ K}$) on the exact exponential curve while leaving $\sim 50$ decades of headroom
-/// below `f64::MAX` for $I_S \exp(\cdot)$ and $g_d = (I_S / N V_T) \exp(\cdot)$ during intermediate
-/// Newton steps. Above `DIODE_EXP_ARG_MAX`, a $C^1$ linear continuation $\exp(x_{\max})(1 + x - x_{\max})$
-/// prevents `NaN`/`Inf` in the Jacobian; the nonlinear solver rejects any converged point that
-/// still lies in the linear-continuation region (`SimError::DeviceRangeExceeded`).
-pub const DIODE_EXP_ARG_MAX: f64 = 600.0;
-const DIODE_EXP_SLOPE_MAX: f64 = 3.773_020_300_929_939_7e260; // 600.0_f64.exp()
-
-#[inline]
-pub fn diode_exp(arg: f64) -> (f64, f64, bool) {
-    if arg <= DIODE_EXP_ARG_MAX {
-        let e = arg.exp();
-        (e, e, false)
-    } else {
-        let excess = arg - DIODE_EXP_ARG_MAX;
-        (
-            DIODE_EXP_SLOPE_MAX * (1.0 + excess),
-            DIODE_EXP_SLOPE_MAX,
-            true,
-        )
     }
 }
 
@@ -214,8 +167,6 @@ impl CpuSimdBackend {
             return;
         }
         let vt = state.temp_vt;
-        let gmin = state.gmin;
-
         self.arch.dispatch(|| {
             for i in 0..n_mos {
                 let vd = DeviceSoaBuffer::node_voltage(voltages, state.mos_drain[i]);
@@ -327,9 +278,9 @@ impl CpuSimdBackend {
                     }
                 };
 
-                // Signed drain-to-source current in global node orientation (with minimum Gmin bleed conductance)
-                let gds = gds + gmin;
-                let id_oriented = pol * mode * cdrain + gmin * (vd - vs);
+                // Signed drain-to-source current in global node orientation. The `gmin` shunts of a MOSFET sit across
+                // its bulk junctions (`ext`), not between drain and source.
+                let id_oriented = pol * mode * cdrain;
                 state.mos_id[i] = id_oriented;
                 state.mos_gm[i] = gm;
                 state.mos_gds[i] = gds;
@@ -403,7 +354,8 @@ impl ComputeBackend for CpuSimdBackend {
         // Evaluate nonlinear semiconductor devices via SIMD
         let diodes_limited = self.eval_diodes(state, voltages);
         self.eval_mosfets(state, voltages);
-        state.limiter_active = diodes_limited;
+        let ext_limited = state.evaluate_ext_devices(voltages);
+        state.limiter_active = diodes_limited || ext_limited;
 
         Ok(())
     }

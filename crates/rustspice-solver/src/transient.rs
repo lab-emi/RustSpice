@@ -561,7 +561,9 @@ impl TransientSolver {
         }
 
         let is_linear = topo.soa.is_linear();
-        let has_reactive = !topo.soa.cap_names.is_empty() || !topo.soa.ind_names.is_empty();
+        let has_reactive = !topo.soa.cap_names.is_empty()
+            || !topo.soa.ind_names.is_empty()
+            || topo.soa.ext.stores_charge();
         // a linear circuit keeps its steps on the `hmax / 2^k` ladder
         let quantized = is_linear && has_reactive;
         let land_rows = !is_linear || !has_reactive;
@@ -946,6 +948,8 @@ impl TransientSolver {
             topo.soa.ind_i_prev2[i] = il0;
             topo.soa.ind_v_prev[i] = vp - vn;
         }
+        let vt = topo.soa.temp_vt;
+        topo.soa.ext.start_charges(&x, vt);
         Ok((x, op.iterations))
     }
 
@@ -994,6 +998,12 @@ impl TransientSolver {
             topo.soa.ind_req[i] = r;
             topo.soa.ind_veq[i] = -r * *i0;
         }
+        for k in 0..topo.soa.ext.mutual.len() {
+            let mu = &topo.soa.ext.mutual[k];
+            let (a, b, m) = (mu.ind_a, mu.ind_b, mu.m);
+            topo.soa.ind_veq[a] -= m / h0 * il0[b];
+            topo.soa.ind_veq[b] -= m / h0 * il0[a];
+        }
 
         let mut x = vec![0.0_f64; dim];
         for (&node, &v) in initial_conditions {
@@ -1001,6 +1011,10 @@ impl TransientSolver {
                 x[node - 1] = v;
             }
         }
+        // junction and gate charges hold the voltages of the initial conditions like stiff capacitors
+        let vt = topo.soa.temp_vt;
+        topo.soa.ext.start_charges(&x, vt);
+        topo.soa.ext.set_charge_history(-1.0 / h0, 0.0, false);
         NonlinearSolver::sync_device_voltages(topo, &x);
         linear_solver.invalidate_factorization();
         let (iters, _) = nonlinear_solver
@@ -1027,6 +1041,7 @@ impl TransientSolver {
             topo.soa.ind_i_prev2[i] = il;
             topo.soa.ind_v_prev[i] = vp - vn;
         }
+        topo.soa.ext.start_charges(&x, vt);
         topo.soa.is_transient = false;
         Ok((x, iters))
     }
@@ -1190,6 +1205,10 @@ impl TransientSolver {
                 self.ind_i_prev3[i],
             );
         }
+        // junction and gate charges: the voltage floor carried to charge by the branch capacitance
+        soa.ext.for_each_charge(x, soa.temp_vt, |q, q0, q1, q2, c| {
+            check(o.vntol * c, q, q0, q1, q2)
+        });
         r
     }
 
@@ -1242,6 +1261,13 @@ impl TransientSolver {
             soa.ind_req[i] = l * a0;
             soa.ind_veq[i] = hist;
         }
+        // coupled inductors: the flux of each winding includes `M` times the current of the other
+        for mu in &soa.ext.mutual {
+            let (a, b, m) = (mu.ind_a, mu.ind_b, mu.m);
+            soa.ind_veq[a] += m * (a1 * soa.ind_i_prev[b] + a2 * soa.ind_i_prev2[b]);
+            soa.ind_veq[b] += m * (a1 * soa.ind_i_prev[a] + a2 * soa.ind_i_prev2[a]);
+        }
+        soa.ext.set_charge_history(a1, a2, uses_rate);
         a0
     }
 
@@ -1266,6 +1292,8 @@ impl TransientSolver {
             topo.soa.ind_i_prev[i] = il;
             topo.soa.ind_v_prev[i] = vl;
         }
+        let (a0, vt) = (topo.soa.transient_g_scale, topo.soa.temp_vt);
+        topo.soa.ext.commit_charges(x, a0, vt);
     }
 }
 

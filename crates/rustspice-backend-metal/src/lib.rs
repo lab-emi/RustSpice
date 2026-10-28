@@ -304,9 +304,10 @@ impl MetalUmaBackend {
                 }
             };
 
-            let id_oriented = pol * mode * cdrain.to_f64() + state.gmin * (vd - vs);
+            // the `gmin` shunts sit across the bulk junctions (`ext`), as on the CPU
+            let id_oriented = pol * mode * cdrain.to_f64();
             let gm_f = gm.to_f64();
-            let gds_f = gds.to_f64() + state.gmin;
+            let gds_f = gds.to_f64();
             let gmbs_f = gmbs.to_f64();
 
             state.mos_id[i] = id_oriented;
@@ -375,7 +376,9 @@ impl ComputeBackend for MetalUmaBackend {
 
         let diodes_limited = self.eval_diodes_df64(state, voltages);
         self.eval_mosfets_df64(state, voltages);
-        state.limiter_active = diodes_limited;
+        // couplings, polynomial sources, full junctions and Meyer capacitances: host `f64`, as on the CPU
+        let ext_limited = state.evaluate_ext_devices(voltages);
+        state.limiter_active = diodes_limited || ext_limited;
         Ok(())
     }
 

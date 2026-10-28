@@ -423,6 +423,24 @@ pub struct DiodeModelParams {
     /// Temperature at which the parameters were measured, °C (default: `.options tnom`, else 27).
     #[serde(default)]
     pub tnom: Option<f64>,
+    /// Reverse breakdown voltage `BV` (V; `None`: no breakdown).
+    #[serde(default)]
+    pub bv: Option<f64>,
+    /// Current at `-BV`, `IBV` (A, default 1e-3).
+    #[serde(default)]
+    pub ibv: Option<f64>,
+    /// High-injection knee current `IKF` (A; `None`: no knee).
+    #[serde(default)]
+    pub ikf: Option<f64>,
+    /// Recombination saturation current `ISR` (A; `None`: no recombination current).
+    #[serde(default)]
+    pub isr: Option<f64>,
+    /// Recombination emission coefficient `NR` (default 2).
+    #[serde(default)]
+    pub nr: Option<f64>,
+    /// Forward-bias depletion capacitance coefficient `FC` (default 0.5).
+    #[serde(default)]
+    pub fc: Option<f64>,
 }
 
 impl Default for DiodeModelParams {
@@ -439,8 +457,83 @@ impl Default for DiodeModelParams {
             eg: None,
             xti: None,
             tnom: None,
+            bv: None,
+            ibv: None,
+            ikf: None,
+            isr: None,
+            nr: None,
+            fc: None,
         }
     }
+}
+
+impl DiodeModelParams {
+    /// Whether the model needs more than the ideal Shockley equation (series resistance, breakdown, high
+    /// injection, recombination current or charge storage).
+    pub fn is_extended(&self) -> bool {
+        self.rs > 0.0
+            || self.bv.is_some()
+            || self.ikf.is_some()
+            || self.isr.is_some()
+            || self.cjo > 0.0
+            || self.tt > 0.0
+    }
+}
+
+/// Process parameters from which a level-1 MOSFET model derives the electrical ones its card does not give.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MosProcess {
+    /// Oxide thickness `TOX` (m): gives `Cox`, the Meyer gate capacitances and, with `UO`, `KP`.
+    pub tox: Option<f64>,
+    /// Surface mobility `UO` / `U0` (cm^2/Vs, default 600).
+    pub uo: Option<f64>,
+    /// Substrate doping `NSUB` (cm^-3): with `TOX`, gives `PHI`, `GAMMA` and `VTO`.
+    pub nsub: Option<f64>,
+    /// Surface state density `NSS` (cm^-2).
+    pub nss: Option<f64>,
+    /// Gate type `TPG` (+1 opposite to the substrate, -1 same, 0 aluminium; default 1).
+    pub tpg: Option<f64>,
+    pub kp_given: bool,
+    pub vto_given: bool,
+    pub gamma_given: bool,
+    pub phi_given: bool,
+}
+
+/// Level-1 MOSFET parasitics: lateral diffusion, series resistances and bulk junctions.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MosParasitics {
+    /// Lateral diffusion `LD` (m): the effective channel length is `L - 2 LD`.
+    pub ld: Option<f64>,
+    /// Drain / source series resistances `RD`, `RS` (ohm) and the sheet resistance `RSH` (ohm/sq).
+    pub rd: Option<f64>,
+    pub rs: Option<f64>,
+    pub rsh: Option<f64>,
+    /// Bulk junction saturation current `IS` (A, default 1e-14) and its density `JS` (A/m^2).
+    pub is: Option<f64>,
+    pub js: Option<f64>,
+    /// Zero-bias bulk-drain / bulk-source capacitances `CBD`, `CBS` (F).
+    pub cbd: Option<f64>,
+    pub cbs: Option<f64>,
+    /// Bottom (`CJ`, F/m^2) and sidewall (`CJSW`, F/m) junction capacitance densities and their grading.
+    pub cj: Option<f64>,
+    pub cjsw: Option<f64>,
+    pub mj: Option<f64>,
+    pub mjsw: Option<f64>,
+    /// Junction potential `PB` (V, default 0.8) and forward-bias capacitance coefficient `FC` (default 0.5).
+    pub pb: Option<f64>,
+    pub fc: Option<f64>,
+}
+
+/// Drain / source geometry of one MOSFET instance (areas `AD`/`AS` in m^2, perimeters `PD`/`PS` in m, and the
+/// squares `NRD`/`NRS` of `RSH`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MosGeometry {
+    pub ad: Option<f64>,
+    pub as_: Option<f64>,
+    pub pd: Option<f64>,
+    pub ps: Option<f64>,
+    pub nrd: Option<f64>,
+    pub nrs: Option<f64>,
 }
 
 /// Polarity of a MOSFET device (`NMOS` or `PMOS`).
@@ -479,6 +572,10 @@ pub struct MosfetModelParams {
     /// Temperature at which the parameters were measured, °C (default: `.options tnom`, else 27).
     #[serde(default)]
     pub tnom: Option<f64>,
+    #[serde(default)]
+    pub process: MosProcess,
+    #[serde(default)]
+    pub parasitics: MosParasitics,
 }
 
 impl Default for MosfetModelParams {
@@ -498,6 +595,8 @@ impl Default for MosfetModelParams {
             w_default: 100e-6,
             l_default: 100e-6,
             tnom: None,
+            process: MosProcess::default(),
+            parasitics: MosParasitics::default(),
         }
     }
 }
@@ -536,6 +635,82 @@ pub struct VccsInstance {
     pub nc_pos: usize,
     pub nc_neg: usize,
     pub gm: f64,
+}
+
+/// `.model <name> R(...)`: semiconductor resistor, `R = RSH (L - 2 SHORT) / (W - 2 NARROW)`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResistorModel {
+    pub rsh: f64,
+    pub narrow: f64,
+    pub short: f64,
+    /// Width of an instance without `w=` (m).
+    pub defw: f64,
+}
+
+/// `.model <name> C(...)`: semiconductor capacitor, `C = CJ W' L' + 2 CJSW (W' + L')` with `W' = W - NARROW`,
+/// `L' = L - SHORT`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CapacitorModel {
+    pub cj: f64,
+    pub cjsw: f64,
+    pub narrow: f64,
+    pub short: f64,
+    /// Width of an instance without `w=` (m).
+    pub defw: f64,
+}
+
+/// `E` voltage-controlled voltage source: `v(n_pos, n_neg) = sum_k coeffs[k] * v(nc_pos, nc_neg)^k` (`[0, gain]`
+/// for the linear card, the `POLY(1)` coefficients otherwise). Its branch current is an MNA unknown.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VcvsInstance {
+    pub name: String,
+    pub n_pos: usize,
+    pub n_neg: usize,
+    pub nc_pos: usize,
+    pub nc_neg: usize,
+    pub coeffs: Vec<f64>,
+}
+
+/// `G ... POLY(1)`: the current `sum_k coeffs[k] * v(nc_pos, nc_neg)^k` flows from `n_pos` through the source
+/// to `n_neg`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PolyVccsInstance {
+    pub name: String,
+    pub n_pos: usize,
+    pub n_neg: usize,
+    pub nc_pos: usize,
+    pub nc_neg: usize,
+    pub coeffs: Vec<f64>,
+}
+
+/// `H` current-controlled voltage source: `v(n_pos, n_neg) = r * i(control)`, `control` naming an independent
+/// voltage source. Its branch current is an MNA unknown.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CcvsInstance {
+    pub name: String,
+    pub n_pos: usize,
+    pub n_neg: usize,
+    pub control: String,
+    pub r: f64,
+}
+
+/// `F` current-controlled current source: `gain * i(control)` flows from `n_pos` through the source to `n_neg`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CccsInstance {
+    pub name: String,
+    pub n_pos: usize,
+    pub n_neg: usize,
+    pub control: String,
+    pub gain: f64,
+}
+
+/// `K` coupling of two inductors: mutual inductance `k * sqrt(L1 L2)`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MutualInstance {
+    pub name: String,
+    pub l1: String,
+    pub l2: String,
+    pub k: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -588,6 +763,8 @@ pub struct MosfetInstance {
     /// Offset `dtemp=` from the circuit temperature, K.
     #[serde(default)]
     pub dtemp: Option<f64>,
+    #[serde(default)]
+    pub geom: MosGeometry,
 }
 
 fn unit_multiplier() -> f64 {
@@ -642,6 +819,10 @@ pub struct Netlist {
     pub params: FxHashMap<String, f64>,
     pub diode_models: FxHashMap<String, DiodeModelParams>,
     pub mosfet_models: FxHashMap<String, MosfetModelParams>,
+    #[serde(default)]
+    pub resistor_models: FxHashMap<String, ResistorModel>,
+    #[serde(default)]
+    pub capacitor_models: FxHashMap<String, CapacitorModel>,
     pub resistors: Vec<ResistorInstance>,
     pub capacitors: Vec<CapacitorInstance>,
     pub inductors: Vec<InductorInstance>,
@@ -650,6 +831,16 @@ pub struct Netlist {
     pub i_sources: Vec<CurrentSourceInstance>,
     pub diodes: Vec<DiodeInstance>,
     pub mosfets: Vec<MosfetInstance>,
+    #[serde(default)]
+    pub vcvs: Vec<VcvsInstance>,
+    #[serde(default)]
+    pub ccvs: Vec<CcvsInstance>,
+    #[serde(default)]
+    pub cccs: Vec<CccsInstance>,
+    #[serde(default)]
+    pub poly_vccs: Vec<PolyVccsInstance>,
+    #[serde(default)]
+    pub mutuals: Vec<MutualInstance>,
     pub initial_conditions: FxHashMap<usize, f64>,
     /// `.nodeset` initial guesses of the operating point (node -> volts).
     #[serde(default)]
@@ -714,10 +905,15 @@ impl Netlist {
         self.node_names.len().saturating_sub(1)
     }
 
-    /// Returns the total MNA matrix dimension (`num_nodes + v_sources.len() + inductors.len()`).
+    /// Returns the MNA dimension before device-internal nodes: `num_nodes` plus one branch current per
+    /// independent voltage source, inductor, `E` and `H` source.
     #[inline]
     pub fn mna_dimension(&self) -> usize {
-        self.num_nodes() + self.v_sources.len() + self.inductors.len()
+        self.num_nodes()
+            + self.v_sources.len()
+            + self.inductors.len()
+            + self.vcvs.len()
+            + self.ccvs.len()
     }
 
     /// Fails if a source amplitude / frequency or an analysis bound is infinite or NaN.
@@ -963,6 +1159,7 @@ impl CircuitBuilder {
             m: 1.0,
             temp: None,
             dtemp: None,
+            geom: MosGeometry::default(),
         });
         self
     }
@@ -1072,6 +1269,8 @@ struct ParseState {
     /// R / C / L temperature coefficients, applied once the circuit temperature is known (a `.temp` card may
     /// follow the element).
     pending_tc: Vec<PendingTc>,
+    /// Element references checked once every card is read: (line, element, referenced name, `V` or `L`).
+    controls: Vec<(usize, String, String, u8)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -1487,6 +1686,31 @@ fn parse_source(
         parse_statement(line_no, &line, &mut netlist, &mut sink, &mut state)?;
     }
 
+    for (line, element, target, kind) in std::mem::take(&mut state.controls) {
+        let found = if kind == b'V' {
+            netlist
+                .v_sources
+                .iter()
+                .any(|v| v.name.eq_ignore_ascii_case(&target))
+        } else {
+            netlist
+                .inductors
+                .iter()
+                .any(|l| l.name.eq_ignore_ascii_case(&target))
+        };
+        if !found {
+            let what = if kind == b'V' {
+                "independent voltage source"
+            } else {
+                "inductor"
+            };
+            sink.fatal(
+                line,
+                format!("{element}: `{target}` is not an {what} of the circuit"),
+            );
+        }
+    }
+
     let circuit_temp = netlist.temp.unwrap_or(crate::temperature::DEFAULT_TEMP_C);
     let tnom = netlist.tnom.unwrap_or(crate::temperature::DEFAULT_TEMP_C);
     for p in std::mem::take(&mut state.pending_tc) {
@@ -1862,16 +2086,26 @@ fn rewrite_subckt_line(line: &str, prefix: &str, port_map: &FxHashMap<String, St
         return String::new();
     }
     let lead = toks[0].as_bytes()[0].to_ascii_uppercase();
-    let num_nodes = match lead {
-        b'R' | b'C' | b'L' | b'V' | b'I' | b'D' => 2,
-        b'G' | b'E' | b'M' => 4,
+    // positions of the nodes and of the names of other elements (prefixed like the element names)
+    let poly = matches!(lead, b'G' | b'E')
+        .then(|| poly_dimension(&toks))
+        .flatten();
+    let (nodes, refs): (&[usize], &[usize]) = match (lead, poly) {
+        (_, Some((_, 4))) => (&[1, 2, 4, 5], &[]),
+        (_, Some(_)) => (&[1, 2, 5, 6], &[]),
+        (b'R' | b'C' | b'L' | b'V' | b'I' | b'D', _) => (&[1, 2], &[]),
+        (b'G' | b'E' | b'M', _) => (&[1, 2, 3, 4], &[]),
+        (b'F' | b'H', _) => (&[1, 2], &[3]),
+        (b'K', _) => (&[], &[1, 2]),
         _ => return line.to_string(),
     };
     let mut parts = Vec::with_capacity(toks.len());
     parts.push(format!("{}_{}", toks[0], prefix));
     for (idx, tok) in toks.iter().enumerate().skip(1) {
-        if idx <= num_nodes {
+        if nodes.contains(&idx) {
             parts.push(map_subckt_node(tok, prefix, port_map));
+        } else if refs.contains(&idx) {
+            parts.push(format!("{tok}_{prefix}"));
         } else {
             parts.push((*tok).to_string());
         }
@@ -1973,7 +2207,7 @@ fn parse_model_card(
         if let Some(&v) = kv.get("rs") {
             model.rs = v;
         }
-        if let Some(&v) = kv.get("cjo") {
+        if let Some(&v) = kv.get("cjo").or_else(|| kv.get("cj0")) {
             model.cjo = v;
         }
         if let Some(&v) = kv.get("vj") {
@@ -1988,6 +2222,13 @@ fn parse_model_card(
         model.eg = kv.get("eg").copied();
         model.xti = kv.get("xti").copied();
         model.tnom = kv.get("tnom").copied();
+        // BV = 0 means no breakdown (SPICE); IKF = 0 no knee; ISR = 0 no recombination current
+        model.bv = kv.get("bv").copied().filter(|&v| v > 0.0);
+        model.ibv = kv.get("ibv").copied();
+        model.ikf = kv.get("ikf").copied().filter(|&v| v > 0.0);
+        model.isr = kv.get("isr").copied().filter(|&v| v > 0.0);
+        model.nr = kv.get("nr").copied();
+        model.fc = kv.get("fc").copied();
         audit_model_params(toks[1], "D", &pairs, &netlist.params, line_no, sink);
         netlist.diode_models.insert(mname, model);
     } else if mtype == "NMOS" || mtype == "PMOS" {
@@ -2004,18 +2245,41 @@ fn parse_model_card(
         if let Some(&v) = kv.get("level") {
             model.level = v as u32;
         }
-        if let Some(&v) = kv.get("vto").or_else(|| kv.get("vt0")) {
-            model.vto = v;
-        }
-        if let Some(&v) = kv.get("kp").or_else(|| kv.get("uo")) {
-            model.kp = v;
-        }
-        if let Some(&v) = kv.get("gamma") {
-            model.gamma = v;
-        }
-        if let Some(&v) = kv.get("phi") {
-            model.phi = v;
-        }
+        let vto = kv.get("vto").or_else(|| kv.get("vt0")).copied();
+        let kp = kv.get("kp").copied();
+        let gamma = kv.get("gamma").copied();
+        let phi = kv.get("phi").copied();
+        model.vto = vto.unwrap_or(model.vto);
+        model.kp = kp.unwrap_or(model.kp);
+        model.gamma = gamma.unwrap_or(model.gamma);
+        model.phi = phi.unwrap_or(model.phi);
+        model.process = MosProcess {
+            tox: kv.get("tox").copied().filter(|&v| v > 0.0),
+            uo: kv.get("uo").or_else(|| kv.get("u0")).copied(),
+            nsub: kv.get("nsub").copied().filter(|&v| v > 0.0),
+            nss: kv.get("nss").copied(),
+            tpg: kv.get("tpg").copied(),
+            kp_given: kp.is_some(),
+            vto_given: vto.is_some(),
+            gamma_given: gamma.is_some(),
+            phi_given: phi.is_some(),
+        };
+        model.parasitics = MosParasitics {
+            ld: kv.get("ld").copied(),
+            rd: kv.get("rd").copied(),
+            rs: kv.get("rs").copied(),
+            rsh: kv.get("rsh").copied(),
+            is: kv.get("is").copied(),
+            js: kv.get("js").copied(),
+            cbd: kv.get("cbd").copied(),
+            cbs: kv.get("cbs").copied(),
+            cj: kv.get("cj").copied(),
+            cjsw: kv.get("cjsw").copied(),
+            mj: kv.get("mj").copied(),
+            mjsw: kv.get("mjsw").copied(),
+            pb: kv.get("pb").copied(),
+            fc: kv.get("fc").copied(),
+        };
         if let Some(&v) = kv.get("lambda") {
             model.lambda = v;
         }
@@ -2037,9 +2301,34 @@ fn parse_model_card(
         model.tnom = kv.get("tnom").copied();
         audit_model_params(toks[1], &mtype, &pairs, &netlist.params, line_no, sink);
         netlist.mosfet_models.insert(mname, model);
+    } else if mtype == "R" || mtype == "RES" {
+        let g = |k: &str, d: f64| kv.get(k).copied().unwrap_or(d);
+        audit_model_params(toks[1], "R", &pairs, &netlist.params, line_no, sink);
+        netlist.resistor_models.insert(
+            mname,
+            ResistorModel {
+                rsh: g("rsh", 0.0),
+                narrow: g("narrow", 0.0),
+                short: g("short", 0.0),
+                defw: g("defw", 10e-6),
+            },
+        );
+    } else if mtype == "C" {
+        let g = |k: &str, d: f64| kv.get(k).copied().unwrap_or(d);
+        audit_model_params(toks[1], "C", &pairs, &netlist.params, line_no, sink);
+        netlist.capacitor_models.insert(
+            mname,
+            CapacitorModel {
+                cj: g("cj", 0.0),
+                cjsw: g("cjsw", 0.0),
+                narrow: g("narrow", 0.0),
+                short: g("short", 0.0),
+                defw: g("defw", 10e-6),
+            },
+        );
     } else if [
-        "NPN", "PNP", "NJF", "PJF", "NMF", "PMF", "SW", "CSW", "R", "C", "L", "URC", "LTRA",
-        "VDMOS", "TXL", "CPL",
+        "NPN", "PNP", "NJF", "PJF", "NMF", "PMF", "SW", "CSW", "L", "URC", "LTRA", "VDMOS", "TXL",
+        "CPL",
     ]
     .contains(&mtype.as_str())
     {
@@ -2047,7 +2336,7 @@ fn parse_model_card(
             line_no,
             code::IGNORED_DIRECTIVE,
             format!(
-                "`.model {} {}`: model type `{}` is not supported (only D, NMOS and PMOS are); the card was ignored",
+                "`.model {} {}`: model type `{}` is not supported (only D, NMOS, PMOS, R and C are); the card was ignored",
                 toks[1], toks[2], toks[2]
             ),
         );
@@ -2631,14 +2920,24 @@ fn parse_statement(
                 .strip_prefix("r=")
                 .or_else(|| toks[3].strip_prefix("R="))
                 .unwrap_or(toks[3]);
-            let resistance = parse_spice_number(val_str, &netlist.params).ok_or_else(|| {
-                SimError::ParseError {
-                    line: line_no,
-                    message: format!("Invalid resistance value `{}`", toks[3]),
-                }
-            })?;
+            let model = netlist
+                .resistor_models
+                .get(&toks[3].to_ascii_lowercase())
+                .cloned();
+            let resistance = if let Some(rm) = model {
+                let kv = extract_key_values(&toks[4..].join(" "), &netlist.params);
+                semiconductor_resistance(first, &rm, &kv, line_no)?
+            } else {
+                let r = parse_spice_number(val_str, &netlist.params).ok_or_else(|| {
+                    SimError::ParseError {
+                        line: line_no,
+                        message: format!("Invalid resistance value `{}`", toks[3]),
+                    }
+                })?;
+                audit_number(val_str, &netlist.params, first, "value", line_no, sink);
+                r
+            };
             audit_nodes(first, &toks[1..3], line_no, sink);
-            audit_number(val_str, &netlist.params, first, "value", line_no, sink);
             if resistance == 0.0 {
                 sink.warn(
                     line_no,
@@ -2667,14 +2966,24 @@ fn parse_statement(
             }
             let n_pos = netlist.intern_node(toks[1]);
             let n_neg = netlist.intern_node(toks[2]);
-            let capacitance = parse_spice_number(toks[3], &netlist.params).ok_or_else(|| {
-                SimError::ParseError {
-                    line: line_no,
-                    message: format!("Invalid capacitance value `{}`", toks[3]),
-                }
-            })?;
+            let model = netlist
+                .capacitor_models
+                .get(&toks[3].to_ascii_lowercase())
+                .cloned();
+            let capacitance = if let Some(cm) = model {
+                let kv = extract_key_values(&toks[4..].join(" "), &netlist.params);
+                semiconductor_capacitance(first, &cm, &kv, line_no)?
+            } else {
+                let c = parse_spice_number(toks[3], &netlist.params).ok_or_else(|| {
+                    SimError::ParseError {
+                        line: line_no,
+                        message: format!("Invalid capacitance value `{}`", toks[3]),
+                    }
+                })?;
+                audit_number(toks[3], &netlist.params, first, "value", line_no, sink);
+                c
+            };
             audit_nodes(first, &toks[1..3], line_no, sink);
-            audit_number(toks[3], &netlist.params, first, "value", line_no, sink);
             audit_element_tail(Elem::C, first, &toks[4..], &netlist.params, line_no, sink);
             let kv = extract_key_values(line, &netlist.params);
             let capacitance = capacitance * instance_multiplier(&kv, first, line_no, sink);
@@ -2725,6 +3034,202 @@ fn parse_statement(
                 n_neg,
                 inductance,
                 ic: kv.get("ic").copied(),
+            });
+        }
+        b'G' | b'E' if poly_dimension(&toks).is_some() => {
+            let (dim, at) = poly_dimension(&toks).unwrap_or((0, 0));
+            if dim != 1 {
+                return Err(SimError::ParseError {
+                    line: line_no,
+                    message: format!("{first}: POLY({dim}) is not supported (only POLY(1) is)"),
+                });
+            }
+            if toks.len() < at + 3 {
+                return Err(SimError::ParseError {
+                    line: line_no,
+                    message: format!(
+                        "{first}: POLY(1) needs <nc+> <nc-> and at least one coefficient"
+                    ),
+                });
+            }
+            let n_pos = netlist.intern_node(toks[1]);
+            let n_neg = netlist.intern_node(toks[2]);
+            let nc_pos = netlist.intern_node(toks[at]);
+            let nc_neg = netlist.intern_node(toks[at + 1]);
+            audit_nodes(
+                first,
+                &[toks[1], toks[2], toks[at], toks[at + 1]],
+                line_no,
+                sink,
+            );
+            let mut coeffs = Vec::with_capacity(toks.len() - at - 2);
+            for raw in &toks[at + 2..] {
+                let c = parse_spice_number(raw, &netlist.params).ok_or_else(|| {
+                    SimError::ParseError {
+                        line: line_no,
+                        message: format!("{first}: POLY coefficient `{raw}` is not a number"),
+                    }
+                })?;
+                audit_number(raw, &netlist.params, first, "coefficient", line_no, sink);
+                coeffs.push(c);
+            }
+            // SPICE: a one-dimensional polynomial with a single coefficient is the linear term
+            if coeffs.len() == 1 {
+                coeffs.insert(0, 0.0);
+            }
+            let name = first.to_string();
+            if lead == b'E' {
+                netlist.vcvs.push(VcvsInstance {
+                    name,
+                    n_pos,
+                    n_neg,
+                    nc_pos,
+                    nc_neg,
+                    coeffs,
+                });
+            } else {
+                netlist.poly_vccs.push(PolyVccsInstance {
+                    name,
+                    n_pos,
+                    n_neg,
+                    nc_pos,
+                    nc_neg,
+                    coeffs,
+                });
+            }
+        }
+        b'E' => {
+            if toks.len() < 6 {
+                return Err(SimError::ParseError {
+                    line: line_no,
+                    message: "VCVS requires `E<name> <n+> <n-> <nc+> <nc-> <gain>`".to_string(),
+                });
+            }
+            let n_pos = netlist.intern_node(toks[1]);
+            let n_neg = netlist.intern_node(toks[2]);
+            let nc_pos = netlist.intern_node(toks[3]);
+            let nc_neg = netlist.intern_node(toks[4]);
+            let gain = parse_spice_number(toks[5], &netlist.params).ok_or_else(|| {
+                SimError::ParseError {
+                    line: line_no,
+                    message: format!("{first}: invalid VCVS gain `{}`", toks[5]),
+                }
+            })?;
+            audit_nodes(first, &toks[1..5], line_no, sink);
+            audit_number(toks[5], &netlist.params, first, "gain", line_no, sink);
+            audit_element_tail(
+                Elem::Controlled,
+                first,
+                &toks[6..],
+                &netlist.params,
+                line_no,
+                sink,
+            );
+            netlist.vcvs.push(VcvsInstance {
+                name: first.to_string(),
+                n_pos,
+                n_neg,
+                nc_pos,
+                nc_neg,
+                coeffs: vec![0.0, gain],
+            });
+        }
+        b'F' | b'H' => {
+            let what = if lead == b'F' { "CCCS" } else { "CCVS" };
+            if toks.len() < 5 {
+                return Err(SimError::ParseError {
+                    line: line_no,
+                    message: format!(
+                        "{what} requires `{}<name> <n+> <n-> <vsource> <value>`",
+                        lead as char
+                    ),
+                });
+            }
+            if toks[3].to_ascii_lowercase().starts_with("poly") {
+                return Err(SimError::ParseError {
+                    line: line_no,
+                    message: format!("{first}: POLY current-controlled sources are not supported"),
+                });
+            }
+            let n_pos = netlist.intern_node(toks[1]);
+            let n_neg = netlist.intern_node(toks[2]);
+            let value = parse_spice_number(toks[4], &netlist.params).ok_or_else(|| {
+                SimError::ParseError {
+                    line: line_no,
+                    message: format!("{first}: invalid {what} value `{}`", toks[4]),
+                }
+            })?;
+            audit_nodes(first, &toks[1..3], line_no, sink);
+            audit_number(toks[4], &netlist.params, first, "value", line_no, sink);
+            audit_element_tail(
+                Elem::Controlled,
+                first,
+                &toks[5..],
+                &netlist.params,
+                line_no,
+                sink,
+            );
+            state
+                .controls
+                .push((line_no, first.to_string(), toks[3].to_string(), b'V'));
+            let (name, control) = (first.to_string(), toks[3].to_string());
+            if lead == b'F' {
+                netlist.cccs.push(CccsInstance {
+                    name,
+                    n_pos,
+                    n_neg,
+                    control,
+                    gain: value,
+                });
+            } else {
+                netlist.ccvs.push(CcvsInstance {
+                    name,
+                    n_pos,
+                    n_neg,
+                    control,
+                    r: value,
+                });
+            }
+        }
+        b'K' => {
+            if toks.len() < 4 {
+                return Err(SimError::ParseError {
+                    line: line_no,
+                    message: "Coupling requires `K<name> <L1> <L2> <k>`".to_string(),
+                });
+            }
+            let k = parse_spice_number(toks[3], &netlist.params).ok_or_else(|| {
+                SimError::ParseError {
+                    line: line_no,
+                    message: format!("{first}: invalid coupling coefficient `{}`", toks[3]),
+                }
+            })?;
+            if !(k.abs() > 0.0 && k.abs() <= 1.0) {
+                return Err(SimError::ParseError {
+                    line: line_no,
+                    message: format!("{first}: coupling coefficient {k} is not in (0, 1]"),
+                });
+            }
+            audit_number(toks[3], &netlist.params, first, "k", line_no, sink);
+            audit_element_tail(
+                Elem::Controlled,
+                first,
+                &toks[4..],
+                &netlist.params,
+                line_no,
+                sink,
+            );
+            state
+                .controls
+                .push((line_no, first.to_string(), toks[1].to_string(), b'L'));
+            state
+                .controls
+                .push((line_no, first.to_string(), toks[2].to_string(), b'L'));
+            netlist.mutuals.push(MutualInstance {
+                name: first.to_string(),
+                l1: toks[1].to_string(),
+                l2: toks[2].to_string(),
+                k,
             });
         }
         b'G' => {
@@ -2925,6 +3430,14 @@ fn parse_statement(
                 m: mult,
                 temp: kv.get("temp").copied(),
                 dtemp: kv.get("dtemp").copied(),
+                geom: MosGeometry {
+                    ad: kv.get("ad").copied(),
+                    as_: kv.get("as").copied(),
+                    pd: kv.get("pd").copied(),
+                    ps: kv.get("ps").copied(),
+                    nrd: kv.get("nrd").copied(),
+                    nrs: kv.get("nrs").copied(),
+                },
             });
         }
         _ => {
@@ -2935,6 +3448,76 @@ fn parse_statement(
         }
     }
     Ok(())
+}
+
+/// `POLY(<n>)` of a controlled-source card (`POLY(1)`, `poly (1)`, ...): the dimension and the index of the token
+/// after it.
+fn poly_dimension(toks: &[&str]) -> Option<(usize, usize)> {
+    let t = toks.get(3)?.to_ascii_lowercase();
+    let rest = t.strip_prefix("poly")?;
+    let (arg, next) = if rest.is_empty() {
+        (toks.get(4)?.to_string(), 5)
+    } else {
+        (rest.to_string(), 4)
+    };
+    let dim = arg
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim()
+        .parse()
+        .ok()?;
+    Some((dim, next))
+}
+
+/// Resistance of a semiconductor resistor `R<name> n+ n- <model> l=<L> [w=<W>]`.
+fn semiconductor_resistance(
+    name: &str,
+    m: &ResistorModel,
+    kv: &FxHashMap<String, f64>,
+    line: usize,
+) -> SimResult<f64> {
+    let err = |message: String| SimError::ParseError { line, message };
+    let l = kv.get("l").copied().ok_or_else(|| {
+        err(format!(
+            "{name}: a semiconductor resistor needs its length `l=`"
+        ))
+    })?;
+    if m.rsh <= 0.0 {
+        return Err(err(format!(
+            "{name}: the resistor model has no positive sheet resistance RSH"
+        )));
+    }
+    let w = kv.get("w").copied().unwrap_or(m.defw) - 2.0 * m.narrow;
+    let l = l - 2.0 * m.short;
+    if w <= 0.0 || l <= 0.0 {
+        return Err(err(format!(
+            "{name}: effective width {w:e} m / length {l:e} m is not positive"
+        )));
+    }
+    Ok(m.rsh * l / w)
+}
+
+/// Capacitance of a semiconductor capacitor `C<name> n+ n- <model> l=<L> [w=<W>]`.
+fn semiconductor_capacitance(
+    name: &str,
+    m: &CapacitorModel,
+    kv: &FxHashMap<String, f64>,
+    line: usize,
+) -> SimResult<f64> {
+    let err = |message: String| SimError::ParseError { line, message };
+    let l = kv.get("l").copied().ok_or_else(|| {
+        err(format!(
+            "{name}: a semiconductor capacitor needs its length `l=`"
+        ))
+    })?;
+    let w = kv.get("w").copied().unwrap_or(m.defw) - m.narrow;
+    let l = l - m.short;
+    if w <= 0.0 || l <= 0.0 {
+        return Err(err(format!(
+            "{name}: effective width {w:e} m / length {l:e} m is not positive"
+        )));
+    }
+    Ok(m.cj * w * l + 2.0 * m.cjsw * (w + l))
 }
 
 /// The instance multiplier `m=` (number of parallel copies, default 1). A non-positive value is refused with a
