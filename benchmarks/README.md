@@ -205,14 +205,14 @@ Fastest: `perf_scal_rc_mesh_tran_g14` 19.3x, `fam_rc_mesh_tran_14` 18.6x, `perf_
 
 | benchmark | RustSpice | ngspice | speedup | max error (RustSpice / ngspice default) |
 |---|---|---|---|---|
-| b1 DC ladder | 16.40 ms | 40.20 ms | **2.45x** | 1.91e-13 / 1.93e-13 V |
-| b2 RC line tran | 39.90 ms | 163 ms | **4.08x** (unequal accuracy) | 5.40e-2 / 1.65e-3 of swing, against tight ngspice (no oracle) |
-| b3 diode sweep | 4.72 ms | 7.80 ms | **1.65x** | 5.89e-11 / 5.44e-5 V |
-| b4 CMOS chain tran | 30.93 ms | 52.81 ms | **1.71x** | 4.14e-1 / 3.86e-1 of swing, against tight ngspice (no oracle) |
-| b5 sensitivity | 1.20 ms | 11.44 ms | **9.55x** | 9.33e-15 / 1.00e-6 |
-| b6 batch | 3.65 ms | 3.71 ms | **1.02x** (min **1.12x**) | 2.47e-11 / 1.63e-5 V |
+| b1 DC ladder | 22.96 ms | 56.66 ms | **2.47x** | 1.91e-13 / 1.93e-13 V |
+| b2 RC line tran | 57.36 ms | 235 ms | **4.10x** (unequal accuracy) | 5.40e-2 / 1.65e-3 of swing, against tight ngspice (no oracle) |
+| b3 diode sweep | 7.06 ms | 11.83 ms | **1.68x** | 5.89e-11 / 5.44e-5 V |
+| b4 CMOS chain tran | 45.64 ms | 78.09 ms | **1.71x** | 4.14e-1 / 3.86e-1 of swing, against tight ngspice (no oracle) |
+| b5 sensitivity | 2.26 ms | 28.85 ms | **12.8x** | 9.33e-15 / 1.00e-6 |
+| b6 batch | 5.77 ms | 8.93 ms | **1.55x** (min **1.71x**) | 2.47e-11 / 1.63e-5 V |
 
-Compare the previously published 5.3x / 7.6x / 3.0x / 2.6x / 6285x / 321x: those came from the harness errors listed under "What the suite found about its own first version". b2's speedup is at unequal accuracy (RustSpice's fixed 10 ps step is 32.8x less accurate than ngspice at default settings, improved from 58x by the 16-substep BDF-1 startup in `RC-time-grid`); b4's large pointwise error is edge timing: the 50 % crossing of the 100th stage is 9.6 ps (RustSpice) and 9.1 ps (ngspice at default settings) late against the tight reference at the 5 ps step, so the two are equally off and the speedup compares two equally inexact results; b5 compares one adjoint solve with the best ngspice alternative (`.sens`, which computes 24 sensitivities per requested gradient; **348x** against the finite-difference loop that delivers only the 200 requested ones); b6 is a parallel workload (32 threads) against ngspice's 1-thread `.dc` sweep (**1.02x** with `rustspice-batch`, **2.62x** with `rustspice-dc-sweep`, **5.87x** against `ngspice-control-loop-sparse`, and **9.34x** against `ngspice-par-launches`).
+Compare the previously published 5.3x / 7.6x / 3.0x / 2.6x / 6285x / 321x: those came from the harness errors listed under "What the suite found about its own first version". b2's speedup is at unequal accuracy (RustSpice's fixed 10 ps step is 32.8x less accurate than ngspice at default settings, improved from 58x by the 16-substep BDF-1 startup in `RC-time-grid`); b4's large pointwise error is edge timing: the 50 % crossing of the 100th stage is 9.6 ps (RustSpice) and 9.1 ps (ngspice at default settings) late against the tight reference at the 5 ps step, so the two are equally off and the speedup compares two equally inexact results; b5 compares one adjoint solve with the best ngspice alternative (`.sens`, which computes 24 sensitivities per requested gradient; **391x** against the finite-difference loop that delivers only the 200 requested ones); b6 is a parallel workload (32 threads) against ngspice's 1-thread `.dc` sweep (**1.55x** with `rustspice-batch`, **2.44x** with `rustspice-dc-sweep`, **9.47x** against `ngspice-control-loop-sparse`, and **21.4x** against `ngspice-par-launches`).
 
 **Seeded fuzzers and mutants** (`--scale small --fuzz-count 100 --seed 2`, 400 random decks and 200 mutants):
 - **Random decks (`fuzz_`)**: **400 / 400 pass**, 0 known gap, 0 failing (all `symbolic-lu-blowup`, `no-op-homotopy-tran`, `abstol-absolute-residual`, and `clamp-rail` failures on random linear, RC, diode, and MOS decks are closed).
