@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://lab-emi.github.io/RustEDA/modules/rustspice/">Documentation</a> ·
   <a href="https://github.com/lab-emi/RustEDA">RustEDA</a> ·
-  <a href="#benchmarks">Benchmarks</a> ·
+  <a href="https://lab-emi.github.io/RustEDA/benchmarks/">Benchmarks</a> ·
   <a href="LICENSE">Apache-2.0</a>
 </p>
 
@@ -22,33 +22,15 @@ Part of **[RustEDA](https://github.com/lab-emi/RustEDA)**, infrastructure for ch
 
 ## Benchmarks
 
-**Host: 13th Gen Intel(R) Core(TM) i9-13900HX (32 hardware threads) · Reference: `ngspice-47` (SPARSE 1.3 by default, KLU with `.options klu`; every row compares with the faster of the two).**
+RustEDA publishes one benchmark: a matched Ibex RTL-to-GDS comparison with LibreLane on IHP SG13G2 / EZ130. See the [RustEDA benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/). RustSpice publishes no performance comparison; the [benchmark method](docs/benchmark_report.md) describes how to measure one against `ngspice` on your own host.
 
-Both tools run as subprocesses (`rustspice run --raw`, `ngspice -b -r`) with the rawfile on tmpfs, the single-core benchmarks pinned to one idle core: one warm-up, nine interleaved repetitions, end to end (process start-up, parsing, topology compilation, symbolic factorisation, device stamping, the solve and the output). Accuracy is the maximum error over the full waveform or sweep against an independent oracle where one exists, otherwise against a tightly converged ngspice (`reltol=1e-9`, `vntol=1e-12`, `abstol=1e-15`).
+## Differential verification against ngspice
 
-<!-- rustspice-ngspice-benchmark:start -->
+`rustspice bench-suite` runs 951 cases against ngspice-47 as a black-box executable: **857 pass**, **16 documented RustSpice gaps**, **77 informational**, **1 unverified** and **0 failing**, plus 400/400 random fuzz decks passing and 200/200 hostile mutants handled without a panic. See [`benchmarks/README.md`](benchmarks/README.md).
 
-| Benchmark | Circuit scale | `ngspice-47`<br>end to end ↓ | `RustSpice`<br>end to end ↓ | Speedup ↑ | Max error: `RustSpice` / `ngspice` default ↓ |
-| :--- | :--- | ---: | ---: | ---: | ---: |
-| **1. Resistor ladder (DC OP)** | 10,000 resistors, 5,002 MNA unknowns (DC operating point) | 25.98 ms | 11.13 ms | **2.33×** | `1.91e-13` / `1.93e-13` V |
-| **2. RC line (transient)** | 4,000 R/C elements, `.tran 10p 5n` (500 steps) | 114 ms | 31.45 ms | **3.62×** (at **8.2× lower error** than ngspice default) | `2.01e-4` / `1.65e-3` of swing (vs tight ngspice) |
-| **3. Diode array (DC sweep)** | 64 diodes + 128 resistors, 201-point DC sweep | 6.54 ms | 3.35 ms | **1.95×** | `5.89e-11` / `5.44e-5` V |
-| **4. CMOS inverter chain (transient)** | 200 MOSFETs + 100 capacitors, `.tran 5p 2n` (400 steps) | 35.60 ms | 32.12 ms | **1.11×** (at **5.2× lower error** than ngspice default) | `7.40e-2` / `3.86e-1` of swing (vs tight ngspice) |
-| **5. Sensitivity (adjoint vs. ngspice `.sens`)** | 200 resistor gradients (one adjoint solve) | 12.55 ms | 1.30 ms | **9.66×** vs `.sens` (**306×** vs FD loop) | `9.33e-15` / `1.00e-6` (normalised) |
-| **6. PVT batch (128 corners)** | 128 PVT corners of a 32-diode nonlinear net (Rayon) | 4.30 ms | 3.46 ms | **1.24×** (parallel workload; **2.57×** via `.dc` sweep) | `2.47e-11` / `1.63e-5` V |
+**Batched DC operating points on an NVIDIA GPU** (`rustspice bench-batch`, [method](docs/gpu_batch_report.md)): one circuit at many corners, one corner per CUDA thread in FP64, with a Newton / LU kernel written in Rust and compiled to PTX by [cuda-oxide](https://github.com/NVIDIA/cuda-rust); the same source, built for the CPU with rayon, is the reference it is tested against. The kernel covers plain diodes and level-1 MOSFETs with their bulk junctions. A corner the kernel does not converge is re-solved by the CPU solver. In the last recorded run, the GPU agreed with the CPU build to `5.6e-16` (bit for bit on the MOSFET circuits) and with the CPU solver to `1.8e-9` (relative, inside its Newton tolerance), and no corner needed a CPU re-solve. Creating the CUDA context and JIT-compiling the PTX is a one-time cost per process, so small batches can run faster on the CPU. MOS levels above 1, diodes with breakdown, series resistance or a knee current, polynomial sources, `.nodeset` and linear circuits still run on the CPU.
 
-<!-- rustspice-ngspice-benchmark:end -->
-
-Speedup = `ngspice-47` / `RustSpice`, median of 9 interleaved repetitions against the faster of ngspice's SPARSE 1.3 and KLU solvers; both tools run as subprocesses with rawfile output on tmpfs, the single-core benchmarks pinned to one idle core (the parallel batch, benchmark 6, is not pinned). The previously published 5.3×, 7.6×, 3.0×, 2.6×, 6,285× and 321× came from a harness with known defects (1 ms-quantised solver times, a cold process compared with a warm in-process call, hard-coded zero errors, single runs multiplied by 128 or 400, a transient compared at t = 0 only) and are withdrawn; the report lists each one with its replacement.
-
-- Benchmark 2: restarting fast slope corners with one short backward-Euler step, and a jump detector that no longer takes a steep continuous edge for a jump, reduced RustSpice's waveform error by 23× (from `4.61e-3` to `2.01e-4` of swing, 8.2× below ngspice default's `1.65e-3`); on the step ladder `b2s_rcline_500` (`tstep` 10 ps..1 ps) RustSpice is both 3.4×–4.2× faster and 2.7×–15× more accurate than ngspice default. Its 50 % crossing shift read from the rawfile is `2.00 ps` against ngspice's `0.36 ps` only because RustSpice writes the 10 ps `k * tstep` rows and ngspice its own internal points: the exact reference read at the same 10 ps rows is off by `2.01 ps`, and with the reference read at each tool's rows the shift is `0.07 ps` for RustSpice against `0.35 ps` for ngspice. `rustspice run --internal-points` also writes the accepted steps between the rows (0.14 ps in the rawfile).
-- Benchmark 4: a quadratic predictor, contraction-rate Newton acceptance and a jagged Jacobian gather cut RustSpice's analysis time from 47 ms to 26 ms (with the level-1 bulk junctions and Meyer capacitances added since); it is now faster than ngspice end to end at 5.2× lower waveform error (100th-stage 50% crossing shift `1.60 ps` vs ngspice default's `9.10 ps`).
-- Benchmark 5 compares one adjoint solve with the best ngspice alternative (`.sens`, which computes 24 sensitivities per requested gradient); against the finite-difference loop that delivers only the 200 requested gradients the ratio is 306×.
-- Benchmark 6 is a parallel workload (32 threads vs ngspice's 1-thread `.dc` sweep; via `rustspice-dc-sweep` the 1-thread ratio is 2.57×, against `ngspice-control-loop-sparse` 6.80×, and against `ngspice-par-launches` 12.2×).
-
-Beyond these six circuits, `rustspice bench-suite` runs 951 cases against ngspice-47 (**857 pass**, **16 documented RustSpice gaps**, **77 informational**, **1 unverified** without timing, **0 failing**, plus 400/400 random fuzz decks passing and 200/200 hostile mutants handled without a panic) and times 110 of them: RustSpice is faster end to end in **101 of 110**, with a geometric-mean speedup of **2.51×**. All 2-D and 3-D linear meshes, shuffled ladders and LC ladders are faster than ngspice; 9 nonlinear 2-D MOS/SRAM/diode array and mesh cases remain 1.03×–24.4× slower than ngspice-KLU. See [`benchmarks/README.md`](benchmarks/README.md).
-
-**Batched DC operating points on an NVIDIA GPU** (`rustspice bench-batch`, [report](docs/gpu_batch_report.md)): one circuit at many corners, one corner per CUDA thread in FP64, with a Newton / LU kernel written in Rust and compiled to PTX by [cuda-oxide](https://github.com/NVIDIA/cuda-rust); the same source, built for the CPU with rayon, is the reference it is tested against. The kernel covers plain diodes and level-1 MOSFETs with their bulk junctions. On the RTX 4090 Laptop GPU of this host, 1,048,576 supply corners of the 32-diode cascade of benchmark 6 take 535 ms against 1,575 ms for the kernel's CPU build on 32 threads (**2.95×**), and 131,072 supply and input corners of the 100-stage CMOS inverter chain of benchmark 4 (200 MOSFETs) take 300 ms against 617 ms (**2.05×**; the CPU solver's batch API takes 1,547 ms). Monte Carlo corners gain 1.49× (97 parameters, diode cascade) and 1.35× (402 parameters, inverter chain, where mapping the parameter names on the host takes most of the time) at 16,384 corners. The GPU agrees with the CPU build to `5.6e-16` (bit for bit on the MOSFET circuits) and with the CPU solver to `1.8e-9` (relative, inside its Newton tolerance), and no corner needed a CPU re-solve. Below about 10,000 corners the CPU is faster; creating the CUDA context and JIT-compiling the PTX costs about 0.3 s once per process. On this laptop GPU (FP64 at 1/64 of the FP32 rate) the kernel is bound by FP64 throughput and memory latency; GPUs with full-rate FP64 were not measured. MOS levels above 1, diodes with breakdown, series resistance or a knee current, polynomial sources, `.nodeset` and linear circuits still run on the CPU.
+## Simulator features
 
 - **Three-tier adaptive sparse linear solver (`rustspice-solver::linear`)**: combines symmetric minimum-degree ordering, diagonal-preferring threshold Markowitz pivoting (`0.1`) and factor-growth monitoring on the unrolled symbolic / Cranelift JIT tier with cached symbolic-once `faer` sparse LU (`FaerLuCache`), dense partial-pivoting LU for small ill-conditioned topologies, and Jacobi-preconditioned conjugate gradient (PCG).
 - **Conflict-free static gather table (`CscGatherTable`)**: pre-stamps linear conductances once during compilation and gathers only active dynamic/nonlinear entries via contiguous offsets with zero atomic contention or binary search.
@@ -57,7 +39,7 @@ Beyond these six circuits, `rustspice bench-suite` runs 951 cases against ngspic
 - **Device and element coverage (`rustspice-core::ext`)**: diodes with series resistance, breakdown (BV/IBV), high injection (IKF), recombination current (ISR/NR), transit time and graded depletion capacitance; level-1 MOSFETs with process-derived KP/VTO/GAMMA/PHI (TOX, UO, NSUB, NSS, TPG), LD, RD/RS/RSH, bulk junctions and Meyer gate capacitances; E/F/H controlled sources, `POLY(1)` E/G sources, coupled inductors (K) and semiconductor `.model R`/`.model C`. BJT, JFET, MESFET, B, S, W, T, O, U and MOS LEVEL > 1 are refused with an error.
 - **Discrete adjoint sensitivity (`AdjointSensitivityEngine`)**: computes exact gradients with respect to `P` parameters in a single transposed solve (`J^T λ = ∂L/∂V`) rather than `2P` perturbed simulations.
 
-[Complete benchmark report](docs/benchmark_report.md) · [Architecture guide](docs/architecture.md).
+[Benchmark method](docs/benchmark_report.md) · [Architecture guide](docs/architecture.md).
 
 ## Quick start
 
@@ -78,7 +60,7 @@ cargo build --release --locked -p rustspice-cli
 ./target/release/rustspice codegen --model mosfet-ekv --target msl
 
 # 4. Run the head-to-head accuracy and speed benchmark suite against local ngspice
-./target/release/rustspice bench-ngspice --output docs/benchmark_report.md
+./target/release/rustspice bench-ngspice --output target/bench-ngspice.md
 ```
 
 ## Built for CLI, heterogeneous compute and AI4EDA workflows
@@ -111,7 +93,7 @@ The [documentation site](https://lab-emi.github.io/RustEDA/modules/rustspice/) i
 | Start here | Go deeper |
 | :--- | :--- |
 | [Documentation home](https://lab-emi.github.io/RustEDA/modules/rustspice/) | [Architecture and crate boundaries](docs/architecture.md) |
-| [Benchmark report vs. ngspice-47](docs/benchmark_report.md) | [AI4EDA differentiable sizing example](examples/ai4eda_opamp_sizing.py) |
+| [Benchmark method vs. ngspice-47](docs/benchmark_report.md) | [AI4EDA differentiable sizing example](examples/ai4eda_opamp_sizing.py) |
 | [CMOS ring oscillator deck](examples/cmos_ring_oscillator.sp) | [RustEDA documentation](https://lab-emi.github.io/RustEDA/) |
 
 ## Development and contributing
