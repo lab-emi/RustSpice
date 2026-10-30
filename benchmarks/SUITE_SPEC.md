@@ -187,7 +187,7 @@ rustspice bench-suite [--cases <dir>=benchmarks/cases] [--group G]... [--filter 
                       [--scale small|medium|large] [--reps N=7] [--case-timeout S=60] [--max-rss-mib N=4096]
                       [--seed N=1] [--fuzz-count N=25|100|400 by scale] [--json <file>] [--report <md>]
                       [--artifacts <dir>] [--ngspice <path>=ngspice] [--pin-cpu N] [--no-timing] [--no-fuzz] [--list]
-rustspice bench-ngspice [--output docs/benchmark_report.md] [other legacy flags unchanged]   (legacy 6, honest methodology)
+rustspice bench-ngspice [--output .work/benchmark-report.md] [other legacy flags unchanged]   (legacy 6, honest methodology)
 rustspice run <deck> [--backend B] [--raw <path>] [--stats <path>]
 ```
 Exit code: 0 all good (known gaps allowed), 1 any FAIL, 2 usage/environment error (e.g. no cases found).

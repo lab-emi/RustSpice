@@ -198,7 +198,7 @@ The table below summarizes the seven root causes found by the suite against comm
 
 All additional defects uncovered by `checks/` (`check_card_order_sweep.py`, `check_twin_blocks.py`, `check_mem_scaling.py`, `check_adjoint_fd.py` 15-row truncation, `check_backend_equiv.py` Metal body-effect/EKV mismatch and silent CLI flag fallback, `check_codegen_kernels.py` empty CUDA PTX kernel, and `run_batch_dc_op` solver cloning) have also been fixed and verified (exit 0; see [`checks/README.md`](checks/README.md)).
 
-What the suite found about its own first version, not RustSpice defects (all corrected here): the published ratios of the legacy benchmark came from a 1 ms-quantised `rusage` time taken as solver time, a cold subprocess compared with a warm in-process call, hard-coded zero errors, single runs multiplied by 128 or 400, a transient compared at t = 0 only, and an ngspice labelled KLU that was running SPARSE 1.3 (`.options klu` selects KLU). `rustspice bench-ngspice` writes its report to `docs/benchmark_report.md` by default, which replaces the published method page; pass `--output` to write it elsewhere.
+What the suite found about its own first version, not RustSpice defects (all corrected here): the published ratios of the legacy benchmark came from a 1 ms-quantised `rusage` time taken as solver time, a cold subprocess compared with a warm in-process call, hard-coded zero errors, single runs multiplied by 128 or 400, a transient compared at t = 0 only, and an ngspice labelled KLU that was running SPARSE 1.3 (`.options klu` selects KLU). `rustspice bench-ngspice` writes its report to the ignored `.work/benchmark-report.md` by default, so a local run never replaces the published method page.
 
 ## Limits of this suite
 

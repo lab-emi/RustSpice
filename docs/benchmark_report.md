@@ -26,7 +26,7 @@ Each family runs at several sizes. The report also records process start-up floo
 
 ## Reproduce
 
-Build the CLI and put `ngspice` on `PATH`. The default `--output` is `docs/benchmark_report.md`, which replaces this page, so write the report elsewhere:
+Build the CLI and put `ngspice` on `PATH`. The report goes to `.work/benchmark-report.md` by default, outside the published documentation:
 
 ```sh
 cargo build --release -p rustspice-cli
