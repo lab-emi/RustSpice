@@ -3,7 +3,7 @@
 //! The legacy harness compared a warm in-process RustSpice call against a cold ngspice subprocess, used a 1 ms
 //! quantised `rusage` time as ngspice "solver time", labelled the default SPARSE solver "KLU", hard-coded its accuracy
 //! columns and multiplied single ngspice runs by 400 / 128 for the sensitivity and batch benchmarks. This module keeps
-//! the command (`bench-ngspice --output docs/benchmark_report.md`) and the six circuit families but measures every
+//! the command (`bench-ngspice --output .work/benchmark-report.md`) and the six circuit families but measures every
 //! number in the run that publishes it:
 //!
 //! * both contenders are black-box subprocesses writing a rawfile to tmpfs (`rustspice run --raw/--stats`,
@@ -51,7 +51,7 @@ use super::stats::{loglog_fit, summarize, time_at_equal_error, EqualError, Fit, 
 #[derive(Args, Debug, Clone)]
 pub struct LegacyArgs {
     /// Path to write the Markdown benchmark report
-    #[arg(long, default_value = "docs/benchmark_report.md")]
+    #[arg(long, default_value = ".work/benchmark-report.md")]
     pub output: PathBuf,
     /// Timed repetitions per contender (interleaved after one warm-up; a contender whose own warm-up takes over 1 s / 5 s
     /// is repeated at most 5 / 3 times, heavy multi-launch workloads at most 3; each cap applies only to that contender)
@@ -4772,7 +4772,7 @@ pub fn render_markdown(r: &Report) -> String {
     let _ = writeln!(s, "## Process start-up floors\n");
     s.push_str(&floors_section(&r.floors));
     let _ = writeln!(s, "\n## Reproduce\n");
-    let _ = writeln!(s, "```sh\ncargo build --release -p rustspice-cli\n./target/release/rustspice bench-ngspice --output docs/benchmark_report.md --json bench.json\n# options: --reps N (default 7)  --pin-cpu N  --no-timing  --only b1,b5  --ngspice <path>\n```\n");
+    let _ = writeln!(s, "```sh\ncargo build --release -p rustspice-cli\n./target/release/rustspice bench-ngspice --output .work/benchmark-report.md --json bench.json\n# options: --reps N (default 7)  --pin-cpu N  --no-timing  --only b1,b5  --ngspice <path>\n```\n");
     let _ = writeln!(s, "## Caveats\n");
     let _ = writeln!(s, "- The host is shared and noisy; `noisy` marks series whose spread exceeds 20 % of the median. Re-run on a quiet machine before quoting absolute times.");
     let _ = writeln!(s, "- Hybrid or frequency-scaling CPUs (performance and efficiency cores, turbo) make short processes bimodal: the same ngspice launch can take 30 ms or 60 ms depending on the core it lands on. Series are interleaved and repeated so both sides see the same mix, but the medians still carry that spread; `--pin-cpu N` pins the sequential children to one core for steadier numbers (parallel workloads are never pinned).");
