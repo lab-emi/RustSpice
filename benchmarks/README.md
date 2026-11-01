@@ -20,7 +20,7 @@ cargo build --release -p rustspice-cli
 # one group / one deck family, timed, pinned to one core (pick an idle core: see "Reading timing results")
 ./target/release/rustspice bench-suite --group performance --reps 9 --pin-cpu 11 --report perf.md
 # the six legacy head-to-head benchmarks (honest rewrite of the old `bench-ngspice`)
-./target/release/rustspice bench-ngspice --reps 9 --pin-cpu 11 --output docs/benchmark_report.md
+./target/release/rustspice bench-ngspice --reps 9 --pin-cpu 11 --output target/bench-ngspice.md
 ```
 
 Exit code: `0` = no failing case (known gaps and `unverified` cases are allowed; they are listed in the verdict line and the report),
@@ -97,7 +97,7 @@ run), `--reps` >= 5, min / median / stddev, `noisy` = stddev/median > 0.2, load 
 of its direct solvers: SPARSE 1.3 (its default) and KLU (`.options klu`); the headline compares with the faster one.
 Headline = end-to-end median ratio. *Solve-only* uses ngspice `Total analysis time` against RustSpice `analysis_us`, which
 **excludes RustSpice's compile time** (symbolic LU analysis, JIT): it is reported for diagnosis only and is never the headline.
-Start-up floors (an empty deck: about 2.4 ms for ngspice and 0.8 ms for RustSpice in the reference run, they move with load) are measured once per run and printed.
+Start-up floors (an empty deck; they move with load) are measured once per run and printed.
 Peak RSS is `VmHWM` of each child polled from `/proc` (never `wait4 ru_maxrss`, which is floored by the harness's own high-water
 mark); RustSpice's own `--stats` reading is merged in. ngspice's poll-based peak is a lower bound (`rss_lower_bound` in the JSON).
 Fewer than three samples are never reported as stable (`spread_status`, `noisy: true`).
@@ -150,7 +150,7 @@ Counts are cases tagged with the slug in the reference static run of 2026-10-28 
 | `abstol-absolute-residual` | 0 | **Closed** (`RC-newton-limit`): KCL residual check scales with `reltol * max_branch_current + abstol`. |
 | `resource-budget` | 0 | **Closed** (`RC-resource-budget`): explicit `ResourceLimits` caps on element counts, subcircuit expansion depth, sweep points, transient steps, and non-finite parameters. |
 | `symbolic-lu-blowup` | 0 | **Closed** (`RC-lu-pivot`, `RC-faer-slow`): symmetric minimum-degree ordering with work budget (`200_000`) and symbolic LU operation cap (`32 * dim` for `dim >= 256`, `500_000` max) route high-fill topologies directly to cached `faer` sparse LU. |
-| `faer-nonlinear-slow` | 1 | Nonlinear 2-D arrays/meshes on the `faer` tier (`perf_med_diode_mesh_op_32x32` static deck + `fam_mos_array_tran_fast_5` generated deck; `perf_med_mos_array_op_20x20` closed at 1.18x faster). |
+| `faer-nonlinear-slow` | 1 | Nonlinear 2-D arrays/meshes on the `faer` tier (`perf_med_diode_mesh_op_32x32` static deck + `fam_mos_array_tran_fast_5` generated deck; `perf_med_mos_array_op_20x20` closed). |
 | `r-nonpositive-clamp` | 0 | **Closed** (`RC-resource-budget`): `R < 0` is rejected with a topology error; `R = 0` uses a `1e-9` ohm substitute conductance while rejecting zero-resistance topology loops cleanly. |
 | `linear-static-pivot-accuracy` | 0 | **Closed** (`RC-lu-pivot`): diagonal-preferring threshold Markowitz pivoting (`0.1`), stability growth check, and automatic fallback to `DensePartialPivotLu` / `FaerSupernodal`. |
 | `batch-all-or-nothing` | 0 | `run_batch_dc_op` reuses the pre-compiled symbolic LU structure across Rayon workers (`linear_solver.clone()`). |
@@ -176,43 +176,7 @@ Counts are cases tagged with the slug in the reference static run of 2026-10-28 
 
 **Static correctness run** (`--no-timing --no-fuzz --scale small --teeth --case-timeout 30 --max-rss-mib 2048`, ngspice-47, RustSpice of 2026-10-28 after Phase 3): 951 cases, verdict **PASS**: **857 pass** (818 after Phases 1-2, 635 before), **16 known gaps confirmed** (55 after Phases 1-2, 237 before; Phase 3 closed 31 `silent-ignore-model-param`, 7 `unsupported-device-loud` and 1 `silent-misparse`), **77 informational**, **1 unverified** without timing (`perf_med_diode_mesh_op_32x32`), **0 failing**, 0 `gap_closed`. Capability group: 347 / 378 pass. Mutation check (`--teeth`): **701 passing cases detect a 5 % change of one element**, **0 are blunt** (92 of them see it only through a source), 26 skipped and 224 not applicable. Remaining gaps: `unsupported-device-loud` 11 (BJT x3, JFET, MESFET, B x2, O, S, T, W), `silent-wrong-model-level` 4 (MOS LEVEL 2/3/4/6, refused) and `.if` blocks (refused).
 
-**Timed performance group** (`--group performance --no-fuzz --reps 9 --pin-cpu 11 --case-timeout 60 --max-rss-mib 2048`, scale `medium`): 113 cases, 110 timed, verdict **PASS** (111 pass, 2 known gaps: `fam_mos_array_tran_fast_5` and `perf_med_diode_mesh_op_32x32`; `perf_med_mos_array_op_20x20` closed at 1.18x faster). Host: 13th Gen Intel(R) Core(TM) i9-13900HX, both tools pinned to CPU 11, tmpfs scratch. Start-up floors (empty deck): ngspice 3.04 ms, RustSpice 0.99 ms. After Phase 3 (per-transistor bulk junctions and Meyer capacitances) the group was re-timed at scale `small` (`--reps 5 --pin-cpu 5`, 71 cases, 69 timed): verdict **PASS** (70 pass, 1 known gap `perf_med_diode_mesh_op_32x32` at 0.73x), RustSpice faster end to end in 67 of 69 (geometric mean 2.95x); the nonlinear MOS/SRAM cases stay faster (`fam_sram6t_tran_8` 1.80x, `fam_sram6t_op_8` 2.21x, `perf_med_cmos_chain_tran_50` 2.62x, `perf_med_mos_array_op_20x20` 1.24x) except `fam_mos_array_tran_20`, which remains 5.5x slower (5.4x in the medium run above).
-
-End-to-end (process start to rawfile written), ratio = faster ngspice solver / RustSpice, medians of 9 interleaved repetitions: RustSpice faster in **101 of 110** cases (up from 90 of 108 pre-fix), geometric mean **2.51x** (up from 2.06x pre-fix).
-
-| unknowns | cases | RustSpice faster | geometric mean | range |
-|---|---|---|---|---|
-| <= 100 | 34 | 34 | 3.48x | 1.08x .. 12.0x |
-| 101-1,000 | 35 | 34 | 2.42x | 0.93x .. 6.5x |
-| 1,001-5,000 | 21 | 13 | 1.06x | 0.04x .. 9.3x |
-| > 5,000 | 20 | 20 | 3.84x | 2.04x .. 19.3x |
-
-Fastest: `perf_scal_rc_mesh_tran_g14` 19.3x, `fam_rc_mesh_tran_14` 18.6x, `perf_lin_rlc_pulse_1e5` 12.0x, `perf_lin_rc_sine_1e6` 12.0x, `perf_lin_lc_tank_sine_1e5` 11.4x, `perf_lin_butter5_step_1e5` 10.6x. All 2-D and 3-D linear meshes (`fam_mesh_dc_100` 2.05x faster, `fam_mesh_dc_shuffled_40` 2.13x faster, `perf_scal_mesh3d_dc_n15` 2.07x faster) and LC ladders (`fam_lc_ladder_tran_300` 2.26x faster) that were 3x..37.5x slower before `RC-faer-slow` are now faster than ngspice-KLU. Only 9 nonlinear 2-D MOS/SRAM/diode array/mesh cases remain slower than ngspice-KLU (every one of them passes its accuracy check):
-
-| deck | unknowns | RustSpice | vs |
-|---|---|---|---|
-| `fam_sram6t_tran_24` | 1154 | 24.4x slower | klu |
-| `fam_mos_array_tran_30` | 2704 | 14.7x slower | klu |
-| `fam_mos_array_tran_20` | 1204 | 5.4x slower | klu |
-| `fam_diode_mesh_48` | 2306 | 2.2x slower | klu |
-| `fam_sram6t_op_24` | 1154 | 1.8x slower | klu |
-| `fam_mos_array_op_30` | 2704 | 1.7x slower | klu |
-| `perf_med_diode_mesh_op_32x32` | 1026 | 1.4x slower | klu |
-| `fam_diode_mesh_16` | 258 | 1.1x slower | klu |
-| `fam_mos_array_op_20` | 1204 | 1.03x slower | klu |
-
-**The six legacy benchmarks** (`bench-ngspice`, same circuits and sizes as the old report, rewritten as subprocess-to-subprocess timing with full-waveform accuracy against an independent oracle). Speedup = ngspice (faster of SPARSE and KLU) / RustSpice, end to end, median:
-
-| benchmark | RustSpice | ngspice | speedup | max error (RustSpice / ngspice default) |
-|---|---|---|---|---|
-| b1 DC ladder | 11.13 ms | 25.98 ms | **2.33x** | 1.91e-13 / 1.93e-13 V |
-| b2 RC line tran | 31.45 ms | 114 ms | **3.62x** (8.2x lower error than ngspice default) | 2.01e-4 / 1.65e-3 of swing, against tight ngspice (no oracle) |
-| b3 diode sweep | 3.35 ms | 6.54 ms | **1.95x** | 5.89e-11 / 5.44e-5 V |
-| b4 CMOS chain tran | 32.12 ms | 35.60 ms | **1.11x** (5.2x lower error than ngspice default) | 7.40e-2 / 3.86e-1 of swing, against tight ngspice (no oracle) |
-| b5 sensitivity | 1.30 ms | 12.55 ms | **9.66x** (**306x** vs FD loop) | 9.33e-15 / 1.00e-6 |
-| b6 batch | 3.46 ms | 4.30 ms | **1.24x** (min **1.33x**; **2.57x** via `.dc` sweep) | 2.47e-11 / 1.63e-5 V |
-
-Compare the previously published 5.3x / 7.6x / 3.0x / 2.6x / 6285x / 321x: those came from the harness errors listed under "What the suite found about its own first version". On b2, the single short backward-Euler restart at fast slope corners and the corrected jump detector reduced RustSpice's error from `4.61e-3` (2.80x ngspice default) to `2.01e-4` (8.2x below ngspice default's `1.65e-3`) at `tstep = 10 ps`, and on the step ladder `b2s_rcline_500` (`tstep` 10 ps..1 ps) RustSpice is both 3.4x–4.2x faster and 2.7x–15x more accurate than ngspice default (no equal-error comparison exists: the error ranges do not overlap). The b2 50 % crossing shift read from the rawfiles (`2.00 ps` RustSpice, `0.36 ps` ngspice default) measures the output rows, not the solver: RustSpice writes only the 10 ps `k * tstep` rows and ngspice its internal points, and the tight reference itself, read only at RustSpice's rows, is off by `2.01 ps`. The report therefore also gives the shift with the reference read at each tool's own rows (`0.07 ps` RustSpice, `0.35 ps` ngspice) and that row floor; `rustspice run --internal-points` writes the accepted steps between the rows as well (0.14 ps from the rawfile); on b4, the quadratic predictor, contraction-rate Newton acceptance and jagged Jacobian gather cut RustSpice's analysis time from 47 ms to 26 ms (including the bulk junctions and Meyer capacitances of Phase 3) at an unchanged `7.40e-2` error (1.60 ps crossing shift, 5.2x below ngspice default's `3.86e-1` / 9.10 ps shift); b5 compares one adjoint solve with the best ngspice alternative (`.sens`, which computes 24 sensitivities per requested gradient; **306x** against the finite-difference loop that delivers only the 200 requested ones); b6 is a parallel workload (32 threads) against ngspice's 1-thread `.dc` sweep (**1.24x** with `rustspice-batch`, **2.57x** with `rustspice-dc-sweep`, **6.80x** against `ngspice-control-loop-sparse`, and **12.2x** against `ngspice-par-launches`). Batched DC operating points at 1e4..1e6 corners on an NVIDIA GPU (the b6 diode cascade and the b4 CMOS inverter chain) are timed separately by `rustspice bench-batch` ([`docs/gpu_batch_report.md`](../docs/gpu_batch_report.md)): ngspice has no batched or GPU counterpart, so it compares the CPU batch API, the kernel's own CPU build and the CUDA run.
+**Timed runs** (`--group performance` and `bench-ngspice`): results are not published here. RustEDA publishes one benchmark, a matched Ibex RTL-to-GDS comparison with LibreLane on IHP SG13G2 / EZ130; see the [RustEDA benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/). Run the commands above to time the suite on your own host, and read the ratios within that run only. Batched DC operating points on an NVIDIA GPU are timed separately by `rustspice bench-batch` ([method](../docs/gpu_batch_report.md)).
 
 **Seeded fuzzers and mutants** (`--scale small --fuzz-count 100 --seed 2`, 400 random decks and 200 mutants):
 - **Random decks (`fuzz_`)**: **400 / 400 pass**, 0 known gap, 0 failing (all `symbolic-lu-blowup`, `no-op-homotopy-tran`, `abstol-absolute-residual`, and `clamp-rail` failures on random linear, RC, diode, and MOS decks are closed).
@@ -230,11 +194,11 @@ The table below summarizes the seven root causes found by the suite against comm
 | **Newton box, limits and criteria.** (`RC-newton-clamp`, `RC-newton-limit`) | `clamp-rail`, `false-convergence-pnjlim`, `no-op-homotopy-tran`, `dc-sweep-no-recovery`, `abstol-absolute-residual`, `r-nonpositive-clamp`, `dc-static-homotopy`, `exp-argument-clamp`, `newton-iteration-cap`, `param-floor-clamp` | 54 | **0** | **Fixed.** Removed rail-box clamping, added `pnjlim`/`fetlim` step-delta convergence check, relative KCL residual scaling, smooth diode high-bias linearization (`40 * N * Vt`), adaptive Gmin/source-stepping homotopy, transient sub-stepping, and removed artificial `PHI`/`L` parameter floors. |
 | **Time and sweep grid.** (`RC-time-grid`) | `tran-degenerate-last-step`, `dc-sweep-grid-drift`, `step-retry-grid-desync`, `fixed-step-accuracy` | 38 | **0** | **Fixed.** Integer-counted `.tran` and `.dc` grids, divided-difference LTE adaptive step control, waveform breakpoint landing (`PULSE`, `SIN`, `EXP`, `PWL`) with L-stable `BE -> BE -> BDF-2 -> Trapezoidal` restarts, and quantized `hmax / 2^k` `FactorCache`. |
 | **No resource budgets.** (`RC-resource-budget`) | `resource-budget`, `nonfinite-result-accepted` | 17 (+ 24 mutant aborts) | **0** | **Fixed.** Added `ResourceLimits` (`--max-elements`, `--max-nodes`, `--max-subckt-depth`, `--max-sweep-points`, `--max-tran-steps`, `--max-newton-iters`), NUL/non-ASCII token rejection, and non-finite value/solution rejection. |
-| **Performance on larger systems.** (`RC-faer-slow`) | `faer-nonlinear-slow`, `symbolic-lu-blowup` | 2 judged + 18 slower than ngspice | **1** static judged + 9 slower than ngspice | **Fixed linear/mesh scaling (`FaerLuCache` symbolic-once LU + op-budget routing).** All 2-D/3-D linear meshes and LC ladders are now faster than ngspice-KLU; `check_mem_scaling.py` passes with 3.8–9.3 KB/unknown. |
+| **Performance on larger systems.** (`RC-faer-slow`) | `faer-nonlinear-slow`, `symbolic-lu-blowup` | 2 judged | **1** static judged | **Fixed linear/mesh scaling (`FaerLuCache` symbolic-once LU + op-budget routing).** `check_mem_scaling.py` passes with 3.8–9.3 KB/unknown. |
 
 All additional defects uncovered by `checks/` (`check_card_order_sweep.py`, `check_twin_blocks.py`, `check_mem_scaling.py`, `check_adjoint_fd.py` 15-row truncation, `check_backend_equiv.py` Metal body-effect/EKV mismatch and silent CLI flag fallback, `check_codegen_kernels.py` empty CUDA PTX kernel, and `run_batch_dc_op` solver cloning) have also been fixed and verified (exit 0; see [`checks/README.md`](checks/README.md)).
 
-What the suite found about its own first version, not RustSpice defects (all corrected here): the published ratios of the legacy benchmark came from a 1 ms-quantised `rusage` time taken as solver time, a cold subprocess compared with a warm in-process call, hard-coded zero errors, single runs multiplied by 128 or 400, a transient compared at t = 0 only, and an ngspice labelled KLU that was running SPARSE 1.3 (`.options klu` selects KLU). `docs/benchmark_report.md` is regenerated by `rustspice bench-ngspice`.
+What the suite found about its own first version, not RustSpice defects (all corrected here): the published ratios of the legacy benchmark came from a 1 ms-quantised `rusage` time taken as solver time, a cold subprocess compared with a warm in-process call, hard-coded zero errors, single runs multiplied by 128 or 400, a transient compared at t = 0 only, and an ngspice labelled KLU that was running SPARSE 1.3 (`.options klu` selects KLU). `rustspice bench-ngspice` writes its report to the ignored `.work/benchmark-report.md` by default, so a local run never replaces the published method page.
 
 ## Limits of this suite
 
