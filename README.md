@@ -20,20 +20,60 @@ RustSpice simulates transistor-level SPICE netlists (`.op`, `.dc`, `.tran`) and 
 
 Part of **[RustEDA](https://github.com/lab-emi/RustEDA)**, infrastructure for chip-design recursive self-improvement. Native tools shorten the work between inference steps; verified results guide the next iteration.
 
-## Latest development · 2026-11-01
+## Latest development · 2026-11-02
 
-The simulator source includes adaptive transient integration and breakpoint
-handling, strict SPICE parsing with expressions/includes and explicit resource
-limits, extended diode/level-1 MOS and controlled-source coverage, and adjoint
-parameter sensitivities. Batched FP64 DC has a deterministic CPU reference and
-an optional CUDA kernel with explicit fallback for unsupported/nonconverged cases.
+The RustEDA Ibex host campaign (IHP SG13G2 / EZ130 with two real SRAMs, on a
+4-vCPU Intel Xeon cloud host with 15.7 GiB RAM and no swap) ran
+`rustspice bench-suite` with RustSpice 0.1.0 (commit
+[`cc2426f`](https://github.com/lab-emi/RustSpice/commit/cc2426f3e6cbb1ad05843b22a71632f118f62ddc))
+against ngspice-45. The transient decks are linear RC networks from the native
+nominal SPEF of the final RustEDA Ibex layout: the eight largest single nets
+(548–649 unknowns, 3–10 sinks) and two multi-net decks (10 nets with 5,843
+unknowns, 40 nets with 20,023). Each deck drives real nets with a Thevenin ramp,
+keeps the extracted resistors and positive capacitors with coupling capacitance
+grounded, and adds a fixed load capacitance at each sink pin. Accuracy is
+checked at the probed nodes only: the driver and first sink of each single net
+(2 probes), and of the first 4 nets in each multi-net deck (8 probes).
+**All 10 cases `pass` accuracy**: against a tightly converged ngspice
+reference, RustSpice's worst error / swing is 7.90 × 10⁻⁴, 39 % of the
+tolerance of 2 × 10⁻³ set in each deck. **RustSpice was 3.68–5.78× faster end
+to end than the faster ngspice solver**, which was SPARSE in every case.
+
+| | 8 single nets | 10 nets, 5,843 unknowns | 40 nets, 20,023 unknowns |
+| --- | ---: | ---: | ---: |
+| Accuracy verdict | `pass` × 8 | `pass` | `pass` |
+| Error / swing, RustSpice | 0.90–2.12 × 10⁻⁴ | 7.90 × 10⁻⁴ | 7.68 × 10⁻⁴ |
+| Median end to end, ngspice SPARSE | 534.33–618.43 ms | 1,107.13 ms | 4,072.28 ms |
+| Median end to end, RustSpice | 136.28–161.45 ms | 196.78 ms | 704.24 ms |
+| End-to-end speedup vs the faster ngspice solver | 3.68–4.18× | 5.63× | 5.78× |
+| Solve-only speedup vs the faster ngspice solver | 4.60–5.14× | 7.74× | 7.82× |
+| Median peak RSS, ngspice SPARSE / RustSpice | 15,404–15,708 / 33,728–38,416 KiB | 30,724 / 46,232 KiB | 71,608 / 144,152 KiB |
+
+Times are medians of seven interleaved repetitions after a correctness warm-up,
+from one session on one shared host. Solve-only pairs ngspice's `Total analysis
+time` with RustSpice's `analysis_us`, which excludes RustSpice's parse and
+compile; end to end includes both. RustSpice used more memory than ngspice in
+every case. The scope is linear RC interconnect only: RustSpice does not
+implement the PSP103 models of the IHP SG13G2 transistors, so no
+transistor-level Ibex simulation was run, and RustSpice is not part of the
+timed RTL-to-GDS flow. This host's ngspice is ngspice-45; the differential
+suite and the benchmark method below cite ngspice-47.
+
+The measured source is the 2026-11-01 update, which includes adaptive transient
+integration and breakpoint handling, strict SPICE parsing with
+expressions/includes and explicit resource limits, extended diode/level-1 MOS
+and controlled-source coverage, and adjoint parameter sensitivities. Batched
+FP64 DC has a deterministic CPU reference and an optional CUDA kernel with
+explicit fallback for unsupported/nonconverged cases.
 
 [Current source and qualification](docs/development-status.md) ·
-[Latest complete-flow evidence](https://lab-emi.github.io/RustEDA/benchmarks/)
+[SPICE head-to-head](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45) ·
+[Host campaign method and deviations](https://lab-emi.github.io/RustEDA/benchmarks/#host-campaign-method-and-deviations) ·
+[All benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/)
 
 ## Benchmarks
 
-RustEDA publishes one benchmark: a matched Ibex RTL-to-GDS comparison with LibreLane on IHP SG13G2 / EZ130. See the [RustEDA benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/). RustSpice publishes no performance comparison; the [benchmark method](docs/benchmark_report.md) describes how to measure one against `ngspice` on your own host.
+RustEDA publishes its benchmarks on one page: Ibex RTL-to-GDS on IHP SG13G2 / EZ130 against LibreLane, with module head-to-heads. See the [RustEDA benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/). RustSpice's one published performance comparison is the [head-to-head with ngspice-45](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45) from the 2026-11-02 Ibex host campaign, on linear RC networks extracted from the Ibex layout (summarized above); it covers no transistor-level circuit and applies to that host only. The [benchmark method](docs/benchmark_report.md) describes how to measure RustSpice against `ngspice` on your own host.
 
 ## Differential verification against ngspice
 

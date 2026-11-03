@@ -9,6 +9,37 @@ RustSpice simulates transistor-level SPICE netlists (`.op`, `.dc`, `.tran`) and 
   <img src="assets/rustspice-banner.gif" alt="Circuit simulation for the next design iteration." width="1200">
 </picture>
 
+## Ibex host campaign · 2026-11-02
+
+In the RustEDA Ibex host campaign (IHP SG13G2 / EZ130 with two real SRAMs, on a
+4-vCPU cloud host), `rustspice bench-suite` compared RustSpice 0.1.0 with
+ngspice-45 on transient decks built from linear RC networks of the final Ibex
+layout: eight single nets (548–649 unknowns) and two multi-net decks (10 nets
+with 5,843 unknowns, 40 nets with 20,023), each driven by a Thevenin ramp with
+coupling capacitance grounded and a fixed load capacitance at each sink pin.
+Accuracy is checked at 2 probed nodes per single net and at 8 (on the first 4
+nets) per multi-net deck. **All 10 cases `pass` accuracy** against a
+tightly converged ngspice reference (worst RustSpice error / swing
+7.90 × 10⁻⁴, tolerance 2 × 10⁻³). **RustSpice was 3.68–4.18× faster end to end
+than the faster ngspice solver on the single nets and 5.63× and 5.78× on the
+multi-net decks**; solve-only speedups are 4.60–5.14×, 7.74× and 7.82×. Its
+median peak RSS was higher: 33,728–144,152 KiB against 15,404–71,608 KiB for
+ngspice SPARSE. Times are medians of seven interleaved repetitions on one
+shared host. End to end is each simulator's subprocess wall time (start-up,
+parse, setup, solve and rawfile write); solve-only pairs ngspice's `Total
+analysis time` with RustSpice's `analysis_us`, which excludes RustSpice's parse
+and compile.
+
+The scope is linear RC interconnect only. RustSpice does not implement the
+PSP103 models of the IHP SG13G2 transistors, so there is no transistor-level
+Ibex simulation, and RustSpice is not part of the timed RTL-to-GDS flow. This
+host's ngspice is ngspice-45; the differential suite and the benchmark method
+cite ngspice-47.
+
+[Decks, all values and method](development-status.md) ·
+[SPICE head-to-head](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45) ·
+[All benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/)
+
 ## Development update · 2026-11-01
 
 The simulator source includes adaptive transient integration and breakpoint
@@ -33,7 +64,7 @@ rustspice bench-ngspice --output target/bench-ngspice.md
 
 ## Benchmarks
 
-RustEDA publishes one benchmark: a matched Ibex RTL-to-GDS comparison with LibreLane on IHP SG13G2 / EZ130. See the [RustEDA benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/). The [benchmark method](benchmark_report.md) describes how to measure RustSpice against `ngspice` on your own host.
+RustEDA publishes its benchmarks on one page: Ibex RTL-to-GDS on IHP SG13G2 / EZ130 against LibreLane, with module head-to-heads. See the [RustEDA benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/). RustSpice's one published performance comparison is the [head-to-head with ngspice-45](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45) on linear RC networks extracted from the Ibex layout ([summary above](#ibex-host-campaign-2026-11-02)); it covers no transistor-level circuit and applies to that host only. The [benchmark method](benchmark_report.md) describes how to measure RustSpice against `ngspice` on your own host.
 
 ## Batched DC operating points on NVIDIA GPUs
 

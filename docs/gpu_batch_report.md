@@ -1,6 +1,6 @@
 # Batched DC operating points: CPU vs CUDA
 
-RustEDA publishes one benchmark: a matched Ibex RTL-to-GDS comparison with LibreLane on IHP SG13G2 / EZ130. See the [RustEDA benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/). This page describes how `rustspice bench-batch` times batched DC operating points, without published results.
+The RustEDA benchmark page publishes the Ibex RTL-to-GDS campaigns on IHP SG13G2 / EZ130 and a RustSpice-vs-ngspice-45 head-to-head on extracted Ibex RC networks; see the [RustEDA benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/). This page describes how `rustspice bench-batch` times batched DC operating points, without published results.
 
 ## Workloads
 
