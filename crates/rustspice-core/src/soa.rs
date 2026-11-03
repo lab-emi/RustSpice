@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{SimError, SimResult};
 use crate::ext::{ExtDevices, Junction, MeyerCaps, Mutual, PolySource};
-use crate::netlist::{Netlist, ResistorInstance, SourceWaveform};
+use crate::netlist::{CapacitorInstance, Netlist, ResistorInstance, SourceWaveform};
 use crate::sparse::{CscGatherTable, CscMatrix, GatherTerm, JaggedTerms};
 
 /// 64-byte cache-line aligned contiguous array for AVX-512 / AVX2 / NEON and GPU DMA transfers.
@@ -819,7 +819,13 @@ fn level1_effective(m: &crate::netlist::MosfetModelParams, tnom: f64) -> SimResu
 /// Compiles a parsed [`Netlist`] into a 64-byte aligned [`DeviceSoaBuffer`] and a conflict-free
 /// [`CscGatherTable`] + [`CscMatrix`].
 pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
-    let mut netlist_expanded = netlist.clone();
+    // What compiling adds to or rewrites in the netlist; every other device list is read from `netlist` itself (no copy
+    // of the netlist): the series resistances of diodes and MOSFETs and the MOSFET overlap capacitors (stamped after
+    // the netlist's own resistors / capacitors), the MOSFETs with drain / source moved behind their series resistances,
+    // and the diodes left to the plain Shockley model.
+    let mut extra_resistors: Vec<ResistorInstance> = Vec::new();
+    let mut extra_capacitors: Vec<CapacitorInstance> = Vec::new();
+    let mut mosfets = netlist.mosfets.clone();
     // device-internal nodes follow the circuit nodes: `node_names[num_nodes(netlist)+1..]`
     let mut node_names = netlist.node_names.clone();
     let vt = crate::temperature::thermal_voltage(
@@ -843,7 +849,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         let mut anode = d.n_anode;
         if m.rs > 0.0 {
             anode = internal_node(&mut node_names, format!("{}#internal", d.name));
-            netlist_expanded.resistors.push(ResistorInstance {
+            extra_resistors.push(ResistorInstance {
                 name: format!("{}#rs", d.name),
                 n_pos: d.n_anode,
                 n_neg: anode,
@@ -870,11 +876,11 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
             ..Default::default()
         });
     }
-    netlist_expanded.diodes = plain_diodes;
+    let diodes = plain_diodes;
 
     // Level-1 MOSFETs: derived parameters, series resistances, bulk junctions, gate capacitances
     let mut mos_params: Vec<MosCompiled> = Vec::with_capacity(netlist.mosfets.len());
-    for (mos_idx, mos) in netlist_expanded.mosfets.iter_mut().enumerate() {
+    for (mos_idx, mos) in mosfets.iter_mut().enumerate() {
         let m = &netlist
             .mosfet_models
             .get(&mos.model)
@@ -899,7 +905,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         let (n_drain, n_source) = (mos.n_drain, mos.n_source);
         if let Some(rd) = series(par.rd, mos.geom.nrd) {
             mos.n_drain = internal_node(&mut node_names, format!("{}#drain", mos.name));
-            netlist_expanded.resistors.push(ResistorInstance {
+            extra_resistors.push(ResistorInstance {
                 name: format!("{}#rd", mos.name),
                 n_pos: n_drain,
                 n_neg: mos.n_drain,
@@ -908,7 +914,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         }
         if let Some(rs) = series(par.rs, mos.geom.nrs) {
             mos.n_source = internal_node(&mut node_names, format!("{}#source", mos.name));
-            netlist_expanded.resistors.push(ResistorInstance {
+            extra_resistors.push(ResistorInstance {
                 name: format!("{}#rs", mos.name),
                 n_pos: n_source,
                 n_neg: mos.n_source,
@@ -1015,7 +1021,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     }
 
     // Overlap capacitances: CGSO / CGDO per unit width, CGBO per unit (effective) length
-    for (mos, mc) in netlist_expanded.mosfets.clone().iter().zip(&mos_params) {
+    for (mos, mc) in mosfets.iter().zip(&mos_params) {
         if let Some(m) = netlist.mosfet_models.get(&mos.model) {
             let w = mos.w.unwrap_or(m.w_default) * mos.m;
             for (tag, other, c) in [
@@ -1024,15 +1030,13 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
                 ("gb", mos.n_bulk, m.cgbo * mc.leff * mos.m),
             ] {
                 if c > 0.0 {
-                    netlist_expanded
-                        .capacitors
-                        .push(crate::netlist::CapacitorInstance {
-                            name: format!("c_{tag}_{}", mos.name),
-                            n_pos: mos.n_gate,
-                            n_neg: other,
-                            capacitance: c,
-                            ic: None,
-                        });
+                    extra_capacitors.push(CapacitorInstance {
+                        name: format!("c_{tag}_{}", mos.name),
+                        n_pos: mos.n_gate,
+                        n_neg: other,
+                        capacitance: c,
+                        ic: None,
+                    });
                 }
             }
         }
@@ -1040,10 +1044,10 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
 
     let num_nodes = node_names.len() - 1;
     let mna_dim = num_nodes
-        + netlist_expanded.v_sources.len()
-        + netlist_expanded.inductors.len()
-        + netlist_expanded.vcvs.len()
-        + netlist_expanded.ccvs.len();
+        + netlist.v_sources.len()
+        + netlist.inductors.len()
+        + netlist.vcvs.len()
+        + netlist.ccvs.len();
     if mna_dim == 0 {
         return Err(SimError::TopologyError(
             "Circuit contains no non-ground nodes or branches".to_string(),
@@ -1095,7 +1099,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         };
 
     // 1. Resistors (static linear)
-    for r in &netlist_expanded.resistors {
+    for r in netlist.resistors.iter().chain(&extra_resistors) {
         let g = DeviceSoaBuffer::resistor_conductance(&r.name, r.resistance);
         let buf_idx = soa.cond_buf.len() as u32;
         soa.cond_buf.push(g);
@@ -1109,7 +1113,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     }
 
     // 2. VCCS (static linear)
-    for vccs in &netlist_expanded.vccs {
+    for vccs in &netlist.vccs {
         let buf_idx = soa.cond_buf.len() as u32;
         soa.cond_buf.push(vccs.gm);
         soa.vccs_names.push(vccs.name.clone());
@@ -1135,7 +1139,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     }
 
     // 3. Capacitors (dynamic companion model during transient)
-    for c in &netlist_expanded.capacitors {
+    for c in netlist.capacitors.iter().chain(&extra_capacitors) {
         let cond_idx = soa.cond_buf.len() as u32;
         soa.cond_buf.push(0.0);
         let rhs_idx = soa.rhs_buf.len() as u32;
@@ -1164,7 +1168,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     }
 
     // 4. Independent Voltage Sources
-    for (v_idx, vs) in netlist_expanded.v_sources.iter().enumerate() {
+    for (v_idx, vs) in netlist.v_sources.iter().enumerate() {
         let br = num_nodes + v_idx;
         let br_cond_idx = soa.cond_buf.len() as u32;
         soa.cond_buf.push(1.0);
@@ -1195,8 +1199,8 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     }
 
     // 5. Inductors (MNA branch equation: V(pos) - V(neg) - R_eq * I_L = V_eq)
-    for (l_idx, ind) in netlist_expanded.inductors.iter().enumerate() {
-        let br = num_nodes + netlist_expanded.v_sources.len() + l_idx;
+    for (l_idx, ind) in netlist.inductors.iter().enumerate() {
+        let br = num_nodes + netlist.v_sources.len() + l_idx;
         let br_inc_idx = soa.cond_buf.len() as u32;
         soa.cond_buf.push(1.0);
         let req_cond_idx = soa.cond_buf.len() as u32;
@@ -1235,7 +1239,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
 
     // 5b. Controlled sources. `E` / `H` rows follow the inductor branches: `v(n+) - v(n-) - f = 0`.
     let vsrc_branch = |name: &str| -> SimResult<usize> {
-        netlist_expanded
+        netlist
             .v_sources
             .iter()
             .position(|v| v.name.eq_ignore_ascii_case(name))
@@ -1246,7 +1250,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
                 ))
             })
     };
-    let mut br = num_nodes + netlist_expanded.v_sources.len() + netlist_expanded.inductors.len();
+    let mut br = num_nodes + netlist.v_sources.len() + netlist.inductors.len();
     let mut push_branch = |soa: &mut DeviceSoaBuffer,
                            stamps: &mut Vec<(usize, usize, u32, f64, bool)>,
                            name: &str,
@@ -1270,7 +1274,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         br += 1;
         br - 1
     };
-    for e in &netlist_expanded.vcvs {
+    for e in &netlist.vcvs {
         let row = push_branch(&mut soa, &mut matrix_stamps, &e.name, e.n_pos, e.n_neg);
         let linear = e.coeffs.len() <= 2;
         let g_idx = soa.cond_buf.len() as u32;
@@ -1295,7 +1299,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
             });
         }
     }
-    for h in &netlist_expanded.ccvs {
+    for h in &netlist.ccvs {
         let ctrl = vsrc_branch(&h.control)?;
         let row = push_branch(&mut soa, &mut matrix_stamps, &h.name, h.n_pos, h.n_neg);
         let r_idx = soa.cond_buf.len() as u32;
@@ -1303,7 +1307,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         matrix_stamps.push((row, ctrl, r_idx, -1.0, true));
     }
     // `F`: `gain * i(control)` leaves n+ and enters n-
-    for f in &netlist_expanded.cccs {
+    for f in &netlist.cccs {
         let ctrl = vsrc_branch(&f.control)?;
         let g_idx = soa.cond_buf.len() as u32;
         soa.cond_buf.push(f.gain);
@@ -1316,7 +1320,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         soa.ctl_current_nodes.push((f.n_pos, f.n_neg));
     }
     // `G ... POLY(1)`: the VCCS stamps with a slope and an offset current
-    for g in &netlist_expanded.poly_vccs {
+    for g in &netlist.poly_vccs {
         let linear = g.coeffs.len() <= 2;
         let g_idx = soa.cond_buf.len() as u32;
         soa.cond_buf.push(g.coeffs.get(1).copied().unwrap_or(0.0));
@@ -1347,9 +1351,9 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         }
     }
     // `K`: `-M a0` between the two branch equations (zero at DC)
-    for k in &netlist_expanded.mutuals {
+    for k in &netlist.mutuals {
         let find = |name: &str| {
-            netlist_expanded
+            netlist
                 .inductors
                 .iter()
                 .position(|l| l.name.eq_ignore_ascii_case(name))
@@ -1383,7 +1387,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     }
 
     // 6. Independent Current Sources (flowing from n_pos to n_neg inside the source)
-    for isrc in &netlist_expanded.i_sources {
+    for isrc in &netlist.i_sources {
         let rhs_idx = soa.rhs_buf.len() as u32;
         let dc_val = isrc.waveform.dc_value();
         soa.rhs_buf.push(dc_val);
@@ -1404,8 +1408,8 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     }
 
     // 7. PN Junction Diodes
-    for d in &netlist_expanded.diodes {
-        let m = netlist_expanded
+    for d in &diodes {
+        let m = netlist
             .diode_models
             .get(&d.model)
             .cloned()
@@ -1418,7 +1422,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
         soa.diode_names.push(d.name.clone());
         soa.diode_anode.push(d.n_anode);
         soa.diode_cathode.push(d.n_cathode);
-        let (is_t, n_eff, cjo_t, vj_t) = diode_at_temperature(&netlist_expanded, d, &m)?;
+        let (is_t, n_eff, cjo_t, vj_t) = diode_at_temperature(netlist, d, &m)?;
         soa.diode_is.push(is_t * d.area);
         soa.diode_n.push(n_eff);
         soa.diode_area.push(d.area);
@@ -1445,8 +1449,8 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
     }
 
     // 8. MOSFETs
-    for (mos, mc) in netlist_expanded.mosfets.iter().zip(&mos_params) {
-        let m = netlist_expanded
+    for (mos, mc) in mosfets.iter().zip(&mos_params) {
+        let m = netlist
             .mosfet_models
             .get(&mos.model)
             .cloned()
@@ -1716,7 +1720,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
 
     // Add Gmin = 1e-12 only to DC-floating node diagonals (e.g., capacitor-only or isolated gate nodes)
     let mut node_has_dc_device = vec![false; num_nodes];
-    for r in &netlist_expanded.resistors {
+    for r in netlist.resistors.iter().chain(&extra_resistors) {
         if r.n_pos > 0 {
             node_has_dc_device[r.n_pos - 1] = true;
         }
@@ -1724,7 +1728,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
             node_has_dc_device[r.n_neg - 1] = true;
         }
     }
-    for vs in &netlist_expanded.v_sources {
+    for vs in &netlist.v_sources {
         if vs.n_pos > 0 {
             node_has_dc_device[vs.n_pos - 1] = true;
         }
@@ -1732,7 +1736,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
             node_has_dc_device[vs.n_neg - 1] = true;
         }
     }
-    for ind in &netlist_expanded.inductors {
+    for ind in &netlist.inductors {
         if ind.n_pos > 0 {
             node_has_dc_device[ind.n_pos - 1] = true;
         }
@@ -1740,7 +1744,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
             node_has_dc_device[ind.n_neg - 1] = true;
         }
     }
-    for d in &netlist_expanded.diodes {
+    for d in &diodes {
         if d.n_anode > 0 {
             node_has_dc_device[d.n_anode - 1] = true;
         }
@@ -1748,7 +1752,7 @@ pub fn compile_netlist(netlist: &Netlist) -> SimResult<CompiledTopology> {
             node_has_dc_device[d.n_cathode - 1] = true;
         }
     }
-    for m in &netlist_expanded.mosfets {
+    for m in &mosfets {
         if m.n_drain > 0 {
             node_has_dc_device[m.n_drain - 1] = true;
         }
