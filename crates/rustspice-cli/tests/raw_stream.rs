@@ -1,7 +1,8 @@
 //! `rustspice run --raw`: the rawfile is written while the analyses run (`.tran` rows straight from the integrator)
 //! and holds the same plots, bit for bit, as the in-memory result; its failure semantics are those of a rawfile written
-//! at the end: a failed analysis leaves neither the rawfile nor `<raw>.raw.partial`, and an output error (missing
-//! directory, full disk) lets the simulation finish, then exits with code 74 and leaves no file either.
+//! at the end: a failed analysis leaves neither the rawfile nor `<raw>.raw.partial`, a run killed by a signal leaves
+//! nothing either (Linux: the rows go to an unnamed file), and an output error (missing directory, full disk) lets the
+//! simulation finish, then exits with code 74 and leaves no file either.
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -380,4 +381,82 @@ fn without_a_rawfile_memory_does_not_grow_with_the_number_of_rows() {
         long < short + 4 * 1024,
         "peak RSS {short} KiB for 20 000 rows, {long} KiB for 80 000 rows"
     );
+}
+
+/// A run killed by a signal while it streams rows leaves no file behind: until the end the rows go to an unnamed file
+/// (`O_TMPFILE`), which the kernel frees with the process.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_killed_while_streaming_leaves_no_file() {
+    let dir = scratch("killed");
+    // 10 RC sections, 1e6 rows of 12 values: the run takes far longer than it takes to see its file open
+    let mut deck = String::from("RC ladder\nV1 n0 0 PULSE(0 1 1n 1n 1n 20n 40n)\n");
+    for k in 0..10 {
+        deck.push_str(&format!("R{k} n{k} n{} 100\nC{k} n{} 0 1p\n", k + 1, k + 1));
+    }
+    deck.push_str(".tran 10p 10u\n.end\n");
+    let path = dir.join("ladder.sp");
+    std::fs::write(&path, deck).unwrap();
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        let raw = dir.join("ladder.raw");
+        std::fs::write(partial(&raw), b"stale").unwrap();
+        let mut child = Command::new(BIN)
+            .arg("run")
+            .arg(&path)
+            .arg("--raw")
+            .arg(&raw)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // wait for the rawfile to be open: an fd of the child on a deleted (unnamed) file of `dir`
+        let fds = PathBuf::from(format!("/proc/{}/fd", child.id()));
+        let t0 = std::time::Instant::now();
+        let unnamed = loop {
+            let open = std::fs::read_dir(&fds)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .find_map(|e| {
+                    let target = std::fs::read_link(e.path()).ok()?;
+                    target.starts_with(&dir).then_some(target)
+                });
+            if let Some(t) = open.filter(|t| !t.ends_with("ladder.sp")) {
+                break t;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "the run ended before its rawfile was seen open"
+            );
+            assert!(t0.elapsed().as_secs() < 60, "no rawfile opened within 60 s");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        let unnamed = unnamed.to_string_lossy().into_owned();
+        if !unnamed.ends_with("(deleted)") {
+            // the filesystem has no unnamed files: the documented fallback writes `<raw>.raw.partial` directly
+            eprintln!("skipped: no O_TMPFILE support here, the rawfile is written as {unnamed}");
+            child.kill().unwrap();
+            child.wait().unwrap();
+            return;
+        }
+        assert!(
+            !partial(&raw).exists(),
+            "the stale partial file is gone, no new one has a name"
+        );
+        unsafe {
+            assert_eq!(libc::kill(child.id() as libc::pid_t, signal), 0);
+        }
+        let status = child.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(signal),
+            "{status:?}"
+        );
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["ladder.sp"], "signal {signal}");
+    }
 }
