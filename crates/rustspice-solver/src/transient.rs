@@ -378,10 +378,18 @@ const FACTOR_CACHE_FAER_ENTRIES: usize = 4;
 /// corner climbs the same ladder (backward Euler at `h1`, trapezoid at `2 h1`, `4 h1`, ... up to `hmax`) and lands on
 /// the next corner with the same remainder step in every period of a periodic source; refactoring these dominated
 /// large linear transients. Least-recently-used eviction within the bounds above.
+///
+/// The live factors in the solver are the most recently used entry and are never held twice: a hit swaps the cached
+/// factors into the solver and the outgoing live ones into the cache, and the live factors move into the cache just
+/// before a refactorization would overwrite them. The entries, their order and the evictions are those of a cache
+/// that keeps a copy of the live factors as well (the bounds count the live entry), so the factors the integration
+/// uses are the same; only the copies are gone.
 #[derive(Default)]
 struct FactorCache {
-    /// Oldest use first.
+    /// Stored entries, oldest use first; never the entry of the live factors.
     entries: Vec<(f64, FactorSnapshot)>,
+    /// Scale of the solver's live factors when they are an entry of the cache (its most recently used one).
+    live: Option<f64>,
 }
 
 impl FactorCache {
@@ -389,7 +397,8 @@ impl FactorCache {
         (a - b).abs() <= 1e-9 * b
     }
 
-    /// Restores the factors of companion scale `g` into `solver` when they are cached.
+    /// Makes the cached factors of companion scale `g` the solver's live factors when they are cached; the live
+    /// factors they replace stay cached.
     fn restore(&mut self, solver: &mut AdaptiveSparseSolver, g: f64) -> bool {
         let Some(k) = self
             .entries
@@ -398,24 +407,41 @@ impl FactorCache {
         else {
             return false;
         };
-        let e = self.entries.remove(k);
-        let ok = solver.restore_factors(&e.1);
-        if ok {
-            self.entries.push(e);
+        let (s, snap) = self.entries.remove(k);
+        match solver.swap_factors(snap) {
+            Ok(prev) => {
+                if let (Some(f), Some(prev)) = (self.live.take(), prev) {
+                    self.entries.push((f, prev));
+                }
+                self.live = Some(s);
+                true
+            }
+            // factors of an outdated pivot schedule / symbolic structure are dropped
+            Err(_) => false,
         }
-        ok
     }
 
-    fn insert(&mut self, g: f64, snap: FactorSnapshot) {
+    /// Moves the live factors into the stored entries: the solver is about to refactorize, which overwrites them.
+    fn stash_live(&mut self, solver: &mut AdaptiveSparseSolver) {
+        if let Some(f) = self.live.take() {
+            if let Some(snap) = solver.take_factors() {
+                self.entries.push((f, snap));
+            }
+        }
+    }
+
+    /// Makes the solver's freshly factored live factors (holding `known_bytes`, `None` for `faer` factors) the entry
+    /// of scale `g`, evicting the least recently used entries beyond the bounds.
+    fn insert_live(&mut self, g: f64, known_bytes: Option<usize>) {
         self.entries.retain(|(s, _)| !Self::same_scale(*s, g));
-        let (max_entries, max_bytes) = match snap.known_bytes() {
+        let (max_entries, max_bytes) = match known_bytes {
             Some(_) => (FACTOR_CACHE_ENTRIES, FACTOR_CACHE_BYTES),
             None => (FACTOR_CACHE_FAER_ENTRIES, usize::MAX),
         };
         let bytes = |e: &[(f64, FactorSnapshot)]| -> usize {
             e.iter().map(|(_, f)| f.known_bytes().unwrap_or(0)).sum()
         };
-        let need = snap.known_bytes().unwrap_or(0);
+        let need = known_bytes.unwrap_or(0);
         if need > max_bytes {
             return;
         }
@@ -424,7 +450,7 @@ impl FactorCache {
         {
             self.entries.remove(0);
         }
-        self.entries.push((g, snap));
+        self.live = Some(g);
     }
 }
 
@@ -816,6 +842,10 @@ impl TransientSolver {
                     self.solve_linear_cached(topo, linear_solver, &mut x)
                         .map(|()| 1usize)
                 } else {
+                    if is_linear {
+                        // the factorization below overwrites the live factors: keep them cached
+                        factor_cache.stash_live(linear_solver);
+                    }
                     // initial guess for Newton: extrapolation of the last accepted points
                     if self.options.use_predictor
                         && !is_linear
@@ -853,8 +883,8 @@ impl TransientSolver {
                     if is_linear {
                         factored_scale = res.is_ok().then_some(g_scale);
                         if res.is_ok() {
-                            if let Some(snap) = linear_solver.snapshot_factors() {
-                                factor_cache.insert(g_scale, snap);
+                            if let Some(bytes) = linear_solver.live_factor_bytes() {
+                                factor_cache.insert_live(g_scale, bytes);
                             }
                         }
                     }
@@ -1509,5 +1539,116 @@ mod tests {
             restart_step(hmax, true, 10e-12, 10e-12),
             (RESTART_FRACTION * hmax, false)
         );
+    }
+
+    /// `n x n` grid Laplacian with `4 + g` on the diagonal: the companion matrix family `G + g C` of an RC mesh.
+    fn grid(n: usize, g: f64) -> rustspice_core::CscMatrix<f64> {
+        let id = |i: usize, j: usize| i * n + j;
+        let mut coords = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                if i + 1 < n {
+                    coords.extend([(id(i, j), id(i + 1, j)), (id(i + 1, j), id(i, j))]);
+                }
+                if j + 1 < n {
+                    coords.extend([(id(i, j), id(i, j + 1)), (id(i, j + 1), id(i, j))]);
+                }
+            }
+        }
+        let mut m = rustspice_core::CscMatrix::from_pattern(n * n, n * n, &coords);
+        for c in 0..n * n {
+            for k in m.col_ptr[c]..m.col_ptr[c + 1] {
+                m.values[k] = if m.row_idx[k] == c { 4.0 + g } else { -1.0 };
+            }
+        }
+        m
+    }
+
+    /// The cache holds every entry once (the live one in the solver, the others stored), in least-recently-used
+    /// order, and a hit swaps in exactly the factors of its scale: on the unrolled tier and on the `faer` tier (whose
+    /// factors are moved, not copied).
+    #[test]
+    fn factor_cache_swaps_factors_in_lru_order_without_duplicates() {
+        for (n, faer) in [(6, false), (20, true)] {
+            let dim = n * n;
+            let b: Vec<f64> = (0..dim).map(|i| 1.0 + (i % 7) as f64).collect();
+            let compile = || AdaptiveSparseSolver::compile(&grid(n, 1.0)).unwrap();
+            let mut solver = compile();
+            assert_eq!(
+                solver.kind == crate::LinearSolverKind::FaerSupernodal,
+                faer,
+                "{n}x{n} grid: tier {:?}",
+                solver.kind
+            );
+            // the solution of every scale from a solver of its own
+            let scales = [1.0, 2.0, 3.0, 4.0, 5.0];
+            let reference = |g: f64| {
+                let mut s = compile();
+                let mut x = vec![0.0; dim];
+                s.factorize_and_solve(&grid(n, g), &b, &mut x).unwrap();
+                s.solve_cached(&b, &mut x).unwrap();
+                x
+            };
+            let solve_live = |s: &mut AdaptiveSparseSolver| {
+                let mut x = vec![0.0; dim];
+                s.solve_cached(&b, &mut x).unwrap();
+                x
+            };
+            let mut cache = FactorCache::default();
+            let mut x = vec![0.0; dim];
+            for &g in &scales {
+                cache.stash_live(&mut solver);
+                // the live factors moved into the cache
+                assert!(cache.live.is_none() && !solver.has_valid_factorization());
+                solver.factorize_and_solve(&grid(n, g), &b, &mut x).unwrap();
+                cache.insert_live(g, solver.live_factor_bytes().unwrap());
+            }
+            // entries held, the live one included (unrolled factors: up to 8)
+            let held = if faer {
+                FACTOR_CACHE_FAER_ENTRIES
+            } else {
+                scales.len()
+            };
+            assert_eq!(cache.live, Some(5.0));
+            assert_eq!(
+                cache.entries.len() + 1,
+                held,
+                "the live entry is not stored twice"
+            );
+            let keys = |c: &FactorCache| c.entries.iter().map(|(s, _)| *s).collect::<Vec<_>>();
+            if faer {
+                // four entries: the oldest scale was evicted
+                assert_eq!(keys(&cache), [2.0, 3.0, 4.0]);
+                assert!(!cache.restore(&mut solver, 1.0));
+            } else {
+                assert_eq!(keys(&cache), [1.0, 2.0, 3.0, 4.0]);
+            }
+            // a hit makes its factors live (bit-identical solution) and keeps the outgoing ones as the newest entry
+            assert!(cache.restore(&mut solver, 3.0));
+            assert_eq!(solve_live(&mut solver), reference(3.0));
+            assert_eq!(cache.live, Some(3.0));
+            assert_eq!(*keys(&cache).last().unwrap(), 5.0);
+            assert!(cache.restore(&mut solver, 5.0));
+            assert_eq!(solve_live(&mut solver), reference(5.0));
+            assert!(cache.restore(&mut solver, 2.0));
+            assert_eq!(solve_live(&mut solver), reference(2.0));
+            assert_eq!(cache.entries.len() + 1, held);
+            // a refactorization at a new scale keeps the live factors cached and evicts the least recently used
+            cache.stash_live(&mut solver);
+            solver
+                .factorize_and_solve(&grid(n, 6.0), &b, &mut x)
+                .unwrap();
+            cache.insert_live(6.0, solver.live_factor_bytes().unwrap());
+            assert_eq!(cache.live, Some(6.0));
+            if faer {
+                assert_eq!(keys(&cache), [3.0, 5.0, 2.0]);
+            } else {
+                assert_eq!(keys(&cache), [1.0, 4.0, 3.0, 5.0, 2.0]);
+            }
+            assert!(cache.restore(&mut solver, 2.0));
+            assert_eq!(solve_live(&mut solver), reference(2.0));
+            assert!(cache.restore(&mut solver, 6.0));
+            assert_eq!(solve_live(&mut solver), reference(6.0));
+        }
     }
 }
