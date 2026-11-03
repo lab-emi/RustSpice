@@ -546,9 +546,21 @@ struct RefSpec {
     options: Option<String>,
     tmax: Option<f64>,
     label: &'static str,
+    /// `.save` card of a transient reference whose comparison needs only the declared probes: the rawfile of a
+    /// reference sampled far below `tstep` then holds `time` and the probes instead of every vector (with a few
+    /// hundred nodes, hundreds of MB the suite would read back).
+    save: Option<String>,
 }
 
 fn ref_spec(case: &Case, has_tran: bool) -> RefSpec {
+    let mut spec = ref_spec_options(case, has_tran);
+    if has_tran && (spec.options.is_some() || spec.tmax.is_some()) {
+        spec.save = meta::save_line(&case.meta.probes);
+    }
+    spec
+}
+
+fn ref_spec_options(case: &Case, has_tran: bool) -> RefSpec {
     let m = &case.meta;
     let base_tstep = m
         .series_tstep
@@ -570,6 +582,7 @@ fn ref_spec(case: &Case, has_tran: bool) -> RefSpec {
             options: None,
             tmax: None,
             label: "as_is",
+            save: None,
         },
         RefMode::Default => {
             if has_tran {
@@ -577,12 +590,14 @@ fn ref_spec(case: &Case, has_tran: bool) -> RefSpec {
                     options: Some(TRAN_REF_OPTIONS.to_string()),
                     tmax: m.ref_tmax.or(auto_tmax),
                     label: "converged_tran",
+                    save: None,
                 }
             } else {
                 RefSpec {
                     options: Some(TIGHT_OPTIONS.to_string()),
                     tmax: None,
                     label: "tight",
+                    save: None,
                 }
             }
         }
@@ -590,6 +605,7 @@ fn ref_spec(case: &Case, has_tran: bool) -> RefSpec {
             options: Some(TIGHT_OPTIONS.to_string()),
             tmax: m.ref_tmax,
             label: "tight",
+            save: None,
         },
         // literal options replace the default tolerances, the step limit stays tstep/20 unless `bench.ref.tmax`
         RefMode::Options(o) => RefSpec {
@@ -600,6 +616,7 @@ fn ref_spec(case: &Case, has_tran: bool) -> RefSpec {
                 m.ref_tmax
             },
             label: "options",
+            save: None,
         },
     }
 }
@@ -871,6 +888,7 @@ fn run_ng(
     text: &[u8],
     solver: NgSolver,
     want_plots: bool,
+    keep: Option<&[String]>,
     r: &mut CaseResult,
 ) -> Result<ngspice::NgRun, String> {
     let deck = dir.join(format!("{name}.sp"));
@@ -881,6 +899,7 @@ fn run_ng(
         cwd: Some(&cwd),
         ignore_log_failures: case.meta.ngspice_error_ok(),
         retry_on_signal: true,
+        keep,
     };
     // a deck that selects KLU itself (`.options klu`) legitimately runs KLU whatever the harness asked for
     let expect_solver = if meta::deck_selects_klu(&String::from_utf8_lossy(text)) {
@@ -1274,7 +1293,7 @@ fn run_case_inner(ctx: &mut Ctx, case: &Case, r: &mut CaseResult) {
             }
         };
         let name = format!("ng_{}", sv.as_str());
-        let run = match run_ng(ctx, case, &dir, &name, &text, sv, k == 0, r) {
+        let run = match run_ng(ctx, case, &dir, &name, &text, sv, k == 0, None, r) {
             Ok(run) => run,
             Err(e) => {
                 harness_failure(r, e);
@@ -1380,19 +1399,31 @@ fn run_case_inner(ctx: &mut Ctx, case: &Case, r: &mut CaseResult) {
         } else {
             match ng_deck_bytes(case, primary, spec.options.as_deref(), spec.tmax) {
                 Ok(text) => {
-                    let mut run = match run_ng(ctx, case, &dir, "ng_ref", &text, primary, true, r) {
-                        Ok(run) => run,
-                        Err(e) => {
-                            r.status = Status::Unverified;
-                            r.notes.push(e);
-                            return;
-                        }
+                    let text = match &spec.save {
+                        Some(save) => meta::inject_line_bytes(&text, save),
+                        None => text,
                     };
+                    // only the axis and the probes of the reference are compared: the other columns are not read
+                    let keep = (!m.probes.is_empty()).then_some(m.probes.as_slice());
+                    let mut run =
+                        match run_ng(ctx, case, &dir, "ng_ref", &text, primary, true, keep, r) {
+                            Ok(run) => run,
+                            Err(e) => {
+                                r.status = Status::Unverified;
+                                r.notes.push(e);
+                                return;
+                            }
+                        };
                     let label = format!(
-                        "{}{}",
+                        "{}{}{}",
                         spec.options.clone().unwrap_or_default(),
                         spec.tmax
-                            .map_or(String::new(), |t| format!(" tmax={t:.3e}"))
+                            .map_or(String::new(), |t| format!(" tmax={t:.3e}")),
+                        if spec.save.is_some() {
+                            " save=probes"
+                        } else {
+                            ""
+                        }
                     );
                     let rss_kib = run.child.max_rss_kib;
                     if run.class == NgClass::Ok {
@@ -2344,6 +2375,7 @@ fn timed_run(
                 ignore_log_failures: ng_ignore_log_failures,
                 // a non-deterministic crash costs the repetition its sample, not the whole timing
                 retry_on_signal: true,
+                keep: None,
             };
             let run = ngspice::run_opts(
                 &ctx.args.ngspice,
@@ -3666,6 +3698,23 @@ mod tests {
         // a parameterised stop time still gets the tmax from the numeric time step
         let p = tran.replace(".tran 10n 1u", ".tran 10n {1u*n}");
         assert_eq!(ref_spec(&one_case(&p, "r"), true).tmax, Some(10e-9 / 20.0));
+    }
+
+    #[test]
+    fn a_transient_reference_saves_only_the_declared_probes() {
+        let tran = "t\n* bench.id: r\n* bench.group: accuracy\n* bench.probes: v(out), i(v1)\n* bench.ref: reltol=1e-9 abstol=1e-15\nV1 a 0 1\nR1 a out 1\nC1 out 0 1n\n.tran 10n 1u\n.end\n";
+        let s = ref_spec(&one_case(tran, "r"), true);
+        assert_eq!(s.save.as_deref(), Some(".save v(out) i(v1)"));
+        let deck = meta::inject_line_bytes(tran.as_bytes(), s.save.as_deref().unwrap());
+        assert!(deck.starts_with(b"t\n.save v(out) i(v1)\n* bench.id: r\n"));
+        // no probes, a probe name whose `.save` spelling is not checked, no transient, no reference run: no `.save`
+        let none = tran.replace("* bench.probes: v(out), i(v1)\n", "");
+        assert_eq!(ref_spec(&one_case(&none, "r"), true).save, None);
+        let odd = tran.replace("v(out), i(v1)", "v(out), v(bus[1])");
+        assert_eq!(ref_spec(&one_case(&odd, "r"), true).save, None);
+        assert_eq!(ref_spec(&one_case(tran, "r"), false).save, None);
+        let as_is = tran.replace("reltol=1e-9 abstol=1e-15", "none");
+        assert_eq!(ref_spec(&one_case(&as_is, "r"), true).save, None);
     }
 
     #[test]

@@ -144,7 +144,7 @@ fn read_line(data: &[u8], pos: &mut usize) -> Option<String> {
 
 /// Parse every plot in `data`.
 pub fn parse(data: &[u8]) -> Result<Vec<Plot>, RawError> {
-    let loaded = parse_all(data, false)?;
+    let loaded = parse_all(data, false, None)?;
     Ok(loaded.plots)
 }
 
@@ -158,11 +158,18 @@ pub struct Loaded {
 
 /// [`parse`] that skips binary complex plots instead of failing (the suite compares real plots only).
 pub fn parse_lenient(data: &[u8]) -> Result<Loaded, RawError> {
-    parse_all(data, true)
+    parse_all(data, true, None)
 }
 
 /// [`read_file`] with [`parse_lenient`].
 pub fn read_file_lenient(path: &Path) -> Result<Loaded, RawError> {
+    read_file_lenient_keep(path, None)
+}
+
+/// [`read_file_lenient`] keeping, of every plot, only the axis (the first variable) and the variables named in `keep`
+/// (`None`: all of them). The other columns are skipped while reading, so a reference with many vectors costs the
+/// memory of the few the comparison uses.
+pub fn read_file_lenient_keep(path: &Path, keep: Option<&[String]>) -> Result<Loaded, RawError> {
     let meta =
         std::fs::metadata(path).map_err(|e| RawError::Io(format!("{}: {e}", path.display())))?;
     if meta.len() > MAX_PLOT_BYTES {
@@ -174,10 +181,10 @@ pub fn read_file_lenient(path: &Path) -> Result<Loaded, RawError> {
         )));
     }
     let data = std::fs::read(path).map_err(|e| RawError::Io(format!("{}: {e}", path.display())))?;
-    parse_lenient(&data)
+    parse_all(&data, true, keep)
 }
 
-fn parse_all(data: &[u8], lenient: bool) -> Result<Loaded, RawError> {
+fn parse_all(data: &[u8], lenient: bool, keep: Option<&[String]>) -> Result<Loaded, RawError> {
     let mut out = Loaded::default();
     let mut pos = 0usize;
     let mut any = false;
@@ -190,7 +197,7 @@ fn parse_all(data: &[u8], lenient: bool) -> Result<Loaded, RawError> {
             break;
         }
         any = true;
-        match parse_plot(data, &mut pos, lenient)? {
+        match parse_plot(data, &mut pos, lenient, keep)? {
             Parsed::Plot(p) => out.plots.push(p),
             Parsed::Skipped(name) => out.skipped.push(name),
         }
@@ -206,7 +213,12 @@ enum Parsed {
     Skipped(String),
 }
 
-fn parse_plot(data: &[u8], pos: &mut usize, lenient: bool) -> Result<Parsed, RawError> {
+fn parse_plot(
+    data: &[u8],
+    pos: &mut usize,
+    lenient: bool,
+    keep: Option<&[String]>,
+) -> Result<Parsed, RawError> {
     let mut title = String::new();
     let mut plotname = String::new();
     let mut flags = String::new();
@@ -317,7 +329,15 @@ fn parse_plot(data: &[u8], pos: &mut usize, lenient: bool) -> Result<Parsed, Raw
             "plot `{plotname}` is {nv} vars x {np} points = {bytes} bytes (> {MAX_PLOT_BYTES})"
         )));
     }
-    let mut cols: Vec<Vec<f64>> = (0..nv).map(|_| Vec::new()).collect();
+    // column of every variable in `cols`: all of them, or only the axis and the `keep` vectors
+    let mut slot: Vec<Option<usize>> = Vec::with_capacity(nv);
+    let mut kept = 0usize;
+    for (i, v) in vars.iter().enumerate() {
+        let read = i == 0 || keep.is_none_or(|names| names.contains(&v.name));
+        slot.push(read.then_some(kept));
+        kept += usize::from(read);
+    }
+    let mut cols: Vec<Vec<f64>> = (0..kept).map(|_| Vec::new()).collect();
     if binary {
         let need = bytes as usize;
         if data.len() - (*pos).min(data.len()) < need {
@@ -332,9 +352,11 @@ fn parse_plot(data: &[u8], pos: &mut usize, lenient: bool) -> Result<Parsed, Raw
             c.reserve_exact(np);
         }
         for (k, i) in (0..need).step_by(8).enumerate() {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&block[i..i + 8]);
-            cols[k % nv].push(f64::from_le_bytes(b));
+            if let Some(c) = slot[k % nv] {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&block[i..i + 8]);
+                cols[c].push(f64::from_le_bytes(b));
+            }
         }
     } else {
         for p in 0..np {
@@ -355,9 +377,18 @@ fn parse_plot(data: &[u8], pos: &mut usize, lenient: bool) -> Result<Parsed, Raw
                 let v: f64 = t
                     .parse()
                     .map_err(|_| RawError::Malformed(format!("bad number `{t}` at point {p}")))?;
-                cols[i].push(v);
+                if let Some(c) = slot[i] {
+                    cols[c].push(v);
+                }
             }
         }
+    }
+    if kept < nv {
+        vars = vars
+            .into_iter()
+            .zip(&slot)
+            .filter_map(|(v, c)| c.map(|_| v))
+            .collect();
     }
     Ok(Parsed::Plot(Plot {
         title,
@@ -596,6 +627,37 @@ mod tests {
             deferred_points_value(usize::MAX).len(),
             DEFERRED_POINTS_WIDTH
         );
+    }
+
+    #[test]
+    fn keep_reads_only_the_axis_and_the_named_vectors() {
+        let mut plots = sample();
+        plots[1].vars.push(Var {
+            name: "v(b)".into(),
+            kind: "voltage".into(),
+        });
+        plots[1].cols.push(vec![7.0, 8.0, 9.0]);
+        let mut buf = Vec::new();
+        write(&mut buf, &plots).unwrap();
+        let path = std::env::temp_dir().join(format!("rawfile_keep_{}.raw", std::process::id()));
+        std::fs::write(&path, &buf).unwrap();
+        let keep = vec!["v(b)".to_string()];
+        let got = read_file_lenient_keep(&path, Some(&keep)).unwrap().plots;
+        let _ = std::fs::remove_file(&path);
+        // the axis (first variable) always stays; an absent name is simply not there
+        assert_eq!(got[0].vars, plots[0].vars[..1]);
+        assert_eq!(got[0].cols, plots[0].cols[..1]);
+        let names: Vec<&str> = got[1].vars.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["time", "v(b)"]);
+        assert_eq!(
+            got[1].cols,
+            vec![plots[1].cols[0].clone(), plots[1].cols[2].clone()]
+        );
+        assert_eq!(got[1].npoints, 3);
+        // ASCII plots too
+        let txt = "Title: x\nPlotname: DC transfer characteristic\nFlags: real\nNo. Variables: 3\nNo. Points: 2\nVariables:\n\t0\tV(v-sweep)\tvoltage\n\t1\tV1#branch\tcurrent\n\t2\tv(b)\tvoltage\nValues:\n 0\t0.0\n\t-1.0e-3\n\t5\n 1\t1.0\n\t-2.0e-3\n\t6\n";
+        let p = parse_all(txt.as_bytes(), true, Some(&keep)).unwrap().plots;
+        assert_eq!(p[0].cols, vec![vec![0.0, 1.0], vec![5.0, 6.0]]);
     }
 
     #[test]
