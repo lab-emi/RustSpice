@@ -122,8 +122,9 @@ both simulators), may appear anywhere after the title line, one key per line:
 2. **ngspice reference run** per `bench.ref` (temp copy of the deck with the options injected; tran gets `tmax`).
    If the reference run fails, fall back to the as-is run and note `ref_status: "fell_back"`. A transient reference of
    a case with `bench.probes` (plain `v(<node>)` / `i(<source>)` names) also gets `.save <probes>`
-   (`ref_options` ends in `save=probes`), and of any case with probes only the axis and the probes are read back:
-   a reference sampled far below `tstep` then costs a few columns, not every vector of the circuit.
+   (`ref_options` ends in `save=probes`), and of any case with probes only the axis and the probes are read back.
+   Rawfiles are read through a buffer, row by row, and only the columns kept are held (never the whole file), so a
+   reference sampled far below `tstep` costs a few columns even when the `.save` could not be injected.
 3. **RustSpice correctness run**: subprocess `current_exe run <deck> --raw <tmp>/rs.raw --stats <tmp>/rs.json` under
    the same watchdog/RSS cap; exit code 101 or SIGABRT/SIGSEGV = `panic`; hang = `timeout`; stderr captured.
 4. **Timing** (only when `bench.timing`=yes and steps 1 and 3 succeeded and `--no-timing` absent): `--reps` (default 7,
