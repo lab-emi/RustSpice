@@ -1596,6 +1596,8 @@ fn run_case_inner(ctx: &mut Ctx, case: &Case, r: &mut CaseResult) {
             pass: c.pass,
             err_rs: c.err_rs,
             err_ng: c.err_ng,
+            err_rs_own: c.err_rs_own,
+            err_ng_own: c.err_ng_own,
             within_ng_error: c.within_ng_error,
             interp_floor: c.interp_floor,
             points_rs: c.points_rs,

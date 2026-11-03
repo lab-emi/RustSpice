@@ -143,8 +143,13 @@ pub struct TimingResult {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct AccuracySummary {
     pub pass: Option<bool>,
+    /// Transient: the value at the nominal `k * tstep` grid, each simulator's waveform read there by linear
+    /// interpolation between its rows (RustSpice writes its rows on that grid; ngspice's are resampled).
     pub err_rs: Option<f64>,
     pub err_ng: Option<f64>,
+    /// Transient only, EVIDENCE: each simulator at its own rows (`own_grid_err` / `ng_own_err` of the probes).
+    pub err_rs_own: Option<f64>,
+    pub err_ng_own: Option<f64>,
     pub within_ng_error: Option<bool>,
     pub interp_floor: Option<f64>,
     pub points_rs: Option<usize>,
