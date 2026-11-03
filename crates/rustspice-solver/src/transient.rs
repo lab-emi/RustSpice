@@ -133,6 +133,71 @@ pub struct TranResult {
     pub rejected_steps: usize,
 }
 
+/// Receives the output rows of a transient analysis while it runs (see
+/// [`TransientSolver::solve_transient_spec_into`]): a caller that writes the rows out (a rawfile) or reduces them
+/// never holds the whole waveform, whose size is `rows x MNA dimension x 8` bytes.
+pub trait TranSink {
+    /// Called once before the first row (after the start point has been solved), with the exact number of rows
+    /// when it is known in advance (always, unless [`TranOptions::internal_points`] is set) and the MNA dimension
+    /// (the length of every row's `x`).
+    fn begin(&mut self, rows: Option<usize>, dim: usize) -> SimResult<()> {
+        let _ = (rows, dim);
+        Ok(())
+    }
+
+    /// One output row: its time and the full MNA solution there. `x` is only valid during the call. An error stops
+    /// the analysis and is returned by it.
+    fn row(&mut self, t: f64, x: &[f64]) -> SimResult<()>;
+}
+
+/// A [`TranSink`] that drops every row: the analysis runs in memory independent of its length and only the
+/// counters of [`TranStats`] remain.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DiscardRows;
+
+impl TranSink for DiscardRows {
+    #[inline]
+    fn row(&mut self, _t: f64, _x: &[f64]) -> SimResult<()> {
+        Ok(())
+    }
+}
+
+/// Counters of a transient analysis whose rows went to a [`TranSink`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TranStats {
+    /// Rows handed to the sink.
+    pub rows: usize,
+    pub total_nr_iterations: usize,
+    pub lu_factorizations: usize,
+    /// Internal integration steps that were accepted.
+    pub accepted_steps: usize,
+    /// Internal steps repeated with a smaller step (LTE above tolerance or Newton failure).
+    pub rejected_steps: usize,
+}
+
+/// The in-memory sink behind [`TransientSolver::solve_transient_spec`] (a [`TranResult`]).
+#[derive(Default)]
+struct CollectRows {
+    time_points: Vec<f64>,
+    waveforms: Vec<Vec<f64>>,
+}
+
+impl TranSink for CollectRows {
+    fn begin(&mut self, rows: Option<usize>, _dim: usize) -> SimResult<()> {
+        if let Some(n) = rows {
+            self.time_points.reserve_exact(n);
+            self.waveforms.reserve_exact(n);
+        }
+        Ok(())
+    }
+
+    fn row(&mut self, t: f64, x: &[f64]) -> SimResult<()> {
+        self.time_points.push(t);
+        self.waveforms.push(x.to_vec());
+        Ok(())
+    }
+}
+
 /// High-speed Transient Integrator.
 pub struct TransientSolver {
     pub options: TranOptions,
@@ -283,25 +348,24 @@ fn step_end(t: f64, h: f64, lands: bool, stop: f64, next_row: Option<f64>) -> f6
 }
 
 /// Value at `tau` of the polynomial through the points `(t_k, y_k)`: quadratic, or linear when the third time is
-/// `NaN` (Lagrange form, evaluated per unknown).
-fn interpolate_row(tau: f64, pts: [(f64, &Vec<f64>); 3]) -> Vec<f64> {
+/// `NaN` (Lagrange form, evaluated per unknown), written into `out` (its previous contents are replaced).
+fn interpolate_row_into(tau: f64, pts: [(f64, &[f64]); 3], out: &mut Vec<f64>) {
     let [(ta, ya), (tb, yb), (tc, yc)] = pts;
+    out.clear();
     if tc.is_nan() {
         let wa = (tau - tb) / (ta - tb);
-        return ya
-            .iter()
-            .zip(yb)
-            .map(|(a, b)| wa * a + (1.0 - wa) * b)
-            .collect();
+        out.extend(ya.iter().zip(yb).map(|(a, b)| wa * a + (1.0 - wa) * b));
+        return;
     }
     let la = (tau - tb) * (tau - tc) / ((ta - tb) * (ta - tc));
     let lb = (tau - ta) * (tau - tc) / ((tb - ta) * (tb - tc));
     let lc = (tau - ta) * (tau - tb) / ((tc - ta) * (tc - tb));
-    ya.iter()
-        .zip(yb)
-        .zip(yc)
-        .map(|((a, b), c)| la * a + lb * b + lc * c)
-        .collect()
+    out.extend(
+        ya.iter()
+            .zip(yb)
+            .zip(yc)
+            .map(|((a, b), c)| la * a + lb * b + lc * c),
+    );
 }
 
 /// Bounds of [`FactorCache`]: entries whose size is known (unrolled / dense factors) and their total bytes, and
@@ -411,7 +475,8 @@ impl TransientSolver {
         )
     }
 
-    /// Runs the transient analysis a `.tran` card describes (see [`TranSpec`]).
+    /// Runs the transient analysis a `.tran` card describes (see [`TranSpec`]) and returns every output row in
+    /// memory. Use [`Self::solve_transient_spec_into`] when the rows are written out or reduced as they come.
     pub fn solve_transient_spec(
         &mut self,
         topo: &mut CompiledTopology,
@@ -421,6 +486,39 @@ impl TransientSolver {
         spec: &TranSpec,
         initial_conditions: &rustc_hash::FxHashMap<usize, f64>,
     ) -> SimResult<TranResult> {
+        let mut rows = CollectRows::default();
+        let stats = self.solve_transient_spec_into(
+            topo,
+            backend,
+            linear_solver,
+            nonlinear_solver,
+            spec,
+            initial_conditions,
+            &mut rows,
+        )?;
+        Ok(TranResult {
+            time_points: rows.time_points,
+            waveforms: rows.waveforms,
+            total_nr_iterations: stats.total_nr_iterations,
+            lu_factorizations: stats.lu_factorizations,
+            accepted_steps: stats.accepted_steps,
+            rejected_steps: stats.rejected_steps,
+        })
+    }
+
+    /// [`Self::solve_transient_spec`] handing every output row to `sink` as soon as it is known instead of storing
+    /// it: memory does not grow with the number of rows. The rows are the same, bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn solve_transient_spec_into(
+        &mut self,
+        topo: &mut CompiledTopology,
+        backend: &dyn ComputeBackend,
+        linear_solver: &mut AdaptiveSparseSolver,
+        nonlinear_solver: &mut NonlinearSolver,
+        spec: &TranSpec,
+        initial_conditions: &rustc_hash::FxHashMap<usize, f64>,
+        sink: &mut dyn TranSink,
+    ) -> SimResult<TranStats> {
         // SPICE timing defaults (PULSE rise / fall = tstep, SIN frequency = 1/tstop, ...) depend on this `.tran`
         // card: resolve them on the source tables for this run and put the card values back afterwards
         let soa = &mut topo.soa;
@@ -446,6 +544,7 @@ impl TransientSolver {
             nonlinear_solver,
             spec,
             initial_conditions,
+            sink,
         );
         if let Some((v, i)) = saved {
             topo.soa.vsrc_waveforms = v;
@@ -454,6 +553,7 @@ impl TransientSolver {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_spec(
         &mut self,
         topo: &mut CompiledTopology,
@@ -462,7 +562,8 @@ impl TransientSolver {
         nonlinear_solver: &mut NonlinearSolver,
         spec: &TranSpec,
         initial_conditions: &rustc_hash::FxHashMap<usize, f64>,
-    ) -> SimResult<TranResult> {
+        sink: &mut dyn TranSink,
+    ) -> SimResult<TranStats> {
         let TranSpec {
             tstep,
             tstop,
@@ -541,12 +642,19 @@ impl TransientSolver {
         self.ind_i_prev3.extend_from_slice(&topo.soa.ind_i_prev);
 
         let mut grid = OutputGrid::new(tstep, tstop, tstart);
-        let est_rows = grid.remaining();
-        let mut time_points = Vec::with_capacity(est_rows);
-        let mut waveforms = Vec::with_capacity(est_rows);
+        // without internal points the grid is every row there will be (`remaining` is exact)
+        sink.begin(
+            (!self.options.internal_points).then_some(grid.remaining()),
+            dim,
+        )?;
+        // rows handed to the sink, the time of the last one, and the buffer of interpolated rows
+        let mut n_rows = 0usize;
+        let mut last_row_t: Option<f64> = None;
+        let mut row_buf: Vec<f64> = Vec::with_capacity(dim);
         if grid.peek() == Some(0.0) {
-            time_points.push(0.0);
-            waveforms.push(x.clone());
+            sink.row(0.0, &x)?;
+            n_rows += 1;
+            last_row_t = Some(0.0);
             grid.advance();
         }
 
@@ -612,7 +720,7 @@ impl TransientSolver {
 
         let mut t = 0.0_f64;
         while grid.peek().is_some() {
-            if time_points.len() as u64 >= point_cap {
+            if n_rows as u64 >= point_cap {
                 return Err(SimError::ResourceLimit {
                     resource: "transient_points",
                     requested: format!(
@@ -648,8 +756,9 @@ impl TransientSolver {
                     if stop_is_bp && t_out > t + teps {
                         break;
                     }
-                    time_points.push(t_out);
-                    waveforms.push(x_acc.clone());
+                    sink.row(t_out, &x_acc)?;
+                    n_rows += 1;
+                    last_row_t = Some(t_out);
                     grid.advance();
                 }
                 if stop_is_bp {
@@ -812,30 +921,34 @@ impl TransientSolver {
             // 2. Accept the step, writing the rows it passes
             let t_new = step_end(t, h, lands, stop, grid.peek());
             while let Some(t_out) = grid.peek() {
-                if t_out > t_new + teps || time_points.len() as u64 >= point_cap {
+                if t_out > t_new + teps || n_rows as u64 >= point_cap {
                     break;
                 }
-                let row =
-                    if (t_out - t_new).abs() <= teps || (jump_restart && stage == Stage::Startup) {
-                        x.clone()
-                    } else if n_hist >= 2 {
-                        interpolate_row(t_out, [(t_new, &x), (t, &x_acc), (t_hist[1], &x_acc_prev)])
+                if (t_out - t_new).abs() <= teps || (jump_restart && stage == Stage::Startup) {
+                    sink.row(t_out, &x)?;
+                } else {
+                    let third = if n_hist >= 2 {
+                        (t_hist[1], x_acc_prev.as_slice())
                     } else {
-                        interpolate_row(t_out, [(t_new, &x), (t, &x_acc), (f64::NAN, &x_acc)])
+                        (f64::NAN, x_acc.as_slice())
                     };
-                time_points.push(t_out);
-                waveforms.push(row);
+                    interpolate_row_into(t_out, [(t_new, &x), (t, &x_acc), third], &mut row_buf);
+                    sink.row(t_out, &row_buf)?;
+                }
+                n_rows += 1;
+                last_row_t = Some(t_out);
                 grid.advance();
             }
             // an accepted step between two rows: the solution there is exact, not interpolated
             if self.options.internal_points
                 && t_new >= tstart
-                && time_points.last().is_none_or(|&tl| t_new > tl + teps)
+                && last_row_t.is_none_or(|tl| t_new > tl + teps)
                 && grid.peek().is_some_and(|tr| t_new < tr - teps)
-                && ((time_points.len() + grid.remaining()) as u64) < point_cap
+                && ((n_rows + grid.remaining()) as u64) < point_cap
             {
-                time_points.push(t_new);
-                waveforms.push(x.clone());
+                sink.row(t_new, &x)?;
+                n_rows += 1;
+                last_row_t = Some(t_new);
             }
             self.cap_v_prev3.copy_from_slice(&topo.soa.cap_v_prev2);
             self.ind_i_prev3.copy_from_slice(&topo.soa.ind_i_prev2);
@@ -919,9 +1032,8 @@ impl TransientSolver {
         }
 
         topo.soa.is_transient = false;
-        Ok(TranResult {
-            time_points,
-            waveforms,
+        Ok(TranStats {
+            rows: n_rows,
             total_nr_iterations,
             lu_factorizations,
             accepted_steps,

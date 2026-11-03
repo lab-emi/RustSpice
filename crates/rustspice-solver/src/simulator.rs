@@ -14,7 +14,7 @@ use rustspice_core::{
 use crate::adjoint::{AdjointGradientResult, AdjointSensitivityEngine, ParameterGradSpec};
 use crate::linear::AdaptiveSparseSolver;
 use crate::nonlinear::{DcOpResult, DcSweepResult, NonlinearSolver, NrOptions};
-use crate::transient::{TranOptions, TranResult, TranSpec, TransientSolver};
+use crate::transient::{TranOptions, TranResult, TranSink, TranSpec, TranStats, TransientSolver};
 
 #[derive(Clone, Copy, PartialEq)]
 enum SweepVar {
@@ -276,6 +276,24 @@ impl Simulator {
             &mut self.nonlinear_solver,
             spec,
             &self.netlist.initial_conditions,
+        )
+    }
+
+    /// [`Self::run_transient_spec`] handing every output row to `sink` as it is produced instead of storing it
+    /// (see [`TranSink`]): memory stays independent of the number of rows.
+    pub fn run_transient_spec_into(
+        &mut self,
+        spec: &TranSpec,
+        sink: &mut dyn TranSink,
+    ) -> SimResult<TranStats> {
+        self.transient_solver.solve_transient_spec_into(
+            &mut self.topology,
+            self.backend.as_ref(),
+            &mut self.linear_solver,
+            &mut self.nonlinear_solver,
+            spec,
+            &self.netlist.initial_conditions,
+            sink,
         )
     }
 

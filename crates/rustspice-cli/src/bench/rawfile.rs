@@ -375,25 +375,64 @@ fn parse_plot(data: &[u8], pos: &mut usize, lenient: bool) -> Result<Parsed, Raw
 /// `rustspice`, an empty value and `n/a` do not. The line therefore carries an `ngspice-` prefixed, non-runnable text.
 pub const HEADER_COMMAND: &str = "ngspice-compatible rawfile written by rustspice";
 
-fn write_header<W: Write>(
+/// Width of the `No. Points:` value of a header written before the point count is known
+/// ([`write_header_deferred`]): spaces, overwritten by [`deferred_points_value`] once the plot is complete (the way
+/// ngspice streams its rawfile; readers trim the value).
+pub const DEFERRED_POINTS_WIDTH: usize = 20;
+
+/// Header text up to and including `No. Points: `.
+fn header_head(title: &str, plotname: &str, vars: &[Var]) -> String {
+    format!(
+        "Title: {}\nDate: n/a\nCommand: {HEADER_COMMAND}\nPlotname: {}\nFlags: real\nNo. Variables: {}\nNo. Points: ",
+        title.replace('\n', " "),
+        plotname,
+        vars.len(),
+    )
+}
+
+/// Header text after the `No. Points:` value, through `Binary:`.
+fn write_header_tail<W: Write>(w: &mut W, vars: &[Var]) -> std::io::Result<()> {
+    w.write_all(b"\nVariables:\n")?;
+    for (i, v) in vars.iter().enumerate() {
+        writeln!(w, "\t{}\t{}\t{}", i, v.name, v.kind)?;
+    }
+    w.write_all(b"Binary:\n")
+}
+
+/// The header of a binary plot of `npoints` rows.
+pub fn write_header<W: Write>(
     w: &mut W,
     title: &str,
     plotname: &str,
     vars: &[Var],
     npoints: usize,
 ) -> std::io::Result<()> {
-    write!(
-        w,
-        "Title: {}\nDate: n/a\nCommand: {HEADER_COMMAND}\nPlotname: {}\nFlags: real\nNo. Variables: {}\nNo. Points: {}\nVariables:\n",
-        title.replace('\n', " "),
-        plotname,
-        vars.len(),
-        npoints
-    )?;
-    for (i, v) in vars.iter().enumerate() {
-        writeln!(w, "\t{}\t{}\t{}", i, v.name, v.kind)?;
-    }
-    w.write_all(b"Binary:\n")
+    write!(w, "{}{}", header_head(title, plotname, vars), npoints)?;
+    write_header_tail(w, vars)
+}
+
+/// [`write_header`] for a plot whose row count is not known yet: the `No. Points:` value is
+/// [`DEFERRED_POINTS_WIDTH`] spaces. Returns the offset of that value from the first byte written, where
+/// [`deferred_points_value`] goes once the rows are written.
+pub fn write_header_deferred<W: Write>(
+    w: &mut W,
+    title: &str,
+    plotname: &str,
+    vars: &[Var],
+) -> std::io::Result<u64> {
+    let head = header_head(title, plotname, vars);
+    w.write_all(head.as_bytes())?;
+    w.write_all(&[b' '; DEFERRED_POINTS_WIDTH])?;
+    write_header_tail(w, vars)?;
+    Ok(head.len() as u64)
+}
+
+/// The `No. Points:` value of a deferred header: `npoints` left-aligned in [`DEFERRED_POINTS_WIDTH`] bytes.
+pub fn deferred_points_value(npoints: usize) -> [u8; DEFERRED_POINTS_WIDTH] {
+    let mut v = [b' '; DEFERRED_POINTS_WIDTH];
+    let digits = npoints.to_string();
+    v[..digits.len()].copy_from_slice(digits.as_bytes());
+    v
 }
 
 /// Write plots in ngspice binary rawfile layout.
@@ -520,6 +559,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_deferred_point_count_parses_like_a_known_one() {
+        let plots = sample();
+        let tr = &plots[1];
+        let rows: Vec<Vec<f64>> = (0..tr.npoints).map(|p| vec![tr.cols[1][p]]).collect();
+        let mut known = Vec::new();
+        write_rows(
+            &mut known,
+            &tr.title,
+            &tr.plotname,
+            &tr.vars,
+            Some(&tr.cols[0]),
+            &rows,
+        )
+        .unwrap();
+        // the streamed form: blank count, rows, then the count written into the blank
+        let mut streamed = Vec::new();
+        let at = write_header_deferred(&mut streamed, &tr.title, &tr.plotname, &tr.vars).unwrap()
+            as usize;
+        for (k, r) in rows.iter().enumerate() {
+            streamed.extend_from_slice(&tr.cols[0][k].to_le_bytes());
+            streamed.extend_from_slice(&r[0].to_le_bytes());
+        }
+        streamed[at..at + DEFERRED_POINTS_WIDTH]
+            .copy_from_slice(&deferred_points_value(tr.npoints));
+        assert_eq!(parse(&streamed).unwrap(), parse(&known).unwrap());
+        let text = String::from_utf8_lossy(&streamed);
+        assert!(text.contains(&format!(
+            "\nNo. Points: 3{}\n",
+            " ".repeat(DEFERRED_POINTS_WIDTH - 1)
+        )));
+        assert_eq!(
+            deferred_points_value(usize::MAX).len(),
+            DEFERRED_POINTS_WIDTH
+        );
     }
 
     #[test]

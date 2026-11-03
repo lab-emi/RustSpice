@@ -863,7 +863,9 @@ fn a_tiny_childs_peak_rss_is_its_own_not_the_harness_footprint() {
     }
     // `a_big_tran` makes the harness itself hold >100 MB of waveforms (1e6 rows read from two rawfiles); `z_tiny_op`
     // runs afterwards (cases run in id order). `wait4`'s ru_maxrss of its children would report the harness's
-    // high-water mark for every child; VmHWM polling reports each child's own.
+    // high-water mark for every child; VmHWM polling reports each child's own. RustSpice streams the transient rows
+    // into its rawfile, so the deck adds a 1e6-point `.dc` sweep, a result RustSpice does hold in memory: its own
+    // peak is then large as well.
     let big = "Big transient to fatten the harness
 * bench.id: a_big_tran
 * bench.group: accuracy
@@ -875,6 +877,7 @@ V1 in 0 SIN(0 1 1k)
 R1 in out 1k
 C1 out 0 1n
 .tran 100n 100m
+.dc V1 0 1 1u
 .end
 ";
     let tiny = "Tiny op
@@ -915,7 +918,7 @@ R2 out 0 3k
         let p = ch["peak_kib"].as_u64().expect("child measured");
         assert!(p < limit, "{ch}");
     }
-    // and the big case really is bigger for RustSpice (it holds 1e6 rows), so the number tracks the child
+    // and the big case really is bigger for RustSpice (it holds the 1e6-point sweep), so the number tracks the child
     if let Some(rs_big) = kib(&big_c["rustspice"]["rss_kib"]) {
         assert!(rs_big > 2 * rs_tiny, "big {rs_big} vs tiny {rs_tiny}");
     }
