@@ -35,7 +35,9 @@ case passes when the maximum error / swing of every probe is at most
 reference rows against 6,001 RustSpice rows. Default-tolerance ngspice is
 scored against the same reference. Timing uses the correctness run
 as warm-up, then seven interleaved repetitions in rotating order; every
-repetition completed and no series is `noisy` (stddev / median > 0.2). Speedup
+repetition completed and no end-to-end or solve series is `noisy`
+(stddev / median > 0.2); some RustSpice parse/compile/setup and ngspice
+setup/overhead sub-series are flagged noisy. Speedup
 is median ngspice / median RustSpice against the faster ngspice solver for that
 metric.
 
@@ -60,10 +62,11 @@ metric.
 **The suite verdict is `PASS`: 10 of 10 cases pass, and RustSpice was 3.68–5.78×
 faster end to end than the faster ngspice solver**, which was SPARSE in every
 case for both metrics. RustSpice's worst probe used 39 % of the tolerance. On
-the single nets both errors are below the suite's estimate of the reference's
-own linear-resampling error (`interp_floor`), so the comparison does not
-resolve which simulator is closer; on the two multi-net decks both errors
-exceed that estimate and RustSpice is closer. RustSpice used more memory than
+the single nets default-tolerance ngspice's measured error is lower, but both
+errors are below the suite's estimate of the reference's own
+linear-resampling error (`interp_floor`), so the difference is not resolved;
+on the two multi-net decks both errors exceed that estimate and RustSpice is
+closer. RustSpice used more memory than
 ngspice in every case.
 
 End to end is the subprocess wall time: start-up, parse, setup, solve and
