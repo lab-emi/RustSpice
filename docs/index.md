@@ -9,6 +9,43 @@ RustSpice simulates transistor-level SPICE netlists (`.op`, `.dc`, `.tran`) and 
   <img src="assets/rustspice-banner.gif" alt="Circuit simulation for the next design iteration." width="1200">
 </picture>
 
+## Ibex host campaign · 2026-11-05
+
+The RustEDA Ibex host campaign of 2026-11-05 (IHP SG13G2 / EZ130 with two real
+SRAMs, on a 4-vCPU Intel Xeon cloud host with 15.7 GiB RAM and no swap) ran
+`rustspice bench-suite` with RustSpice 0.1.0 (commit
+[`0b557b5`](https://github.com/lab-emi/RustSpice/commit/0b557b5fce24e7d5a70596d8d4d5a059c357ac4e)) against ngspice-45, with the deck builder and method of
+2026-11-02. The decks come from the native nominal SPEF of the new final layout,
+whose largest nets are smaller: the eight largest single nets have 198–291
+unknowns (5–10 sinks), and the two multi-net decks have 10 nets with 2,262
+unknowns and 40 nets with 6,865, so they are not the decks of 2026-11-02.
+**All 10 cases `pass` accuracy.** Read at the nominal `k × tstep` output grid,
+RustSpice is closer to the tightly converged ngspice reference than
+default-tolerance ngspice in every case; at each simulator's own output points
+(without the harness's linear resampling of ngspice's waveform) it is closer in
+9 of 10 cases, ngspice on `ibex_net_01` (1.03 × 10⁻⁵ against 1.33 × 10⁻⁵), and
+the multi-net decks are near level (4.50 × 10⁻⁴ against 4.83 × 10⁻⁴).
+**RustSpice was 4.32–5.96× faster end to end than the faster ngspice solver,
+and used less memory in every case.**
+
+| | 8 single nets | 10 nets, 2,262 unknowns | 40 nets, 6,865 unknowns |
+| --- | ---: | ---: | ---: |
+| Accuracy verdict | `pass` × 8 | `pass` | `pass` |
+| Error / swing, RustSpice | 4.67 × 10⁻⁶ – 1.33 × 10⁻⁵ | 4.50 × 10⁻⁴ | 4.50 × 10⁻⁴ |
+| Error / swing, default-tolerance ngspice, nominal grid | 2.09–6.26 × 10⁻⁵ | 1.44 × 10⁻³ | 1.44 × 10⁻³ |
+| Error / swing, default-tolerance ngspice, its own output points | 6.68 × 10⁻⁶ – 1.61 × 10⁻⁵ | 4.83 × 10⁻⁴ | 4.83 × 10⁻⁴ |
+| Median end to end, faster ngspice solver | 287.99–419.83 ms | 434.57 ms (SPARSE) | 1,688.21 ms (KLU) |
+| Median end to end, RustSpice | 57.17–90.02 ms | 86.22 ms | 283.11 ms |
+| End-to-end speedup vs the faster ngspice solver | 4.32–5.45× | 5.04× | 5.96× |
+| Solve-only speedup vs the faster ngspice solver | 5.07–6.36× | 6.39× | 7.72× |
+| Median peak RSS, ngspice SPARSE / RustSpice | 13,872–14,324 / 6,828–7,208 KiB | 20,488 / 12,380 KiB | 34,968 / 24,552 KiB |
+
+Times are medians of seven interleaved repetitions after a correctness warm-up
+on one host. The scope is linear RC interconnect only.
+
+[Decks, all values and method](development-status.md) ·
+[SPICE head-to-head](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45-2026-11-05)
+
 ## Ibex host campaign · 2026-11-02
 
 In the RustEDA Ibex host campaign (IHP SG13G2 / EZ130 with two real SRAMs, on a
@@ -64,7 +101,7 @@ rustspice bench-ngspice --output target/bench-ngspice.md
 
 ## Benchmarks
 
-RustEDA publishes its benchmarks on one page: Ibex RTL-to-GDS on IHP SG13G2 / EZ130 against LibreLane, with module head-to-heads. See the [RustEDA benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/). RustSpice's one published performance comparison is the [head-to-head with ngspice-45](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45) on linear RC networks extracted from the Ibex layout ([summary above](#ibex-host-campaign-2026-11-02)); it covers no transistor-level circuit and applies to that host only. The [benchmark method](benchmark_report.md) describes how to measure RustSpice against `ngspice` on your own host.
+RustEDA publishes its benchmarks on one page: Ibex RTL-to-GDS on IHP SG13G2 / EZ130 against LibreLane, with module head-to-heads. See the [RustEDA benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/). RustSpice's latest published performance comparison is the [head-to-head with ngspice-45](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45-2026-11-05) from the 2026-11-05 Ibex host campaign, on linear RC networks extracted from the Ibex layout ([summary above](#ibex-host-campaign-2026-11-05); the [2026-11-02 one](#ibex-host-campaign-2026-11-02) is kept below it); it covers no transistor-level circuit and applies to that host only. The [benchmark method](benchmark_report.md) describes how to measure RustSpice against `ngspice` on your own host.
 
 ## Batched DC operating points on NVIDIA GPUs
 
