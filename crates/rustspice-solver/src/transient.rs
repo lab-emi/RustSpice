@@ -133,6 +133,71 @@ pub struct TranResult {
     pub rejected_steps: usize,
 }
 
+/// Receives the output rows of a transient analysis while it runs (see
+/// [`TransientSolver::solve_transient_spec_into`]): a caller that writes the rows out (a rawfile) or reduces them
+/// never holds the whole waveform, whose size is `rows x MNA dimension x 8` bytes.
+pub trait TranSink {
+    /// Called once before the first row (after the start point has been solved), with the exact number of rows
+    /// when it is known in advance (always, unless [`TranOptions::internal_points`] is set) and the MNA dimension
+    /// (the length of every row's `x`).
+    fn begin(&mut self, rows: Option<usize>, dim: usize) -> SimResult<()> {
+        let _ = (rows, dim);
+        Ok(())
+    }
+
+    /// One output row: its time and the full MNA solution there. `x` is only valid during the call. An error stops
+    /// the analysis and is returned by it.
+    fn row(&mut self, t: f64, x: &[f64]) -> SimResult<()>;
+}
+
+/// A [`TranSink`] that drops every row: the analysis runs in memory independent of its length and only the
+/// counters of [`TranStats`] remain.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DiscardRows;
+
+impl TranSink for DiscardRows {
+    #[inline]
+    fn row(&mut self, _t: f64, _x: &[f64]) -> SimResult<()> {
+        Ok(())
+    }
+}
+
+/// Counters of a transient analysis whose rows went to a [`TranSink`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TranStats {
+    /// Rows handed to the sink.
+    pub rows: usize,
+    pub total_nr_iterations: usize,
+    pub lu_factorizations: usize,
+    /// Internal integration steps that were accepted.
+    pub accepted_steps: usize,
+    /// Internal steps repeated with a smaller step (LTE above tolerance or Newton failure).
+    pub rejected_steps: usize,
+}
+
+/// The in-memory sink behind [`TransientSolver::solve_transient_spec`] (a [`TranResult`]).
+#[derive(Default)]
+struct CollectRows {
+    time_points: Vec<f64>,
+    waveforms: Vec<Vec<f64>>,
+}
+
+impl TranSink for CollectRows {
+    fn begin(&mut self, rows: Option<usize>, _dim: usize) -> SimResult<()> {
+        if let Some(n) = rows {
+            self.time_points.reserve_exact(n);
+            self.waveforms.reserve_exact(n);
+        }
+        Ok(())
+    }
+
+    fn row(&mut self, t: f64, x: &[f64]) -> SimResult<()> {
+        self.time_points.push(t);
+        self.waveforms.push(x.to_vec());
+        Ok(())
+    }
+}
+
 /// High-speed Transient Integrator.
 pub struct TransientSolver {
     pub options: TranOptions,
@@ -283,25 +348,24 @@ fn step_end(t: f64, h: f64, lands: bool, stop: f64, next_row: Option<f64>) -> f6
 }
 
 /// Value at `tau` of the polynomial through the points `(t_k, y_k)`: quadratic, or linear when the third time is
-/// `NaN` (Lagrange form, evaluated per unknown).
-fn interpolate_row(tau: f64, pts: [(f64, &Vec<f64>); 3]) -> Vec<f64> {
+/// `NaN` (Lagrange form, evaluated per unknown), written into `out` (its previous contents are replaced).
+fn interpolate_row_into(tau: f64, pts: [(f64, &[f64]); 3], out: &mut Vec<f64>) {
     let [(ta, ya), (tb, yb), (tc, yc)] = pts;
+    out.clear();
     if tc.is_nan() {
         let wa = (tau - tb) / (ta - tb);
-        return ya
-            .iter()
-            .zip(yb)
-            .map(|(a, b)| wa * a + (1.0 - wa) * b)
-            .collect();
+        out.extend(ya.iter().zip(yb).map(|(a, b)| wa * a + (1.0 - wa) * b));
+        return;
     }
     let la = (tau - tb) * (tau - tc) / ((ta - tb) * (ta - tc));
     let lb = (tau - ta) * (tau - tc) / ((tb - ta) * (tb - tc));
     let lc = (tau - ta) * (tau - tb) / ((tc - ta) * (tc - tb));
-    ya.iter()
-        .zip(yb)
-        .zip(yc)
-        .map(|((a, b), c)| la * a + lb * b + lc * c)
-        .collect()
+    out.extend(
+        ya.iter()
+            .zip(yb)
+            .zip(yc)
+            .map(|((a, b), c)| la * a + lb * b + lc * c),
+    );
 }
 
 /// Bounds of [`FactorCache`]: entries whose size is known (unrolled / dense factors) and their total bytes, and
@@ -314,10 +378,18 @@ const FACTOR_CACHE_FAER_ENTRIES: usize = 4;
 /// corner climbs the same ladder (backward Euler at `h1`, trapezoid at `2 h1`, `4 h1`, ... up to `hmax`) and lands on
 /// the next corner with the same remainder step in every period of a periodic source; refactoring these dominated
 /// large linear transients. Least-recently-used eviction within the bounds above.
+///
+/// The live factors in the solver are the most recently used entry and are never held twice: a hit swaps the cached
+/// factors into the solver and the outgoing live ones into the cache, and the live factors move into the cache just
+/// before a refactorization would overwrite them. The entries, their order and the evictions are those of a cache
+/// that keeps a copy of the live factors as well (the bounds count the live entry), so the factors the integration
+/// uses are the same; only the copies are gone.
 #[derive(Default)]
 struct FactorCache {
-    /// Oldest use first.
+    /// Stored entries, oldest use first; never the entry of the live factors.
     entries: Vec<(f64, FactorSnapshot)>,
+    /// Scale of the solver's live factors when they are an entry of the cache (its most recently used one).
+    live: Option<f64>,
 }
 
 impl FactorCache {
@@ -325,7 +397,8 @@ impl FactorCache {
         (a - b).abs() <= 1e-9 * b
     }
 
-    /// Restores the factors of companion scale `g` into `solver` when they are cached.
+    /// Makes the cached factors of companion scale `g` the solver's live factors when they are cached; the live
+    /// factors they replace stay cached.
     fn restore(&mut self, solver: &mut AdaptiveSparseSolver, g: f64) -> bool {
         let Some(k) = self
             .entries
@@ -334,24 +407,41 @@ impl FactorCache {
         else {
             return false;
         };
-        let e = self.entries.remove(k);
-        let ok = solver.restore_factors(&e.1);
-        if ok {
-            self.entries.push(e);
+        let (s, snap) = self.entries.remove(k);
+        match solver.swap_factors(snap) {
+            Ok(prev) => {
+                if let (Some(f), Some(prev)) = (self.live.take(), prev) {
+                    self.entries.push((f, prev));
+                }
+                self.live = Some(s);
+                true
+            }
+            // factors of an outdated pivot schedule / symbolic structure are dropped
+            Err(_) => false,
         }
-        ok
     }
 
-    fn insert(&mut self, g: f64, snap: FactorSnapshot) {
+    /// Moves the live factors into the stored entries: the solver is about to refactorize, which overwrites them.
+    fn stash_live(&mut self, solver: &mut AdaptiveSparseSolver) {
+        if let Some(f) = self.live.take() {
+            if let Some(snap) = solver.take_factors() {
+                self.entries.push((f, snap));
+            }
+        }
+    }
+
+    /// Makes the solver's freshly factored live factors (holding `known_bytes`, `None` for `faer` factors) the entry
+    /// of scale `g`, evicting the least recently used entries beyond the bounds.
+    fn insert_live(&mut self, g: f64, known_bytes: Option<usize>) {
         self.entries.retain(|(s, _)| !Self::same_scale(*s, g));
-        let (max_entries, max_bytes) = match snap.known_bytes() {
+        let (max_entries, max_bytes) = match known_bytes {
             Some(_) => (FACTOR_CACHE_ENTRIES, FACTOR_CACHE_BYTES),
             None => (FACTOR_CACHE_FAER_ENTRIES, usize::MAX),
         };
         let bytes = |e: &[(f64, FactorSnapshot)]| -> usize {
             e.iter().map(|(_, f)| f.known_bytes().unwrap_or(0)).sum()
         };
-        let need = snap.known_bytes().unwrap_or(0);
+        let need = known_bytes.unwrap_or(0);
         if need > max_bytes {
             return;
         }
@@ -360,7 +450,7 @@ impl FactorCache {
         {
             self.entries.remove(0);
         }
-        self.entries.push((g, snap));
+        self.live = Some(g);
     }
 }
 
@@ -411,7 +501,8 @@ impl TransientSolver {
         )
     }
 
-    /// Runs the transient analysis a `.tran` card describes (see [`TranSpec`]).
+    /// Runs the transient analysis a `.tran` card describes (see [`TranSpec`]) and returns every output row in
+    /// memory. Use [`Self::solve_transient_spec_into`] when the rows are written out or reduced as they come.
     pub fn solve_transient_spec(
         &mut self,
         topo: &mut CompiledTopology,
@@ -421,6 +512,39 @@ impl TransientSolver {
         spec: &TranSpec,
         initial_conditions: &rustc_hash::FxHashMap<usize, f64>,
     ) -> SimResult<TranResult> {
+        let mut rows = CollectRows::default();
+        let stats = self.solve_transient_spec_into(
+            topo,
+            backend,
+            linear_solver,
+            nonlinear_solver,
+            spec,
+            initial_conditions,
+            &mut rows,
+        )?;
+        Ok(TranResult {
+            time_points: rows.time_points,
+            waveforms: rows.waveforms,
+            total_nr_iterations: stats.total_nr_iterations,
+            lu_factorizations: stats.lu_factorizations,
+            accepted_steps: stats.accepted_steps,
+            rejected_steps: stats.rejected_steps,
+        })
+    }
+
+    /// [`Self::solve_transient_spec`] handing every output row to `sink` as soon as it is known instead of storing
+    /// it: memory does not grow with the number of rows. The rows are the same, bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn solve_transient_spec_into(
+        &mut self,
+        topo: &mut CompiledTopology,
+        backend: &dyn ComputeBackend,
+        linear_solver: &mut AdaptiveSparseSolver,
+        nonlinear_solver: &mut NonlinearSolver,
+        spec: &TranSpec,
+        initial_conditions: &rustc_hash::FxHashMap<usize, f64>,
+        sink: &mut dyn TranSink,
+    ) -> SimResult<TranStats> {
         // SPICE timing defaults (PULSE rise / fall = tstep, SIN frequency = 1/tstop, ...) depend on this `.tran`
         // card: resolve them on the source tables for this run and put the card values back afterwards
         let soa = &mut topo.soa;
@@ -446,6 +570,7 @@ impl TransientSolver {
             nonlinear_solver,
             spec,
             initial_conditions,
+            sink,
         );
         if let Some((v, i)) = saved {
             topo.soa.vsrc_waveforms = v;
@@ -454,6 +579,7 @@ impl TransientSolver {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_spec(
         &mut self,
         topo: &mut CompiledTopology,
@@ -462,7 +588,8 @@ impl TransientSolver {
         nonlinear_solver: &mut NonlinearSolver,
         spec: &TranSpec,
         initial_conditions: &rustc_hash::FxHashMap<usize, f64>,
-    ) -> SimResult<TranResult> {
+        sink: &mut dyn TranSink,
+    ) -> SimResult<TranStats> {
         let TranSpec {
             tstep,
             tstop,
@@ -541,12 +668,19 @@ impl TransientSolver {
         self.ind_i_prev3.extend_from_slice(&topo.soa.ind_i_prev);
 
         let mut grid = OutputGrid::new(tstep, tstop, tstart);
-        let est_rows = grid.remaining();
-        let mut time_points = Vec::with_capacity(est_rows);
-        let mut waveforms = Vec::with_capacity(est_rows);
+        // without internal points the grid is every row there will be (`remaining` is exact)
+        sink.begin(
+            (!self.options.internal_points).then_some(grid.remaining()),
+            dim,
+        )?;
+        // rows handed to the sink, the time of the last one, and the buffer of interpolated rows
+        let mut n_rows = 0usize;
+        let mut last_row_t: Option<f64> = None;
+        let mut row_buf: Vec<f64> = Vec::with_capacity(dim);
         if grid.peek() == Some(0.0) {
-            time_points.push(0.0);
-            waveforms.push(x.clone());
+            sink.row(0.0, &x)?;
+            n_rows += 1;
+            last_row_t = Some(0.0);
             grid.advance();
         }
 
@@ -612,7 +746,7 @@ impl TransientSolver {
 
         let mut t = 0.0_f64;
         while grid.peek().is_some() {
-            if time_points.len() as u64 >= point_cap {
+            if n_rows as u64 >= point_cap {
                 return Err(SimError::ResourceLimit {
                     resource: "transient_points",
                     requested: format!(
@@ -648,8 +782,9 @@ impl TransientSolver {
                     if stop_is_bp && t_out > t + teps {
                         break;
                     }
-                    time_points.push(t_out);
-                    waveforms.push(x_acc.clone());
+                    sink.row(t_out, &x_acc)?;
+                    n_rows += 1;
+                    last_row_t = Some(t_out);
                     grid.advance();
                 }
                 if stop_is_bp {
@@ -707,6 +842,10 @@ impl TransientSolver {
                     self.solve_linear_cached(topo, linear_solver, &mut x)
                         .map(|()| 1usize)
                 } else {
+                    if is_linear {
+                        // the factorization below overwrites the live factors: keep them cached
+                        factor_cache.stash_live(linear_solver);
+                    }
                     // initial guess for Newton: extrapolation of the last accepted points
                     if self.options.use_predictor
                         && !is_linear
@@ -744,8 +883,8 @@ impl TransientSolver {
                     if is_linear {
                         factored_scale = res.is_ok().then_some(g_scale);
                         if res.is_ok() {
-                            if let Some(snap) = linear_solver.snapshot_factors() {
-                                factor_cache.insert(g_scale, snap);
+                            if let Some(bytes) = linear_solver.live_factor_bytes() {
+                                factor_cache.insert_live(g_scale, bytes);
                             }
                         }
                     }
@@ -812,30 +951,34 @@ impl TransientSolver {
             // 2. Accept the step, writing the rows it passes
             let t_new = step_end(t, h, lands, stop, grid.peek());
             while let Some(t_out) = grid.peek() {
-                if t_out > t_new + teps || time_points.len() as u64 >= point_cap {
+                if t_out > t_new + teps || n_rows as u64 >= point_cap {
                     break;
                 }
-                let row =
-                    if (t_out - t_new).abs() <= teps || (jump_restart && stage == Stage::Startup) {
-                        x.clone()
-                    } else if n_hist >= 2 {
-                        interpolate_row(t_out, [(t_new, &x), (t, &x_acc), (t_hist[1], &x_acc_prev)])
+                if (t_out - t_new).abs() <= teps || (jump_restart && stage == Stage::Startup) {
+                    sink.row(t_out, &x)?;
+                } else {
+                    let third = if n_hist >= 2 {
+                        (t_hist[1], x_acc_prev.as_slice())
                     } else {
-                        interpolate_row(t_out, [(t_new, &x), (t, &x_acc), (f64::NAN, &x_acc)])
+                        (f64::NAN, x_acc.as_slice())
                     };
-                time_points.push(t_out);
-                waveforms.push(row);
+                    interpolate_row_into(t_out, [(t_new, &x), (t, &x_acc), third], &mut row_buf);
+                    sink.row(t_out, &row_buf)?;
+                }
+                n_rows += 1;
+                last_row_t = Some(t_out);
                 grid.advance();
             }
             // an accepted step between two rows: the solution there is exact, not interpolated
             if self.options.internal_points
                 && t_new >= tstart
-                && time_points.last().is_none_or(|&tl| t_new > tl + teps)
+                && last_row_t.is_none_or(|tl| t_new > tl + teps)
                 && grid.peek().is_some_and(|tr| t_new < tr - teps)
-                && ((time_points.len() + grid.remaining()) as u64) < point_cap
+                && ((n_rows + grid.remaining()) as u64) < point_cap
             {
-                time_points.push(t_new);
-                waveforms.push(x.clone());
+                sink.row(t_new, &x)?;
+                n_rows += 1;
+                last_row_t = Some(t_new);
             }
             self.cap_v_prev3.copy_from_slice(&topo.soa.cap_v_prev2);
             self.ind_i_prev3.copy_from_slice(&topo.soa.ind_i_prev2);
@@ -919,9 +1062,8 @@ impl TransientSolver {
         }
 
         topo.soa.is_transient = false;
-        Ok(TranResult {
-            time_points,
-            waveforms,
+        Ok(TranStats {
+            rows: n_rows,
             total_nr_iterations,
             lu_factorizations,
             accepted_steps,
@@ -1397,5 +1539,116 @@ mod tests {
             restart_step(hmax, true, 10e-12, 10e-12),
             (RESTART_FRACTION * hmax, false)
         );
+    }
+
+    /// `n x n` grid Laplacian with `4 + g` on the diagonal: the companion matrix family `G + g C` of an RC mesh.
+    fn grid(n: usize, g: f64) -> rustspice_core::CscMatrix<f64> {
+        let id = |i: usize, j: usize| i * n + j;
+        let mut coords = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                if i + 1 < n {
+                    coords.extend([(id(i, j), id(i + 1, j)), (id(i + 1, j), id(i, j))]);
+                }
+                if j + 1 < n {
+                    coords.extend([(id(i, j), id(i, j + 1)), (id(i, j + 1), id(i, j))]);
+                }
+            }
+        }
+        let mut m = rustspice_core::CscMatrix::from_pattern(n * n, n * n, &coords);
+        for c in 0..n * n {
+            for k in m.col_ptr[c]..m.col_ptr[c + 1] {
+                m.values[k] = if m.row_idx[k] == c { 4.0 + g } else { -1.0 };
+            }
+        }
+        m
+    }
+
+    /// The cache holds every entry once (the live one in the solver, the others stored), in least-recently-used
+    /// order, and a hit swaps in exactly the factors of its scale: on the unrolled tier and on the `faer` tier (whose
+    /// factors are moved, not copied).
+    #[test]
+    fn factor_cache_swaps_factors_in_lru_order_without_duplicates() {
+        for (n, faer) in [(6, false), (20, true)] {
+            let dim = n * n;
+            let b: Vec<f64> = (0..dim).map(|i| 1.0 + (i % 7) as f64).collect();
+            let compile = || AdaptiveSparseSolver::compile(&grid(n, 1.0)).unwrap();
+            let mut solver = compile();
+            assert_eq!(
+                solver.kind == crate::LinearSolverKind::FaerSupernodal,
+                faer,
+                "{n}x{n} grid: tier {:?}",
+                solver.kind
+            );
+            // the solution of every scale from a solver of its own
+            let scales = [1.0, 2.0, 3.0, 4.0, 5.0];
+            let reference = |g: f64| {
+                let mut s = compile();
+                let mut x = vec![0.0; dim];
+                s.factorize_and_solve(&grid(n, g), &b, &mut x).unwrap();
+                s.solve_cached(&b, &mut x).unwrap();
+                x
+            };
+            let solve_live = |s: &mut AdaptiveSparseSolver| {
+                let mut x = vec![0.0; dim];
+                s.solve_cached(&b, &mut x).unwrap();
+                x
+            };
+            let mut cache = FactorCache::default();
+            let mut x = vec![0.0; dim];
+            for &g in &scales {
+                cache.stash_live(&mut solver);
+                // the live factors moved into the cache
+                assert!(cache.live.is_none() && !solver.has_valid_factorization());
+                solver.factorize_and_solve(&grid(n, g), &b, &mut x).unwrap();
+                cache.insert_live(g, solver.live_factor_bytes().unwrap());
+            }
+            // entries held, the live one included (unrolled factors: up to 8)
+            let held = if faer {
+                FACTOR_CACHE_FAER_ENTRIES
+            } else {
+                scales.len()
+            };
+            assert_eq!(cache.live, Some(5.0));
+            assert_eq!(
+                cache.entries.len() + 1,
+                held,
+                "the live entry is not stored twice"
+            );
+            let keys = |c: &FactorCache| c.entries.iter().map(|(s, _)| *s).collect::<Vec<_>>();
+            if faer {
+                // four entries: the oldest scale was evicted
+                assert_eq!(keys(&cache), [2.0, 3.0, 4.0]);
+                assert!(!cache.restore(&mut solver, 1.0));
+            } else {
+                assert_eq!(keys(&cache), [1.0, 2.0, 3.0, 4.0]);
+            }
+            // a hit makes its factors live (bit-identical solution) and keeps the outgoing ones as the newest entry
+            assert!(cache.restore(&mut solver, 3.0));
+            assert_eq!(solve_live(&mut solver), reference(3.0));
+            assert_eq!(cache.live, Some(3.0));
+            assert_eq!(*keys(&cache).last().unwrap(), 5.0);
+            assert!(cache.restore(&mut solver, 5.0));
+            assert_eq!(solve_live(&mut solver), reference(5.0));
+            assert!(cache.restore(&mut solver, 2.0));
+            assert_eq!(solve_live(&mut solver), reference(2.0));
+            assert_eq!(cache.entries.len() + 1, held);
+            // a refactorization at a new scale keeps the live factors cached and evicts the least recently used
+            cache.stash_live(&mut solver);
+            solver
+                .factorize_and_solve(&grid(n, 6.0), &b, &mut x)
+                .unwrap();
+            cache.insert_live(6.0, solver.live_factor_bytes().unwrap());
+            assert_eq!(cache.live, Some(6.0));
+            if faer {
+                assert_eq!(keys(&cache), [3.0, 5.0, 2.0]);
+            } else {
+                assert_eq!(keys(&cache), [1.0, 4.0, 3.0, 5.0, 2.0]);
+            }
+            assert!(cache.restore(&mut solver, 2.0));
+            assert_eq!(solve_live(&mut solver), reference(2.0));
+            assert!(cache.restore(&mut solver, 6.0));
+            assert_eq!(solve_live(&mut solver), reference(6.0));
+        }
     }
 }

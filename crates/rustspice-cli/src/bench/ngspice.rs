@@ -160,6 +160,9 @@ pub struct RunOpts<'a> {
     pub ignore_log_failures: bool,
     /// Start the process once more when it was killed by a signal (a SIGSEGV on some decks is not deterministic).
     pub retry_on_signal: bool,
+    /// Read only the axis and these vectors of every plot (`None`: all of them), see
+    /// [`rawfile::read_file_lenient_keep`].
+    pub keep: Option<&'a [String]>,
 }
 
 /// Run `ngspice -b -r <raw> <deck>`. `expect_solver` is checked against the log (`Using KLU` / `Using SPARSE`).
@@ -303,7 +306,7 @@ fn run_once(
     }
     let mut skipped_plots = Vec::new();
     let mut plots = if want_plots && class == NgClass::Ok {
-        rawfile::read_file_lenient(raw)
+        rawfile::read_file_lenient_keep(raw, opts.keep)
             .map(|l| {
                 skipped_plots = l.skipped;
                 l.plots

@@ -2,6 +2,7 @@
 //! and performance benchmark runner.
 
 mod bench;
+mod raw_out;
 
 use std::fs;
 use std::path::PathBuf;
@@ -19,7 +20,7 @@ use rustspice_ir::{
     build_diode_ir, build_mosfet_ekv_ir, build_mosfet_level1_ir, emit_cuda_ptx_kernel,
     emit_cuda_tile_kernel, emit_msl_df64_kernel, emit_rust_scalar_fn, emit_wgsl_df64_kernel,
 };
-use rustspice_solver::{ParameterGradSpec, Simulator, TranSpec};
+use rustspice_solver::{DiscardRows, ParameterGradSpec, Simulator, TranSpec};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -57,7 +58,8 @@ enum Commands {
         /// Maximum stored `.dc` / `.tran` points per analysis [default: 50000000]
         #[arg(long)]
         max_points: Option<u64>,
-        /// Maximum MiB held by the stored result of one analysis [default: 1024]
+        /// Maximum MiB of the result of one analysis, rows x unknowns x 8 bytes (held in memory for `.dc`, streamed to
+        /// the rawfile for `.tran`) [default: 1024]
         #[arg(long)]
         max_result_mib: Option<u64>,
         /// Maximum `.subckt` instantiation depth [default: 1000]
@@ -231,15 +233,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// One analysis result waiting to be written to the rawfile.
-struct RawPlotOut {
-    plotname: &'static str,
-    vars: Vec<bench::rawfile::Var>,
-    /// Sweep / time axis (becomes variable 0); `None` for `.op`.
-    axis: Option<Vec<f64>>,
-    rows: Vec<Vec<f64>>,
-}
-
 /// `v(node)` / `i(vsrc)` / `i(lname)` / `i(ename)` labels of the written MNA unknowns, lower-case like ngspice, and
 /// their indices in the solution vector. Device-internal nodes (series resistances) are not written.
 fn mna_labels(sim: &Simulator) -> (Vec<String>, Vec<usize>) {
@@ -340,8 +333,8 @@ fn report_diagnostics(diags: &[Diagnostic]) -> usize {
     warnings
 }
 
-/// `rustspice run`: unchanged stdout; optionally a rawfile (written only after every analysis succeeded) and a
-/// stats JSON (also written on failure, with `status = "error: ..."`).
+/// `rustspice run`: unchanged stdout; optionally a rawfile (written while the analyses run, see [`raw_out`], and
+/// only kept when every analysis succeeded) and a stats JSON (also written on failure, with `status = "error: ..."`).
 fn run_deck(
     netlist: &std::path::Path,
     backend: &str,
@@ -426,7 +419,8 @@ fn run_deck_inner(
     );
 
     let (labels, cols) = mna_labels(&sim);
-    let mut plots: Vec<RawPlotOut> = Vec::new();
+    let mut raw_out = raw.map(raw_out::RawOut::new);
+    let title = sim.netlist.title.clone();
     let analyses = sim.netlist.analyses.clone();
     let mut total_us = 0.0;
     let mut total_pts = 0u64;
@@ -453,13 +447,14 @@ fn run_deck_inner(
                 total_us += run_us;
                 total_pts += 1;
                 kinds.push("op");
-                if raw.is_some() {
-                    plots.push(RawPlotOut {
-                        plotname: "Operating Point",
-                        vars: raw_vars(&labels),
-                        axis: None,
-                        rows: visible_rows(vec![res.solution], &cols),
-                    });
+                if let Some(out) = raw_out.as_mut() {
+                    out.write_plot(
+                        &title,
+                        "Operating Point",
+                        &raw_vars(&labels),
+                        None,
+                        &visible_rows(vec![res.solution], &cols),
+                    );
                 }
             }
             AnalysisCmd::Dc {
@@ -494,7 +489,7 @@ fn run_deck_inner(
                 total_us += run_us;
                 total_pts += n;
                 kinds.push("dc");
-                if raw.is_some() {
+                if let Some(out) = raw_out.as_mut() {
                     // ngspice names the sweep vector after the swept quantity: `v(v-sweep)` / `i(i-sweep)` for a
                     // source, `res-sweep` for a resistor, `temp-sweep` for the temperature
                     let lower = source_name.to_ascii_lowercase();
@@ -521,12 +516,13 @@ fn run_deck_inner(
                     };
                     let mut vars = vec![axis];
                     vars.extend(raw_vars(&labels));
-                    plots.push(RawPlotOut {
-                        plotname: "DC transfer characteristic",
-                        vars,
-                        axis: Some(res.sweep_values),
-                        rows: visible_rows(res.solutions, &cols),
-                    });
+                    out.write_plot(
+                        &title,
+                        "DC transfer characteristic",
+                        &vars,
+                        Some(&res.sweep_values),
+                        &visible_rows(res.solutions, &cols),
+                    );
                 }
             }
             AnalysisCmd::Tran {
@@ -536,18 +532,35 @@ fn run_deck_inner(
                 tmax,
                 uic,
             } => {
-                let t_run = Instant::now();
-                let res = sim.run_transient_spec(&TranSpec {
+                let spec = TranSpec {
                     tstep,
                     tstop,
                     tstart,
                     tmax,
                     uic,
-                })?;
-                let run_us = t_run.elapsed().as_secs_f64() * 1e6;
+                };
+                // the rows go straight into the rawfile (or nowhere): the waveform is never held in memory
+                let t_run = Instant::now();
+                let (res, write_us) = match raw_out.as_mut() {
+                    Some(out) => {
+                        let mut vars = vec![bench::rawfile::Var {
+                            name: "time".to_string(),
+                            kind: "time".to_string(),
+                        }];
+                        vars.extend(raw_vars(&labels));
+                        let w0 = out.write_us();
+                        let mut sink = out.tran_sink(&title, &vars, &cols);
+                        let res = sim.run_transient_spec_into(&spec, &mut sink)?;
+                        sink.finish()?;
+                        (res, out.write_us() - w0)
+                    }
+                    None => (sim.run_transient_spec_into(&spec, &mut DiscardRows)?, 0.0),
+                };
+                // the encoding and writing of the rows is booked as `write_us`, as when the rawfile was written last
+                let run_us = (t_run.elapsed().as_secs_f64() * 1e6 - write_us).max(0.0);
                 println!(
                     "[Transient] {} time points up to {:.3e}s ({} steps, {} rejected, {} NR iters, {} LU factorizations, {:.1} us)",
-                    res.time_points.len(),
+                    res.rows,
                     tstop,
                     res.accepted_steps,
                     res.rejected_steps,
@@ -555,7 +568,7 @@ fn run_deck_inner(
                     res.lu_factorizations,
                     run_us
                 );
-                let n = res.time_points.len() as u64;
+                let n = res.rows as u64;
                 stats.analyses.push(AnalysisStat {
                     analysis: "tran",
                     analysis_us: Some(run_us),
@@ -564,19 +577,6 @@ fn run_deck_inner(
                 total_us += run_us;
                 total_pts += n;
                 kinds.push("tran");
-                if raw.is_some() {
-                    let mut vars = vec![bench::rawfile::Var {
-                        name: "time".to_string(),
-                        kind: "time".to_string(),
-                    }];
-                    vars.extend(raw_vars(&labels));
-                    plots.push(RawPlotOut {
-                        plotname: "Transient Analysis",
-                        vars,
-                        axis: Some(res.time_points),
-                        rows: visible_rows(res.waveforms, &cols),
-                    });
-                }
             }
         }
     }
@@ -593,35 +593,16 @@ fn run_deck_inner(
         stats.analysis_us = Some(total_us);
         stats.points = Some(total_pts);
     }
-    if let Some(raw_path) = raw {
-        let t_w = Instant::now();
-        let tmp = raw_path.with_extension("raw.partial");
-        let written = (|| -> std::io::Result<()> {
-            {
-                let f = fs::File::create(&tmp)?;
-                let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-                for p in &plots {
-                    bench::rawfile::write_rows(
-                        &mut w,
-                        &sim.netlist.title,
-                        p.plotname,
-                        &p.vars,
-                        p.axis.as_deref(),
-                        &p.rows,
-                    )?;
-                }
-                std::io::Write::flush(&mut w)?;
+    if let (Some(out), Some(raw_path)) = (raw_out, raw) {
+        match out.finish() {
+            Ok(us) => stats.write_us = Some(us),
+            Err(source) => {
+                return Err(Box::new(RawWriteError {
+                    path: raw_path.to_path_buf(),
+                    source,
+                }))
             }
-            fs::rename(&tmp, raw_path)
-        })();
-        if let Err(source) = written {
-            let _ = fs::remove_file(&tmp);
-            return Err(Box::new(RawWriteError {
-                path: raw_path.to_path_buf(),
-                source,
-            }));
         }
-        stats.write_us = Some(t_w.elapsed().as_secs_f64() * 1e6);
     }
     Ok(())
 }

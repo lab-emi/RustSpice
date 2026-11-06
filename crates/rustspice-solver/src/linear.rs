@@ -564,6 +564,14 @@ impl FactorSnapshot {
     }
 }
 
+/// Which tier holds the live factors of an [`AdaptiveSparseSolver`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiveKind {
+    Unrolled,
+    Dense,
+    Faer,
+}
+
 #[derive(Clone)]
 enum SnapshotKind {
     Unrolled {
@@ -901,6 +909,117 @@ impl AdaptiveSparseSolver {
         }
         self.factors_valid = true;
         true
+    }
+
+    /// Kind of the live factors (`None` without valid factors): the variant [`Self::snapshot_factors`] would copy.
+    fn live_kind(&self) -> Option<LiveKind> {
+        if !self.factors_valid {
+            return None;
+        }
+        if self.factors_dense {
+            return self.dense_lu.is_some().then_some(LiveKind::Dense);
+        }
+        if self.factors_in_faer {
+            return self.faer_cache.is_some().then_some(LiveKind::Faer);
+        }
+        self.unrolled_jit.is_some().then_some(LiveKind::Unrolled)
+    }
+
+    /// [`FactorSnapshot::known_bytes`] of the live factors without copying them: `None` without valid factors,
+    /// `Some(None)` for `faer` factors.
+    pub(crate) fn live_factor_bytes(&self) -> Option<Option<usize>> {
+        Some(match self.live_kind()? {
+            LiveKind::Unrolled => Some(self.lu_buf.len() * 8),
+            LiveKind::Dense => {
+                let d = self.dense_lu.as_ref()?;
+                Some(d.lu.len() * 8 + d.piv.len() * 8)
+            }
+            LiveKind::Faer => None,
+        })
+    }
+
+    /// Takes the live factors out of the solver (`None` without valid factors) before a refactorization would
+    /// overwrite them, and invalidates them. `faer` factors (whose size has no bound) are moved; unrolled and dense
+    /// factors, whose buffers the next factorization reuses in place, are copied.
+    pub(crate) fn take_factors(&mut self) -> Option<FactorSnapshot> {
+        let snap = match self.live_kind()? {
+            LiveKind::Dense => SnapshotKind::Dense(self.dense_lu.clone()?),
+            LiveKind::Unrolled => SnapshotKind::Unrolled {
+                lu: self.lu_buf.clone(),
+                jit: self.unrolled_jit.clone()?,
+            },
+            LiveKind::Faer => {
+                let c = self.faer_cache.as_mut()?;
+                c.valid = false;
+                SnapshotKind::Faer {
+                    numeric: Box::new(std::mem::replace(&mut c.numeric, NumericLu::new())),
+                    epoch: c.epoch,
+                }
+            }
+        };
+        self.invalidate_factorization();
+        Some(FactorSnapshot(snap))
+    }
+
+    /// Makes `snap` the live factors without copying them (the same checks as [`Self::restore_factors`]) and returns
+    /// the live factors it replaced, moved out (`Ok(None)` when there were none). `Err(snap)` gives the snapshot back,
+    /// nothing changed, when the solver's pivot schedule or symbolic structure is no longer the one it was taken with.
+    pub(crate) fn swap_factors(
+        &mut self,
+        snap: FactorSnapshot,
+    ) -> Result<Option<FactorSnapshot>, FactorSnapshot> {
+        let fits = match &snap.0 {
+            SnapshotKind::Unrolled { lu, jit } => {
+                self.unrolled_jit
+                    .as_ref()
+                    .is_some_and(|j| std::sync::Arc::ptr_eq(j, jit))
+                    && self.ordering.is_some()
+                    && self.lu_buf.len() == lu.len()
+            }
+            SnapshotKind::Dense(d) => {
+                self.kind == LinearSolverKind::DensePartialPivotLu
+                    && self.dense_lu.as_ref().is_some_and(|x| x.dim == d.dim)
+            }
+            SnapshotKind::Faer { epoch, .. } => {
+                self.kind == LinearSolverKind::FaerSupernodal
+                    && self.faer_cache.as_ref().is_some_and(|c| c.epoch == *epoch)
+            }
+        };
+        if !fits {
+            return Err(snap);
+        }
+        // a snapshot only fits the solver tier it was taken on, which is the tier of valid live factors, so the
+        // outgoing factors are of the same kind (any other live factors are dropped, as a copying restore would)
+        let live = self.live_kind();
+        let prev = match snap.0 {
+            SnapshotKind::Unrolled { lu, jit } => {
+                let old = std::mem::replace(&mut self.lu_buf, lu);
+                self.factors_in_faer = false;
+                self.factors_dense = false;
+                (live == Some(LiveKind::Unrolled))
+                    .then_some(SnapshotKind::Unrolled { lu: old, jit })
+            }
+            SnapshotKind::Dense(d) => {
+                let old = self.dense_lu.replace(d);
+                self.factors_in_faer = false;
+                self.factors_dense = true;
+                old.filter(|_| live == Some(LiveKind::Dense))
+                    .map(SnapshotKind::Dense)
+            }
+            SnapshotKind::Faer { mut numeric, epoch } => {
+                let c = self
+                    .faer_cache
+                    .as_mut()
+                    .expect("checked above: the faer cache exists");
+                std::mem::swap(&mut c.numeric, &mut *numeric);
+                c.valid = true;
+                self.factors_in_faer = true;
+                self.factors_dense = false;
+                (live == Some(LiveKind::Faer)).then_some(SnapshotKind::Faer { numeric, epoch })
+            }
+        };
+        self.factors_valid = true;
+        Ok(prev.map(FactorSnapshot))
     }
 
     /// Factorizes `csc` and solves $A x = b$ into `x`.

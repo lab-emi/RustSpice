@@ -939,13 +939,26 @@ pub fn inject_options(deck: &str, opts: &str) -> String {
     }
 }
 
-/// [`inject_options`] on raw bytes, for decks that are not valid UTF-8 (every other byte stays untouched).
-pub fn inject_options_bytes(deck: &[u8], opts: &str) -> Vec<u8> {
-    let opts = opts.trim();
-    if opts.is_empty() {
-        return deck.to_vec();
-    }
-    let line = options_line(opts);
+/// The `.save` card of a reference run that only needs `vectors` (the case's probes), or `None` when one of them is
+/// not a plain `v(<node>)` / `i(<source>)` name of letters, digits, `_` and `.` (other names are left to the full
+/// output: their `.save` spelling is not checked against ngspice).
+pub fn save_line(vectors: &[String]) -> Option<String> {
+    let plain = |v: &String| {
+        v.strip_prefix("v(")
+            .or_else(|| v.strip_prefix("i("))
+            .and_then(|s| s.strip_suffix(')'))
+            .is_some_and(|n| {
+                !n.is_empty()
+                    && n.bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.')
+            })
+    };
+    (!vectors.is_empty() && vectors.iter().all(plain))
+        .then(|| format!(".save {}", vectors.join(" ")))
+}
+
+/// Insert `line` directly after the title line of a deck given as bytes (every other byte stays untouched).
+pub fn inject_line_bytes(deck: &[u8], line: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(deck.len() + line.len() + 2);
     match deck.iter().position(|&b| b == b'\n') {
         Some(i) => {
@@ -962,6 +975,15 @@ pub fn inject_options_bytes(deck: &[u8], opts: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+/// [`inject_options`] on raw bytes, for decks that are not valid UTF-8 (every other byte stays untouched).
+pub fn inject_options_bytes(deck: &[u8], opts: &str) -> Vec<u8> {
+    let opts = opts.trim();
+    if opts.is_empty() {
+        return deck.to_vec();
+    }
+    inject_line_bytes(deck, &options_line(opts))
 }
 
 /// Expand `bench.series.tstep` into one deck per time step; non-series decks yield one unchanged entry.

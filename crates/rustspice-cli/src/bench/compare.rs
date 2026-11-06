@@ -170,6 +170,13 @@ pub struct ProbeResult {
     pub own_grid_err: Option<f64>,
     /// Same at RustSpice's own rows against the oracle of the case (when it has one and it could be evaluated).
     pub oracle_own_grid_err: Option<f64>,
+    /// Transient only, EVIDENCE (never used for pass/fail): the as-is ngspice run at ITS own time rows (the reference
+    /// interpolated to them), normalised like `ng_err`; the counterpart of `own_grid_err`. `ng_err` reads ngspice at
+    /// the nominal `k * tstep` grid by linear interpolation between its rows, so it also charges ngspice the
+    /// harness's linear resampling of its waveform, whereas RustSpice writes its rows on that grid itself (interpolated
+    /// inside the solver). Compare `rs_err` with `ng_err` for the values a reader of the two rawfiles gets at
+    /// `k * tstep`, and `own_grid_err` with this field for each simulator at the points it actually wrote.
+    pub ng_own_err: Option<f64>,
     /// dc sweep whose grids do not match (point count or an axis value): number of leading points on which the two
     /// sweeps are aligned and were compared as EVIDENCE (the structural failure decides the verdict, not these).
     pub aligned_points: Option<usize>,
@@ -214,8 +221,14 @@ pub struct CompareResult {
     pub interp_floor: Option<f64>,
     pub oracle: Option<OracleSummary>,
     /// Headline scalar errors (max over evaluated probes; norm for tran, abs otherwise): rustspice / as-is ngspice.
+    /// Transient: the value at the nominal `k * tstep` grid, each waveform read there by linear interpolation between
+    /// its rows (see [`ProbeResult::ng_own_err`]).
     pub err_rs: Option<f64>,
     pub err_ng: Option<f64>,
+    /// Transient only, EVIDENCE: the same maxima with each simulator read at its OWN rows
+    /// ([`ProbeResult::own_grid_err`], [`ProbeResult::ng_own_err`]).
+    pub err_rs_own: Option<f64>,
+    pub err_ng_own: Option<f64>,
     pub within_ng_error: Option<bool>,
     /// Every probe was vacuous (reference ~0) and none deviates: nothing could be evaluated, nothing is wrong.
     pub vacuous_only: bool,
@@ -844,6 +857,14 @@ pub fn compare_budgeted(
                 if p.pass.is_some() || p.vacuous {
                     bump(&mut res.err_rs, if p.vacuous { None } else { p.rs_err });
                     bump(&mut res.err_ng, if p.vacuous { None } else { p.ng_err });
+                    bump(
+                        &mut res.err_rs_own,
+                        if p.vacuous { None } else { p.own_grid_err },
+                    );
+                    bump(
+                        &mut res.err_ng_own,
+                        if p.vacuous { None } else { p.ng_own_err },
+                    );
                 }
                 res.probes.push(p);
             }
@@ -1767,6 +1788,19 @@ fn compare_tran(
                     p.ng_err = Some(s.worst / denom);
                 }
                 ng_grid = Some(g);
+                // evidence: ngspice at its own rows inside the window (at most 200 000, like RustSpice's)
+                let rows: Vec<usize> = (0..nt.len().min(ny.len()))
+                    .filter(|&k| nt[k] >= t0 && nt[k] <= tend)
+                    .collect();
+                let (ts, ys): (Vec<f64>, Vec<f64>) = thin_indices(rows.len(), 200_000)
+                    .into_iter()
+                    .map(|i| (nt[rows[i]], ny[rows[i]]))
+                    .unzip();
+                let yr: Vec<f64> = ts.iter().map(|&t| interp(t_rf, y_rf, t)).collect();
+                let s = diff_stats(&ts, &ys, &yr);
+                if s.used > 0 {
+                    p.ng_own_err = Some(s.worst / denom);
+                }
             }
         }
         if let (Some(e), Some(ne)) = (p.rs_err, p.ng_err) {
@@ -3246,6 +3280,48 @@ mod tests {
             r.probes[0].oracle_own_grid_err, None,
             "no oracle on this case"
         );
+    }
+
+    /// The as-is ngspice error at its own rows is evidence beside `ng_err`: an ngspice that is exact at its own
+    /// (coarse, off-grid) rows is charged the linear resampling of its waveform at `k * tstep` by `ng_err` only.
+    #[test]
+    fn ngspice_own_row_error_is_evidence_beside_the_grid_error() {
+        let m = meta_from("* bench.tol.norm: 5e-3");
+        let deck = "t\n.tran 100n 20u\n";
+        let f = |t: f64| (2.0 * std::f64::consts::PI * 1e5 * t).sin();
+        let rf = tran_at(&steps(5e-9, 4000), f);
+        let rs = tran_at(&steps(100e-9, 200), f);
+        // exact at its own rows, which are 4x coarser than tstep and off the grid
+        let ng_rows: Vec<f64> = (0..=50)
+            .map(|k| (k as f64 * 400e-9 + if k > 0 { 37e-9 } else { 0.0 }).min(20e-6))
+            .collect();
+        let ng = tran_at(&ng_rows, f);
+        let r = compare(&CompareInput {
+            meta: &m,
+            deck,
+            rs: &rs,
+            reference: &rf,
+            asis: Some(&ng),
+        });
+        let p = &r.probes[0];
+        let (grid, own) = (
+            p.ng_err.unwrap(),
+            p.ng_own_err.expect("ngspice own-row evidence"),
+        );
+        assert!(own < 1e-3 * grid, "own {own:e} grid {grid:e}");
+        assert!(
+            grid > 1e-3,
+            "setup: resampling a 400 ns sampling of the sine must cost: {grid:e}"
+        );
+        assert_eq!(r.err_ng, Some(grid));
+        assert_eq!(r.err_ng_own, Some(own));
+        assert_eq!(r.err_rs_own, p.own_grid_err);
+        // evidence only: the verdict and the ngspice comparison are those of the grid metric
+        assert_eq!(r.pass, Some(true));
+        assert_eq!(p.within_ng_error, Some(true));
+        // without an as-is run there is no ngspice evidence at all
+        let r = run(&m, deck, &rs, &rf);
+        assert_eq!((r.probes[0].ng_own_err, r.err_ng_own), (None, None));
     }
 
     /// ER-metrics-08: the oracle cut-off is reported as `budget`, once per case, with the other probes skipped.

@@ -2,7 +2,7 @@
 //! several plots per file). Pure std, never panics on malformed input.
 
 use std::fmt;
-use std::io::Write;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 /// Largest plot (or file) the reader will load: `skipped_budget` territory above this (Rule 9).
@@ -111,40 +111,135 @@ fn normalize_name(raw: &str) -> String {
 }
 
 pub fn read_file(path: &Path) -> Result<Vec<Plot>, RawError> {
-    let meta =
-        std::fs::metadata(path).map_err(|e| RawError::Io(format!("{}: {e}", path.display())))?;
-    if meta.len() > MAX_PLOT_BYTES {
+    Ok(read_path(path, false, None)?.plots)
+}
+
+/// Reads and parses the file at `path` through a buffer: only the parsed columns are ever held, never the file.
+fn read_path(path: &Path, lenient: bool, keep: Option<&[String]>) -> Result<Loaded, RawError> {
+    let io = |e: io::Error| RawError::Io(format!("{}: {e}", path.display()));
+    let f = std::fs::File::open(path).map_err(io)?;
+    let len = f.metadata().map_err(io)?.len();
+    if len > MAX_PLOT_BYTES {
         return Err(RawError::Budget(format!(
             "{} is {} bytes (> {} byte limit)",
             path.display(),
-            meta.len(),
+            len,
             MAX_PLOT_BYTES
         )));
     }
-    let data = std::fs::read(path).map_err(|e| RawError::Io(format!("{}: {e}", path.display())))?;
-    parse(&data)
+    let mut src = Src {
+        r: BufReader::with_capacity(64 << 10, f),
+        pos: 0,
+        len,
+        name: path.display().to_string(),
+    };
+    parse_src(&mut src, lenient, keep)
 }
 
-fn read_line(data: &[u8], pos: &mut usize) -> Option<String> {
-    if *pos >= data.len() {
-        return None;
+/// The bytes of a rawfile being parsed: in memory (`&[u8]`) or a buffered file, with its length for the truncation
+/// checks.
+struct Src<R: BufRead> {
+    r: R,
+    /// Bytes consumed so far.
+    pos: u64,
+    len: u64,
+    /// Names the file in I/O errors.
+    name: String,
+}
+
+fn src_error(name: &str, e: io::Error) -> RawError {
+    if e.kind() == io::ErrorKind::UnexpectedEof {
+        RawError::Truncated(format!("{name}: {e}"))
+    } else {
+        RawError::Io(format!("{name}: {e}"))
     }
-    let rest = &data[*pos..];
-    let (line, adv) = match rest.iter().position(|&b| b == b'\n') {
-        Some(i) => (&rest[..i], i + 1),
-        None => (rest, rest.len()),
-    };
-    *pos += adv;
-    Some(
-        String::from_utf8_lossy(line)
-            .trim_end_matches('\r')
-            .to_string(),
-    )
+}
+
+impl<'a> Src<&'a [u8]> {
+    fn of(data: &'a [u8]) -> Self {
+        Src {
+            r: data,
+            pos: 0,
+            len: data.len() as u64,
+            name: "rawfile".to_string(),
+        }
+    }
+}
+
+impl<R: BufRead> Src<R> {
+    /// Bytes left after the current position.
+    fn avail(&self) -> u64 {
+        self.len.saturating_sub(self.pos)
+    }
+
+    /// The next line without its `\n` (and a trailing `\r`); `None` at the end of the data.
+    fn read_line(&mut self) -> Result<Option<String>, RawError> {
+        let mut line = Vec::new();
+        let name = &self.name;
+        let n = self
+            .r
+            .read_until(b'\n', &mut line)
+            .map_err(|e| src_error(name, e))?;
+        if n == 0 {
+            return Ok(None);
+        }
+        self.pos += n as u64;
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&line)
+                .trim_end_matches('\r')
+                .to_string(),
+        ))
+    }
+
+    /// Skips newlines and spaces (between plots); `false` at the end of the data.
+    fn skip_blank(&mut self) -> Result<bool, RawError> {
+        loop {
+            let name = &self.name;
+            let buf = self.r.fill_buf().map_err(|e| src_error(name, e))?;
+            if buf.is_empty() {
+                return Ok(false);
+            }
+            let n = buf
+                .iter()
+                .take_while(|b| matches!(b, b'\n' | b'\r' | b' '))
+                .count();
+            let more = n < buf.len();
+            self.r.consume(n);
+            self.pos += n as u64;
+            if more {
+                return Ok(true);
+            }
+        }
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), RawError> {
+        let name = &self.name;
+        self.r.read_exact(buf).map_err(|e| src_error(name, e))?;
+        self.pos += buf.len() as u64;
+        Ok(())
+    }
+
+    /// Skips `n` bytes (checked against [`Src::avail`] by the caller).
+    fn skip(&mut self, n: u64) -> Result<(), RawError> {
+        let name = &self.name;
+        let done = io::copy(&mut (&mut self.r).take(n), &mut io::sink())
+            .map_err(|e| src_error(name, e))?;
+        self.pos += done;
+        if done < n {
+            return Err(RawError::Truncated(format!(
+                "{name}: {n} bytes to skip, {done} available"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Parse every plot in `data`.
 pub fn parse(data: &[u8]) -> Result<Vec<Plot>, RawError> {
-    let loaded = parse_all(data, false)?;
+    let loaded = parse_all(data, false, None)?;
     Ok(loaded.plots)
 }
 
@@ -158,39 +253,36 @@ pub struct Loaded {
 
 /// [`parse`] that skips binary complex plots instead of failing (the suite compares real plots only).
 pub fn parse_lenient(data: &[u8]) -> Result<Loaded, RawError> {
-    parse_all(data, true)
+    parse_all(data, true, None)
 }
 
 /// [`read_file`] with [`parse_lenient`].
 pub fn read_file_lenient(path: &Path) -> Result<Loaded, RawError> {
-    let meta =
-        std::fs::metadata(path).map_err(|e| RawError::Io(format!("{}: {e}", path.display())))?;
-    if meta.len() > MAX_PLOT_BYTES {
-        return Err(RawError::Budget(format!(
-            "{} is {} bytes (> {} byte limit)",
-            path.display(),
-            meta.len(),
-            MAX_PLOT_BYTES
-        )));
-    }
-    let data = std::fs::read(path).map_err(|e| RawError::Io(format!("{}: {e}", path.display())))?;
-    parse_lenient(&data)
+    read_file_lenient_keep(path, None)
 }
 
-fn parse_all(data: &[u8], lenient: bool) -> Result<Loaded, RawError> {
+/// [`read_file_lenient`] keeping, of every plot, only the axis (the first variable) and the variables named in `keep`
+/// (`None`: all of them). The file is read through a buffer and the other columns are skipped row by row, so a
+/// reference with many vectors costs the memory of the few the comparison uses.
+pub fn read_file_lenient_keep(path: &Path, keep: Option<&[String]>) -> Result<Loaded, RawError> {
+    read_path(path, true, keep)
+}
+
+fn parse_all(data: &[u8], lenient: bool, keep: Option<&[String]>) -> Result<Loaded, RawError> {
+    parse_src(&mut Src::of(data), lenient, keep)
+}
+
+fn parse_src<R: BufRead>(
+    src: &mut Src<R>,
+    lenient: bool,
+    keep: Option<&[String]>,
+) -> Result<Loaded, RawError> {
     let mut out = Loaded::default();
-    let mut pos = 0usize;
     let mut any = false;
-    loop {
-        // Skip blank lines between plots.
-        while pos < data.len() && (data[pos] == b'\n' || data[pos] == b'\r' || data[pos] == b' ') {
-            pos += 1;
-        }
-        if pos >= data.len() {
-            break;
-        }
+    // blank lines between plots are skipped
+    while src.skip_blank()? {
         any = true;
-        match parse_plot(data, &mut pos, lenient)? {
+        match parse_plot(src, lenient, keep)? {
             Parsed::Plot(p) => out.plots.push(p),
             Parsed::Skipped(name) => out.skipped.push(name),
         }
@@ -206,7 +298,11 @@ enum Parsed {
     Skipped(String),
 }
 
-fn parse_plot(data: &[u8], pos: &mut usize, lenient: bool) -> Result<Parsed, RawError> {
+fn parse_plot<R: BufRead>(
+    src: &mut Src<R>,
+    lenient: bool,
+    keep: Option<&[String]>,
+) -> Result<Parsed, RawError> {
     let mut title = String::new();
     let mut plotname = String::new();
     let mut flags = String::new();
@@ -215,7 +311,7 @@ fn parse_plot(data: &[u8], pos: &mut usize, lenient: bool) -> Result<Parsed, Raw
     let mut vars: Vec<Var> = Vec::new();
     let mut binary = None;
     let mut header_lines = 0usize;
-    while let Some(line) = read_line(data, pos) {
+    while let Some(line) = src.read_line()? {
         header_lines += 1;
         if header_lines > 1_000_000 {
             return Err(RawError::Malformed("header too long".to_string()));
@@ -235,7 +331,7 @@ fn parse_plot(data: &[u8], pos: &mut usize, lenient: bool) -> Result<Parsed, Raw
                 return Err(RawError::Malformed(format!("bad variable count {nv}")));
             }
             for i in 0..nv {
-                let Some(l) = read_line(data, pos) else {
+                let Some(l) = src.read_line()? else {
                     if npoints == Some(0) {
                         // a header-only file of an empty sweep (ngspice cuts the variable list off)
                         let cols = vec![Vec::new(); vars.len()];
@@ -300,13 +396,13 @@ fn parse_plot(data: &[u8], pos: &mut usize, lenient: bool) -> Result<Parsed, Raw
         if lenient && binary {
             // 16 bytes per value (real and imaginary part)
             let need = (nv as u128) * (np as u128) * 16;
-            let avail = data.len().saturating_sub(*pos) as u128;
+            let avail = src.avail() as u128;
             if need > avail {
                 return Err(RawError::Truncated(format!(
                     "complex plot `{plotname}` needs {need} data bytes, {avail} available"
                 )));
             }
-            *pos += need as usize;
+            src.skip(need as u64)?;
             return Ok(Parsed::Skipped(plotname));
         }
         return Err(RawError::Unsupported("complex data".to_string()));
@@ -317,31 +413,48 @@ fn parse_plot(data: &[u8], pos: &mut usize, lenient: bool) -> Result<Parsed, Raw
             "plot `{plotname}` is {nv} vars x {np} points = {bytes} bytes (> {MAX_PLOT_BYTES})"
         )));
     }
-    let mut cols: Vec<Vec<f64>> = (0..nv).map(|_| Vec::new()).collect();
+    // column of every variable in `cols`: all of them, or only the axis and the `keep` vectors
+    let mut slot: Vec<Option<usize>> = Vec::with_capacity(nv);
+    let mut kept = 0usize;
+    for (i, v) in vars.iter().enumerate() {
+        let read = i == 0 || keep.is_none_or(|names| names.contains(&v.name));
+        slot.push(read.then_some(kept));
+        kept += usize::from(read);
+    }
+    let mut cols: Vec<Vec<f64>> = (0..kept).map(|_| Vec::new()).collect();
     if binary {
-        let need = bytes as usize;
-        if data.len() - (*pos).min(data.len()) < need {
+        let need = bytes as u64;
+        if src.avail() < need {
             return Err(RawError::Truncated(format!(
                 "plot `{plotname}` needs {need} data bytes, {} available",
-                data.len().saturating_sub(*pos)
+                src.avail()
             )));
         }
-        let block = &data[*pos..*pos + need];
-        *pos += need;
         for c in cols.iter_mut() {
             c.reserve_exact(np);
         }
-        for (k, i) in (0..need).step_by(8).enumerate() {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&block[i..i + 8]);
-            cols[k % nv].push(f64::from_le_bytes(b));
+        // row by row: (byte offset in the row, column) of the kept variables
+        let picks: Vec<(usize, usize)> = slot
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|c| (8 * i, c)))
+            .collect();
+        let mut row = vec![0u8; if np > 0 { 8 * nv } else { 0 }];
+        for _ in 0..np {
+            src.read_exact(&mut row)?;
+            for &(at, c) in &picks {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&row[at..at + 8]);
+                cols[c].push(f64::from_le_bytes(b));
+            }
         }
     } else {
         for p in 0..np {
             // point index, then nv values, whitespace separated (ngspice puts the index and first value on one line)
             let mut toks = Vec::with_capacity(nv + 1);
             while toks.len() < nv + 1 {
-                let l = read_line(data, pos)
+                let l = src
+                    .read_line()?
                     .ok_or_else(|| RawError::Truncated(format!("ASCII values at point {p}")))?;
                 toks.extend(l.split_whitespace().map(|s| s.to_string()));
             }
@@ -355,9 +468,18 @@ fn parse_plot(data: &[u8], pos: &mut usize, lenient: bool) -> Result<Parsed, Raw
                 let v: f64 = t
                     .parse()
                     .map_err(|_| RawError::Malformed(format!("bad number `{t}` at point {p}")))?;
-                cols[i].push(v);
+                if let Some(c) = slot[i] {
+                    cols[c].push(v);
+                }
             }
         }
+    }
+    if kept < nv {
+        vars = vars
+            .into_iter()
+            .zip(&slot)
+            .filter_map(|(v, c)| c.map(|_| v))
+            .collect();
     }
     Ok(Parsed::Plot(Plot {
         title,
@@ -375,25 +497,64 @@ fn parse_plot(data: &[u8], pos: &mut usize, lenient: bool) -> Result<Parsed, Raw
 /// `rustspice`, an empty value and `n/a` do not. The line therefore carries an `ngspice-` prefixed, non-runnable text.
 pub const HEADER_COMMAND: &str = "ngspice-compatible rawfile written by rustspice";
 
-fn write_header<W: Write>(
+/// Width of the `No. Points:` value of a header written before the point count is known
+/// ([`write_header_deferred`]): spaces, overwritten by [`deferred_points_value`] once the plot is complete (the way
+/// ngspice streams its rawfile; readers trim the value).
+pub const DEFERRED_POINTS_WIDTH: usize = 20;
+
+/// Header text up to and including `No. Points: `.
+fn header_head(title: &str, plotname: &str, vars: &[Var]) -> String {
+    format!(
+        "Title: {}\nDate: n/a\nCommand: {HEADER_COMMAND}\nPlotname: {}\nFlags: real\nNo. Variables: {}\nNo. Points: ",
+        title.replace('\n', " "),
+        plotname,
+        vars.len(),
+    )
+}
+
+/// Header text after the `No. Points:` value, through `Binary:`.
+fn write_header_tail<W: Write>(w: &mut W, vars: &[Var]) -> std::io::Result<()> {
+    w.write_all(b"\nVariables:\n")?;
+    for (i, v) in vars.iter().enumerate() {
+        writeln!(w, "\t{}\t{}\t{}", i, v.name, v.kind)?;
+    }
+    w.write_all(b"Binary:\n")
+}
+
+/// The header of a binary plot of `npoints` rows.
+pub fn write_header<W: Write>(
     w: &mut W,
     title: &str,
     plotname: &str,
     vars: &[Var],
     npoints: usize,
 ) -> std::io::Result<()> {
-    write!(
-        w,
-        "Title: {}\nDate: n/a\nCommand: {HEADER_COMMAND}\nPlotname: {}\nFlags: real\nNo. Variables: {}\nNo. Points: {}\nVariables:\n",
-        title.replace('\n', " "),
-        plotname,
-        vars.len(),
-        npoints
-    )?;
-    for (i, v) in vars.iter().enumerate() {
-        writeln!(w, "\t{}\t{}\t{}", i, v.name, v.kind)?;
-    }
-    w.write_all(b"Binary:\n")
+    write!(w, "{}{}", header_head(title, plotname, vars), npoints)?;
+    write_header_tail(w, vars)
+}
+
+/// [`write_header`] for a plot whose row count is not known yet: the `No. Points:` value is
+/// [`DEFERRED_POINTS_WIDTH`] spaces. Returns the offset of that value from the first byte written, where
+/// [`deferred_points_value`] goes once the rows are written.
+pub fn write_header_deferred<W: Write>(
+    w: &mut W,
+    title: &str,
+    plotname: &str,
+    vars: &[Var],
+) -> std::io::Result<u64> {
+    let head = header_head(title, plotname, vars);
+    w.write_all(head.as_bytes())?;
+    w.write_all(&[b' '; DEFERRED_POINTS_WIDTH])?;
+    write_header_tail(w, vars)?;
+    Ok(head.len() as u64)
+}
+
+/// The `No. Points:` value of a deferred header: `npoints` left-aligned in [`DEFERRED_POINTS_WIDTH`] bytes.
+pub fn deferred_points_value(npoints: usize) -> [u8; DEFERRED_POINTS_WIDTH] {
+    let mut v = [b' '; DEFERRED_POINTS_WIDTH];
+    let digits = npoints.to_string();
+    v[..digits.len()].copy_from_slice(digits.as_bytes());
+    v
 }
 
 /// Write plots in ngspice binary rawfile layout.
@@ -523,6 +684,74 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_point_count_parses_like_a_known_one() {
+        let plots = sample();
+        let tr = &plots[1];
+        let rows: Vec<Vec<f64>> = (0..tr.npoints).map(|p| vec![tr.cols[1][p]]).collect();
+        let mut known = Vec::new();
+        write_rows(
+            &mut known,
+            &tr.title,
+            &tr.plotname,
+            &tr.vars,
+            Some(&tr.cols[0]),
+            &rows,
+        )
+        .unwrap();
+        // the streamed form: blank count, rows, then the count written into the blank
+        let mut streamed = Vec::new();
+        let at = write_header_deferred(&mut streamed, &tr.title, &tr.plotname, &tr.vars).unwrap()
+            as usize;
+        for (k, r) in rows.iter().enumerate() {
+            streamed.extend_from_slice(&tr.cols[0][k].to_le_bytes());
+            streamed.extend_from_slice(&r[0].to_le_bytes());
+        }
+        streamed[at..at + DEFERRED_POINTS_WIDTH]
+            .copy_from_slice(&deferred_points_value(tr.npoints));
+        assert_eq!(parse(&streamed).unwrap(), parse(&known).unwrap());
+        let text = String::from_utf8_lossy(&streamed);
+        assert!(text.contains(&format!(
+            "\nNo. Points: 3{}\n",
+            " ".repeat(DEFERRED_POINTS_WIDTH - 1)
+        )));
+        assert_eq!(
+            deferred_points_value(usize::MAX).len(),
+            DEFERRED_POINTS_WIDTH
+        );
+    }
+
+    #[test]
+    fn keep_reads_only_the_axis_and_the_named_vectors() {
+        let mut plots = sample();
+        plots[1].vars.push(Var {
+            name: "v(b)".into(),
+            kind: "voltage".into(),
+        });
+        plots[1].cols.push(vec![7.0, 8.0, 9.0]);
+        let mut buf = Vec::new();
+        write(&mut buf, &plots).unwrap();
+        let path = std::env::temp_dir().join(format!("rawfile_keep_{}.raw", std::process::id()));
+        std::fs::write(&path, &buf).unwrap();
+        let keep = vec!["v(b)".to_string()];
+        let got = read_file_lenient_keep(&path, Some(&keep)).unwrap().plots;
+        let _ = std::fs::remove_file(&path);
+        // the axis (first variable) always stays; an absent name is simply not there
+        assert_eq!(got[0].vars, plots[0].vars[..1]);
+        assert_eq!(got[0].cols, plots[0].cols[..1]);
+        let names: Vec<&str> = got[1].vars.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["time", "v(b)"]);
+        assert_eq!(
+            got[1].cols,
+            vec![plots[1].cols[0].clone(), plots[1].cols[2].clone()]
+        );
+        assert_eq!(got[1].npoints, 3);
+        // ASCII plots too
+        let txt = "Title: x\nPlotname: DC transfer characteristic\nFlags: real\nNo. Variables: 3\nNo. Points: 2\nVariables:\n\t0\tV(v-sweep)\tvoltage\n\t1\tV1#branch\tcurrent\n\t2\tv(b)\tvoltage\nValues:\n 0\t0.0\n\t-1.0e-3\n\t5\n 1\t1.0\n\t-2.0e-3\n\t6\n";
+        let p = parse_all(txt.as_bytes(), true, Some(&keep)).unwrap().plots;
+        assert_eq!(p[0].cols, vec![vec![0.0, 1.0], vec![5.0, 6.0]]);
+    }
+
+    #[test]
     fn ascii_fallback_and_branch_names() {
         let txt = "Title: x\nPlotname: DC transfer characteristic\nFlags: real\nNo. Variables: 2\nNo. Points: 2\nVariables:\n\t0\tV(v-sweep)\tvoltage\n\t1\tV1#branch\tcurrent\nValues:\n 0\t0.0\n\t-1.0e-3\n 1\t1.0\n\t-2.0e-3\n";
         let p = parse(txt.as_bytes()).unwrap();
@@ -622,6 +851,87 @@ mod tests {
             Err(RawError::Truncated(_))
         ));
         assert!(parse_lenient(b"").is_err());
+    }
+
+    /// A file is read through a buffer, plot by plot and row by row: the same plots as parsing its bytes in memory,
+    /// across buffer refills (rows wider than the buffer, a complex plot to skip, ASCII and binary plots), and the same
+    /// errors for a truncated file.
+    #[test]
+    fn reading_a_file_gives_the_plots_of_its_bytes() {
+        let wide: Vec<Var> = (0..9000)
+            .map(|i| Var {
+                name: if i == 0 {
+                    "time".into()
+                } else {
+                    format!("v(n{i})")
+                },
+                kind: if i == 0 {
+                    "time".into()
+                } else {
+                    "voltage".into()
+                },
+            })
+            .collect();
+        let rows: Vec<Vec<f64>> = (0..7)
+            .map(|k| (1..9000).map(|i| (k * 9000 + i) as f64 * 0.5).collect())
+            .collect();
+        let axis: Vec<f64> = (0..7).map(|k| k as f64 * 1e-9).collect();
+        let mut buf = b"Title: x\nPlotname: AC Analysis\nFlags: complex\nNo. Variables: 2\nNo. Points: 2\nVariables:\n\t0\tfrequency\tfrequency\n\t1\tv(a)\tvoltage\nBinary:\n".to_vec();
+        buf.extend_from_slice(&[7u8; 2 * 2 * 16]);
+        write_rows(
+            &mut buf,
+            "w",
+            "Transient Analysis",
+            &wide,
+            Some(&axis),
+            &rows,
+        )
+        .unwrap();
+        buf.extend_from_slice(b"\n");
+        write(&mut buf, &sample()).unwrap();
+        buf.extend_from_slice(b"Title: x\nPlotname: DC transfer characteristic\nFlags: real\nNo. Variables: 2\nNo. Points: 2\nVariables:\n\t0\tV(v-sweep)\tvoltage\n\t1\tV1#branch\tcurrent\nValues:\n 0\t0.0\n\t-1.0e-3\n 1\t1.0\n\t-2.0e-3\n");
+        let path = std::env::temp_dir().join(format!("rawfile_stream_{}.raw", std::process::id()));
+        std::fs::write(&path, &buf).unwrap();
+        let mem = parse_lenient(&buf).unwrap();
+        let file = read_file_lenient(&path).unwrap();
+        assert_eq!(file.plots, mem.plots);
+        assert_eq!(file.skipped, mem.skipped);
+        assert_eq!(file.plots.len(), 4);
+        assert_eq!(file.plots[0].cols[8999][6], (6 * 9000 + 8999) as f64 * 0.5);
+        let keep = vec!["v(n8999)".to_string(), "v(a)".to_string()];
+        let kept = read_file_lenient_keep(&path, Some(&keep)).unwrap();
+        assert_eq!(
+            kept.plots,
+            parse_all(&buf, true, Some(&keep)).unwrap().plots
+        );
+        assert_eq!(
+            kept.plots[0].cols,
+            vec![
+                axis.clone(),
+                rows.iter().map(|r| r[8998]).collect::<Vec<f64>>()
+            ]
+        );
+        // the strict reader refuses the complex plot from a file as from memory
+        assert_eq!(read_file(&path).unwrap_err(), parse(&buf).unwrap_err());
+        // cut anywhere: the same plots or the same error as the bytes in memory (inside a header, the variable list
+        // or the binary rows of the wide plot, and inside the last, ASCII plot)
+        for cut in [100, 200, 70_000, 300_000, buf.len() - 40, buf.len() - 1] {
+            std::fs::write(&path, &buf[..cut]).unwrap();
+            let got = read_file_lenient(&path).map(|l| l.plots);
+            assert_eq!(
+                got,
+                parse_lenient(&buf[..cut]).map(|l| l.plots),
+                "cut at {cut}"
+            );
+            if cut <= 300_000 {
+                assert!(got.is_err(), "cut at {cut}");
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            read_file(&path),
+            Err(RawError::Io(m)) if m.contains("rawfile_stream_")
+        ));
     }
 
     #[test]

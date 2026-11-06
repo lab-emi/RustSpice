@@ -120,7 +120,11 @@ both simulators), may appear anywhere after the title line, one key per line:
    in the log. ngspice failed = non-zero exit, no rawfile, or log matches `Error`, `singular matrix`, `no convergence`,
    `Timestep too small`, `Too many iterations`.
 2. **ngspice reference run** per `bench.ref` (temp copy of the deck with the options injected; tran gets `tmax`).
-   If the reference run fails, fall back to the as-is run and note `ref_status: "fell_back"`.
+   If the reference run fails, fall back to the as-is run and note `ref_status: "fell_back"`. A transient reference of
+   a case with `bench.probes` (plain `v(<node>)` / `i(<source>)` names) also gets `.save <probes>`
+   (`ref_options` ends in `save=probes`), and of any case with probes only the axis and the probes are read back.
+   Rawfiles are read through a buffer, row by row, and only the columns kept are held (never the whole file), so a
+   reference sampled far below `tstep` costs a few columns even when the `.save` could not be injected.
 3. **RustSpice correctness run**: subprocess `current_exe run <deck> --raw <tmp>/rs.raw --stats <tmp>/rs.json` under
    the same watchdog/RSS cap; exit code 101 or SIGABRT/SIGSEGV = `panic`; hang = `timeout`; stderr captured.
 4. **Timing** (only when `bench.timing`=yes and steps 1 and 3 succeeded and `--no-timing` absent): `--reps` (default 7,
@@ -147,6 +151,13 @@ both simulators), may appear anywhere after the title line, one key per line:
   50 %-crossing time shift. Pass iff `norm_err <= tol.norm`.
 - With a reference run report `err(rustspice, ref)` AND `err(ngspice_asis, ref)`; RustSpice is "within ngspice's own
   error" when `err(rs,ref) <= max(err(ng,ref), tol floor)`. With an oracle report `err(rs, oracle)` and `err(ng, oracle)`.
+- tran, what `err_rs` / `err_ng` measure: the value each rawfile gives at `k * tstep`, read by linear interpolation
+  between its rows. RustSpice writes its rows on that grid (interpolated inside the solver), as-is ngspice writes its
+  own time points, so `err_ng` also contains the harness's linear resampling of the ngspice waveform. As EVIDENCE
+  (never a verdict) each probe also carries both simulators at their OWN rows against the reference: `own_grid_err`
+  (RustSpice) and `ng_own_err` (as-is ngspice), with the case maxima `err_rs_own` / `err_ng_own` in `accuracy`. A
+  statement that one simulator is more accurate than the other names the metric: the `k * tstep` values, or the
+  own-row errors, which can rank the two differently (ngspice's rows are usually fewer and exact at their instants).
 - Never apply a relative metric to values indistinguishable from 0 (|ref| < 1e-30) and never report a pass on a probe
   whose reference is vacuous (all |ref| < floor): such a probe is `vacuous` and excluded with a note.
 - Series (work-precision): per point `err_rs`, `err_ng`, `t_rs`, `t_ng`; the report interpolates log-log "time at equal
