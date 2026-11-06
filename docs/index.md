@@ -9,12 +9,22 @@ RustSpice simulates transistor-level SPICE netlists (`.op`, `.dc`, `.tran`) and 
   <img src="assets/rustspice-banner.gif" alt="Circuit simulation for the next design iteration." width="1200">
 </picture>
 
+## RustSpice vs ngspice at a glance
+
+Ibex RTL-to-GDS on IHP SG13G2 with EZ130 cells and two SRAM macros, 2026-11-05: RustEDA and LibreLane 3.0.17 (OpenROAD, Yosys, KLayout, Magic, Netgen) ran one after the other on the same 4-vCPU host from the same prepared inputs, and the same signoff scripts checked both layouts.
+
+- **4.3–6.0× faster end to end than the faster ngspice-45 solver** on RC decks from the native SPEF of the final Ibex layout (10 decks, 198 to 6,865 unknowns), with **1.4–2.0× less peak memory**.
+- **All 10 cases pass accuracy**, and RustSpice is closer to the tightly converged reference than default-tolerance ngspice in every case on the nominal output grid (9 of 10 at each simulator's own output points).
+- The RustEDA flow around it finishes **4.2× sooner end to end** than LibreLane.
+
+LibreLane's layout fails the shared timing gate (112 maximum-capacitance and fanout violations at TT and SS) and its equivalence check does not complete, so the receipt keeps its own ratio fields null under its publication rule; the multiples here divide the recorded times. Stages are paired by phase, not as identical tasks. RustEDA is not faster everywhere: its repair before global routing takes 1.18× LibreLane's two pre-route resizer steps alone, OpenRCX runs 1.36× longer on RustEDA's DEF, and the latch-up check 1.11× longer on its layout. [All stages, gates and losses](https://lab-emi.github.io/RustEDA/benchmarks/)
+
 ## Ibex host campaign · 2026-11-05
 
 The RustEDA Ibex host campaign of 2026-11-05 (IHP SG13G2 / EZ130 with two real
 SRAMs, on a 4-vCPU Intel Xeon cloud host with 15.7 GiB RAM and no swap) ran
 `rustspice bench-suite` with RustSpice 0.1.0 (commit
-[`0b557b5`](https://github.com/lab-emi/RustSpice/commit/0b557b5fce24e7d5a70596d8d4d5a059c357ac4e)) against ngspice-45, with the deck builder and method of
+[`d4d6a50`](https://github.com/lab-emi/RustSpice/commit/d4d6a5043af226643d39ecc43f9a3859e29b0cc5)) against ngspice-45, with the deck builder and method of
 2026-11-02. The decks come from the native nominal SPEF of the new final layout,
 whose largest nets are smaller: the eight largest single nets have 198–291
 unknowns (5–10 sinks), and the two multi-net decks have 10 nets with 2,262

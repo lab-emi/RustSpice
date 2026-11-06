@@ -10,7 +10,7 @@ repository lockfile when reproducing a run.
 The RustEDA Ibex host campaign of 2026-11-05 (IHP SG13G2 / EZ130 with two real
 SRAMs, on a 4-vCPU Intel Xeon cloud host with 15.7 GiB RAM and no swap) ran
 `rustspice bench-suite` with RustSpice 0.1.0 (commit
-[`0b557b5`](https://github.com/lab-emi/RustSpice/commit/0b557b5fce24e7d5a70596d8d4d5a059c357ac4e)) against ngspice-45, with the deck builder and method of
+[`d4d6a50`](https://github.com/lab-emi/RustSpice/commit/d4d6a5043af226643d39ecc43f9a3859e29b0cc5)) against ngspice-45, with the deck builder and method of
 2026-11-02. The decks come from the native nominal SPEF of the new final layout,
 whose largest nets are smaller: the eight largest single nets have 198–291
 unknowns (5–10 sinks), and the two multi-net decks have 10 nets with 2,262
