@@ -22,15 +22,77 @@ Part of **[RustEDA](https://github.com/lab-emi/RustEDA)**, infrastructure for ch
 
 ## RustSpice vs ngspice at a glance
 
-Ibex RTL-to-GDS on IHP SG13G2 with EZ130 cells and two SRAM macros, 2026-11-05: RustEDA and LibreLane 3.0.17 (OpenROAD, Yosys, KLayout, Magic, Netgen) ran one after the other on the same 4-vCPU host from the same prepared inputs, and the same signoff scripts checked both layouts.
+Ibex RTL-to-GDS on IHP SG13G2 with EZ130 cells and two SRAM macros, 2026-11-13: RustEDA and LibreLane 3.0.17 (OpenROAD, Yosys, KLayout, Magic, Netgen) ran one after the other on the same 4-vCPU host from the same prepared inputs, and the same signoff scripts checked both layouts. Every RustEDA engine was built with Rust 1.100.0, RustSpice at [`71875bf`](https://github.com/lab-emi/RustSpice/commit/71875bf9a8c937fb6ada641c45f52df67f0cfa30).
 
-- **4.3–6.0× faster end to end than the faster ngspice-45 solver** on RC decks from the native SPEF of the final Ibex layout (10 decks, 198 to 6,865 unknowns), with **1.4–2.0× less peak memory**.
-- **All 10 cases pass accuracy**, and RustSpice is closer to the tightly converged reference than default-tolerance ngspice in every case on the nominal output grid (9 of 10 at each simulator's own output points).
-- The RustEDA flow around it finishes **4.2× sooner end to end** than LibreLane.
+- **4.1–7.0× faster end to end than the faster ngspice-45 solver** on RC decks from the native SPEF of the final Ibex layout (10 decks, 173 to 5,614 unknowns), with **1.4–2.1× less peak memory**. Some RustSpice medians are flagged `noisy`, so these multiples hold within this session only.
+- **All 10 cases pass accuracy**, and RustSpice is closer to the tightly converged reference than default-tolerance ngspice in every case on the nominal output grid; at each simulator's own output points it is closer in only 6 of 10, with default-tolerance ngspice closer on two single nets and both multi-net decks.
+- RustSpice is not part of the timed flow; the RustEDA flow around it finishes **4.4× sooner end to end** than LibreLane (751.54 s against 3,283.05 s with both flows' foundry checks on the same schedule; 3.5× with every check run one after another).
 
-LibreLane's layout fails the shared timing gate (112 maximum-capacitance and fanout violations at TT and SS) and its equivalence check does not complete, so the receipt keeps its own ratio fields null under its publication rule; the multiples here divide the recorded times. Stages are paired by phase, not as identical tasks. RustEDA is not faster everywhere: its repair before global routing takes 1.18× LibreLane's two pre-route resizer steps alone, OpenRCX runs 1.36× longer on RustEDA's DEF, and the latch-up check 1.11× longer on its layout. [All stages, gates and losses](https://lab-emi.github.io/RustEDA/benchmarks/)
+LibreLane's layout fails the shared timing gate (112 maximum-capacitance and fanout violations at TT and SS) and its equivalence check does not complete, so the receipt keeps its own ratio fields null under its publication rule; the multiples here divide the recorded times. Stages are paired by phase, not as identical tasks. Against the three losses of 2026-11-05, in same-load runs: repair before global routing now takes 0.73× the time of LibreLane's two pre-route resizer steps (ranges do not overlap; 1.18× on 2026-11-05), OpenRCX on RustEDA's layout is level with its time on LibreLane's (1.00×, ranges overlap; 1.36× on 2026-11-05) and the latch-up check on RustEDA's layout takes 0.76× its time on LibreLane's (1.11× with the checker of that campaign). RustEDA is still not faster or not better everywhere: RustROAD's standalone extraction takes 1.22× OpenRCX's time at 4 threads, RustSTA's peak memory at 4 threads is 11.8 % above OpenSTA's, the timing gate is level (0.98×, ranges overlap) and its layout keeps less hold margin (TT 0.108 ns against 0.172 ns; both meet hold). [All stages, gates and losses](https://lab-emi.github.io/RustEDA/benchmarks/#ibex-host-campaign-2026-11-13) · [Where RustEDA still loses or is at parity](https://lab-emi.github.io/RustEDA/benchmarks/#where-rusteda-still-loses-or-is-at-parity-2026-11-13)
 
-## Latest development · 2026-11-05
+## Latest development · 2026-11-13
+
+The RustEDA Ibex host campaign of 2026-11-13 (IHP SG13G2 / EZ130 with two real
+SRAMs, on a 4-vCPU Intel Xeon cloud host reporting 2.10 GHz, with 15.7 GiB RAM
+and no swap) ran `rustspice bench-suite` with RustSpice 0.1.0 (commit
+[`71875bf`](https://github.com/lab-emi/RustSpice/commit/71875bf9a8c937fb6ada641c45f52df67f0cfa30),
+built with Rust 1.100.0 instead of 1.97.1) against ngspice-45, with the deck
+builder and method of 2026-11-05. RustROAD's route changed since then (its
+topology controls cut the routed DEF from about 192 thousand wire pieces to 160
+thousand), so the decks differ from 2026-11-05's: the eight largest single nets
+of the new final layout have 173–237 unknowns (7–10 sinks), and the two
+multi-net decks have 10 nets with 1,836 unknowns and 40 nets with 5,614.
+**The suite verdict is `PASS`: all 10 cases `pass` accuracy.** Read at the
+nominal `k × tstep` output grid, RustSpice is closer to the tightly converged
+ngspice reference than default-tolerance ngspice in 10 of 10 cases. At each
+simulator's own output points (without the harness's linear resampling of
+ngspice's waveform) it is closer in 6 of 10; default-tolerance ngspice is closer
+on `ibex_net_00` (8.51 × 10⁻⁶ against 1.05 × 10⁻⁵), on `ibex_net_05`
+(2.03 × 10⁻⁵ against 2.44 × 10⁻⁵) and on both multi-net decks (4.67 × 10⁻⁴
+against 5.99 × 10⁻⁴ and 5.50 × 10⁻⁴). **RustSpice was 4.14–7.02× faster per
+deck, end to end, than the faster ngspice solver (SPARSE in every case), and
+used less memory in every case.**
+
+| | 8 single nets | 10 nets, 1,836 unknowns | 40 nets, 5,614 unknowns |
+| --- | ---: | ---: | ---: |
+| Accuracy verdict | `pass` × 8 | `pass` | `pass` |
+| Error / swing, RustSpice | 5.47 × 10⁻⁶ – 2.44 × 10⁻⁵ | 5.99 × 10⁻⁴ | 5.50 × 10⁻⁴ |
+| Error / swing, default-tolerance ngspice, nominal grid | 2.57–8.23 × 10⁻⁵ | 1.59 × 10⁻³ | 1.59 × 10⁻³ |
+| Error / swing, default-tolerance ngspice, its own output points | 7.12 × 10⁻⁶ – 2.03 × 10⁻⁵ | 4.67 × 10⁻⁴ | 4.67 × 10⁻⁴ |
+| ngspice SPARSE, median per-deck wall | 194.77–256.92 ms | 298.95 ms | 1,158.88 ms |
+| ngspice KLU, median per-deck wall | 222.27–307.41 ms | 348.62 ms | 1,234.75 ms |
+| RustSpice, median per-deck wall | 37.86–53.33 ms | 46.94 ms | 165.03 ms |
+| Quotient, faster ngspice ÷ RustSpice, per-deck wall (median) | 4.14–5.79× | 6.37× | 7.02× |
+| Quotient, faster ngspice ÷ RustSpice, analysis time only (median) | 4.85–6.79× | 8.59× | 9.50× |
+| Median peak RSS, ngspice SPARSE / RustSpice | 13,716–14,060 / 6,624–6,816 KiB | 19,000 / 11,040 KiB | 31,216 / 21,664 KiB |
+
+Times are medians of seven interleaved repetitions after a correctness warm-up,
+from one session on one host (load average 0.5 at the start and 1.0 at the
+end). The suite flags the RustSpice medians of `ibex_net_03`, `ibex_net_04`,
+`ibex_net_05`, `ibex_net_07` and `ibex_bulk_10` as `noisy` (relative spread
+above 0.2), so the quotients hold within this session only. The analysis-only
+quotient pairs ngspice's `Total analysis time` with RustSpice's `analysis_us`,
+which excludes RustSpice's parse and compile. Process start-up medians are
+6.53 ms for ngspice and 2.33 ms for RustSpice. The scope is unchanged: linear
+RC interconnect only, no transistor-level Ibex simulation (RustSpice does not
+implement IHP's PSP103 models), and RustSpice is not part of the timed
+RTL-to-GDS flow.
+
+**Against 2026-11-05 (history, not a before/after).** The 2026-11-05 campaign
+measured RustSpice at 4.32–5.96× end to end on other decks (198–291, 2,262 and
+6,865 unknowns) and on another virtual machine (a Xeon reporting 2.80 GHz). Both
+changed: on this host ngspice's start-up alone took 6.53 ms against 12.35 ms
+then, and RustSpice's 2.33 ms against 4.20 ms, and with the same tools and
+inputs every LibreLane stage took less time (floorplan level). The two
+campaigns' numbers therefore do not measure a change in RustSpice; compare
+RustSpice with ngspice within each campaign.
+
+[Decks, all values and method](docs/development-status.md#ibex-host-campaign-2026-11-13) ·
+[SPICE head-to-head](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45-2026-11-13) ·
+[Host campaign 2026-11-13](https://lab-emi.github.io/RustEDA/benchmarks/#ibex-host-campaign-2026-11-13) ·
+[Method and deviations](https://lab-emi.github.io/RustEDA/benchmarks/#host-campaign-method-and-deviations-2026-11-13)
+
+## Ibex host campaign · 2026-11-05
 
 The RustEDA Ibex host campaign of 2026-11-05 (IHP SG13G2 / EZ130 with two real
 SRAMs, on a 4-vCPU Intel Xeon cloud host with 15.7 GiB RAM and no swap) ran
@@ -125,7 +187,7 @@ explicit fallback for unsupported/nonconverged cases.
 
 ## Benchmarks
 
-RustEDA publishes its benchmarks on one page: Ibex RTL-to-GDS on IHP SG13G2 / EZ130 against LibreLane, with module head-to-heads. See the [RustEDA benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/). RustSpice's published performance comparisons are the head-to-heads with ngspice-45 from the [2026-11-05](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45-2026-11-05) and [2026-11-02](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45) Ibex host campaigns, on linear RC networks extracted from the Ibex layouts (summarized above); they cover no transistor-level circuit and apply to those hosts only. The [benchmark method](docs/benchmark_report.md) describes how to measure RustSpice against `ngspice` on your own host.
+RustEDA publishes its benchmarks on one page: Ibex RTL-to-GDS on IHP SG13G2 / EZ130 against LibreLane, with module head-to-heads. See the [RustEDA benchmarks](https://lab-emi.github.io/RustEDA/benchmarks/). RustSpice's published performance comparisons are the head-to-heads with ngspice-45 from the [2026-11-13](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45-2026-11-13) (the latest), [2026-11-05](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45-2026-11-05) and [2026-11-02](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45) Ibex host campaigns, on linear RC networks extracted from the Ibex layouts (summarized above); they cover no transistor-level circuit and apply to those hosts only. The [benchmark method](docs/benchmark_report.md) describes how to measure RustSpice against `ngspice` on your own host.
 
 ## Differential verification against ngspice
 

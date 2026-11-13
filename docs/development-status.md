@@ -1,9 +1,86 @@
 # Development status
 
-Updated **2026-11-05**. The 2026-11-05 section reports the RustEDA host campaign
-of that date; the rest of this page describes the source published with the
-RustEDA development update. Use the superproject’s exact gitlinks and the
-repository lockfile when reproducing a run.
+Updated **2026-11-13**. The 2026-11-13 section reports the latest RustEDA host
+campaign, of that date, and the 2026-11-05 and 2026-11-02 sections the earlier
+ones; the rest of this page describes the source published with the RustEDA
+development update. Use the superproject’s exact gitlinks and the repository
+lockfile when reproducing a run.
+
+## Ibex host campaign · 2026-11-13
+
+The RustEDA Ibex host campaign of 2026-11-13 (IHP SG13G2 / EZ130 with two real
+SRAMs, on a 4-vCPU Intel Xeon cloud host reporting 2.10 GHz, with 15.7 GiB RAM
+and no swap) ran `rustspice bench-suite` with RustSpice 0.1.0 (commit
+[`71875bf`](https://github.com/lab-emi/RustSpice/commit/71875bf9a8c937fb6ada641c45f52df67f0cfa30),
+built with Rust 1.100.0 instead of 1.97.1) against ngspice-45, timing both of
+ngspice's direct solvers, SPARSE and KLU, with the deck builder and method of
+2026-11-05. RustROAD's route changed since then (its topology controls cut the
+routed DEF from about 192 thousand wire pieces to 160 thousand), so the decks,
+built from the native nominal SPEF of the new final layout, differ from
+2026-11-05's:
+
+| Deck | Contents | Unknowns |
+| --- | --- | ---: |
+| `ibex_net_00` … `ibex_net_07` | One extracted net each, the eight largest; 7–10 sinks; 2 probes (driver and first sink) | 173–237 |
+| `ibex_bulk_10` | 10 extracted nets in one deck; 8 probes, on the first 4 nets | 1,836 |
+| `ibex_bulk_40` | 40 extracted nets in one deck; 8 probes, on the first 4 nets | 5,614 |
+
+**The suite verdict is `PASS`: all 10 cases `pass` accuracy.** Read at the
+nominal `k × tstep` output grid, RustSpice is closer to the tightly converged
+ngspice reference than default-tolerance ngspice in 10 of 10 cases. At each
+simulator's own output points (without the harness's linear resampling of
+ngspice's waveform) it is closer in 6 of 10; default-tolerance ngspice is closer
+on `ibex_net_00` (8.51 × 10⁻⁶ against 1.05 × 10⁻⁵), on `ibex_net_05`
+(2.03 × 10⁻⁵ against 2.44 × 10⁻⁵) and on both multi-net decks (4.67 × 10⁻⁴
+against 5.99 × 10⁻⁴ and 5.50 × 10⁻⁴). **RustSpice was 4.14–7.02× faster per
+deck, end to end, than the faster ngspice solver, and used less memory in every
+case.** The faster ngspice solver was SPARSE in every case, for both the
+per-deck wall and the analysis time.
+
+| | 8 single nets | 10 nets, 1,836 unknowns | 40 nets, 5,614 unknowns |
+| --- | ---: | ---: | ---: |
+| Accuracy verdict | `pass` × 8 | `pass` | `pass` |
+| Error / swing, RustSpice | 5.47 × 10⁻⁶ – 2.44 × 10⁻⁵ | 5.99 × 10⁻⁴ | 5.50 × 10⁻⁴ |
+| Error / swing, default-tolerance ngspice, nominal grid | 2.57–8.23 × 10⁻⁵ | 1.59 × 10⁻³ | 1.59 × 10⁻³ |
+| Error / swing, default-tolerance ngspice, its own output points | 7.12 × 10⁻⁶ – 2.03 × 10⁻⁵ | 4.67 × 10⁻⁴ | 4.67 × 10⁻⁴ |
+| ngspice SPARSE, median per-deck wall | 194.77–256.92 ms | 298.95 ms | 1,158.88 ms |
+| ngspice KLU, median per-deck wall | 222.27–307.41 ms | 348.62 ms | 1,234.75 ms |
+| RustSpice, median per-deck wall | 37.86–53.33 ms | 46.94 ms | 165.03 ms |
+| Quotient, faster ngspice ÷ RustSpice, per-deck wall (median) | 4.14–5.79× | 6.37× | 7.02× |
+| Quotient, faster ngspice ÷ RustSpice, analysis time only (median) | 4.85–6.79× | 8.59× | 9.50× |
+| Median peak RSS, ngspice SPARSE / RustSpice | 13,716–14,060 / 6,624–6,816 KiB | 19,000 / 11,040 KiB | 31,216 / 21,664 KiB |
+
+Accuracy is judged at the probed nodes only, against an ngspice transient
+reference with `reltol=1e-6 abstol=1e-15 vntol=1e-9` and `tmax` 0.1 ps on the
+single nets and 1 ps on the multi-net decks; a case passes when the maximum
+error / swing of every probe is at most 2 × 10⁻³. Both errors lie above the
+reference's own resampling error (`interp_floor`) in every case. Times are
+medians of seven interleaved repetitions after a correctness warm-up, from one
+session on one host (load average 0.5 at the start and 1.0 at the end). The
+per-deck wall is each simulator's subprocess wall time (start-up, parse, setup,
+solve and rawfile write); the analysis-only quotient pairs ngspice's `Total
+analysis time` with RustSpice's `analysis_us`, which excludes RustSpice's parse
+and compile. The suite flags the RustSpice medians of `ibex_net_03`,
+`ibex_net_04`, `ibex_net_05`, `ibex_net_07` and `ibex_bulk_10` as `noisy`
+(relative spread above 0.2), so the quotients hold within this session only.
+Process start-up medians were 6.53 ms for ngspice and 2.33 ms for RustSpice.
+Peak RSS is `VmHWM` polled while each child runs. The scope is linear RC
+interconnect only: RustSpice does not implement IHP's PSP103 models, so there
+is no transistor-level Ibex simulation, and RustSpice is not part of the timed
+RTL-to-GDS flow.
+
+**Against 2026-11-05 (history, not a before/after).** The 2026-11-05 section
+below measured RustSpice at 4.32–5.96× end to end on other decks (198–291,
+2,262 and 6,865 unknowns) and on another virtual machine (a Xeon reporting
+2.80 GHz). Both changed: on this host ngspice's start-up alone took 6.53 ms
+against 12.35 ms then, and RustSpice's 2.33 ms against 4.20 ms, and with the
+same tools and inputs every LibreLane stage took less time (floorplan level).
+The two campaigns' numbers therefore do not measure a change in RustSpice;
+compare RustSpice with ngspice within each campaign.
+
+[SPICE head-to-head](https://lab-emi.github.io/RustEDA/benchmarks/#rustspice-vs-ngspice-45-2026-11-13) ·
+[Host campaign 2026-11-13](https://lab-emi.github.io/RustEDA/benchmarks/#ibex-host-campaign-2026-11-13) ·
+[Method and deviations](https://lab-emi.github.io/RustEDA/benchmarks/#host-campaign-method-and-deviations-2026-11-13)
 
 ## Ibex host campaign · 2026-11-05
 
