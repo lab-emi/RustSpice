@@ -2636,7 +2636,8 @@ fn parse_source_spec(
                     format!("{name}: PWL has an odd number of values; the last one was ignored"),
                 ));
             }
-            let points: Vec<(f64, f64)> = a.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+            let points: Vec<(f64, f64)> =
+                a.as_chunks::<2>().0.iter().map(|&[t, v]| (t, v)).collect();
             if points.windows(2).any(|w| w[1].0 < w[0].0) {
                 issues.push((
                     REFUSE,

@@ -141,8 +141,7 @@ impl SymmetricOrdering {
         let n = csc.nrows;
         let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
         for c in 0..n {
-            for idx in csc.col_ptr[c]..csc.col_ptr[c + 1] {
-                let r = csc.row_idx[idx];
+            for &r in &csc.row_idx[csc.col_ptr[c]..csc.col_ptr[c + 1]] {
                 if r != c {
                     adj[r].push(c);
                     adj[c].push(r);
