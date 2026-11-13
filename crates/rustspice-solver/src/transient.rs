@@ -219,7 +219,7 @@ const EDGE_FRACTION: f64 = 1.0 / 32.0;
 /// ratio, `w^2 = w + 1`) the BDF-2 companion factor `(1 + 2w) / ((1 + w) h_2)` equals the backward-Euler one
 /// `1 / h_1`, and the trapezoid step `2 h_1` that follows has it too, so a linear circuit factors its matrix once
 /// for all three steps.
-const BDF2_STARTUP_RATIO: f64 = 1.618_033_988_749_895;
+const BDF2_STARTUP_RATIO: f64 = std::f64::consts::GOLDEN_RATIO;
 /// Largest growth of the step from one accepted step to the next.
 const MAX_GROWTH: f64 = 2.0;
 /// Smallest reduction after a rejected step (a larger cut would waste the information of the estimate).
