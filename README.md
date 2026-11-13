@@ -146,7 +146,7 @@ RustEDA publishes its benchmarks on one page: Ibex RTL-to-GDS on IHP SG13G2 / EZ
 
 ## Quick start
 
-Install [Rust with rustup](https://rustup.rs) and Git. The CPU flow needs no GPU or external solver libraries. Run these commands in one POSIX shell:
+Install [Rust with rustup](https://rustup.rs) and Git. The repository pins Rust 1.100.0. The CPU flow needs no GPU or external solver libraries. Run these commands in one POSIX shell:
 
 ```sh
 git clone https://github.com/lab-emi/RustSpice.git
