@@ -3,6 +3,8 @@ name = "rustspice-backend-cuda-tile"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "NVIDIA CUDA Rust Tile Track (cutile-rs architecture) Backend for SoA Device Evaluation and Multi-Circuit Batch Simulation"
 
 [dependencies]

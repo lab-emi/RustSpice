@@ -3,6 +3,8 @@ name = "rustspice-macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "Procedural macro DSL (#[spice_device]) for compile-time symbolic auto-diff, CSE, and multi-backend GPU kernel generation"
 
 [lib]

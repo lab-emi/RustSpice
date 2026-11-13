@@ -3,6 +3,8 @@ name = "rustspice-backend-metal"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "Apple Silicon Metal UMA Zero-Copy + df64 Double-Float Compute Backend with Mixed-Precision CPU Refinement"
 
 [dependencies]

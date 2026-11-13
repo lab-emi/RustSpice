@@ -1209,7 +1209,6 @@ dependencies = [
  "rayon",
  "rustc-hash",
  "rustspice-core",
- "rustspice-ir",
 ]
 
 [[package]]
@@ -1220,7 +1219,6 @@ dependencies = [
  "rayon",
  "rustspice-backend-cpu",
  "rustspice-core",
- "rustspice-ir",
 ]
 
 [[package]]
@@ -1280,7 +1278,6 @@ version = "0.1.0"
 dependencies = [
  "libloading",
  "rustc-hash",
- "rustspice-ir",
  "rustspice-macros",
  "serde",
  "thiserror 2.0.21",
@@ -1292,7 +1289,6 @@ version = "0.1.0"
 dependencies = [
  "rustc-hash",
  "serde",
- "thiserror 2.0.21",
 ]
 
 [[package]]

@@ -3,6 +3,8 @@ name = "rustspice-backend-cpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "CPU SIMD (pulp AVX-512/AVX2/NEON), Rayon Batching, and Cranelift Topology-Specialized Native JIT Backend for RustSpice"
 
 [dependencies]
@@ -15,4 +17,3 @@ pulp.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
 rustspice-core.workspace = true
-rustspice-ir.workspace = true
